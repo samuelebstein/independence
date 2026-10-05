@@ -7,10 +7,13 @@ J: my conversation with J was about how i don't believe i could survive in a wor
 
 shelter, food, water, hygiene. what else? 
 
-i have no knowledge of anything related to these fundamental necessities of being. 
+i have no knowledge of anything related to these fundamental necessities of being. so 1) i want to be able to learn things related to this, 2) i want to know that i can learn these things if the worst case scenario happesn (sort of in a survival doomsday way), 3) i hate how these massive frontier model companies are taking everyone's data and doing god knows what with it (training models, building profiles of people) and how they will use it. 
 
 
-A
+A: my conversation with A is about how he does nto feel is able to hold a normal job because hte way of being in america is so different than what feels good and natural to him. we discuss things philosphically. he is surviving, he is an artist. how do we make change so that we live in a world that we believe in and love?
 
 
-Z
+Z: my conversations with Z are generally about financial security, and a desire to be free and to spend time with and live close to friends. Z wants to start their own company and is searching for an idea that will make it worth it to take a risk. he is interested in private inference, which i think is incredibly important and i do not know if it exists as a service. likely has tie-ins with TEEs and likely is a SAAS model. 
+
+
+L: my conversation with L revolve around hating prioritary code and knowledge. he will only ever work on open source code, and he is trying to create a provalble internet, fundamentally in order to create a more equal, democratic benevolent society. he is very knowledgable of linux 

@@ -87,7 +87,7 @@ further out, there is the possibility of shared observations. devices might have
 
 i like the possibility of tools that are useful on their own and become more useful when people bring them together.
 
-## starting close
+## i just want to learn 
 
 i am interested in building and using the thing. that seems like a reasonable place to start. i haven't run a local llm. i've never really put together any pieces of hardware. 
 

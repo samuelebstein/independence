@@ -44,3 +44,26 @@ supposed 100 devices around LA detect smoke, or detect a tremor from an earthqua
 
 so why isn't htis an app? local llm on iphone. apple can do it. offline maps? app. plant identifcation? app. 
 
+
+on an uiphone the device is the interface to things elsewhere. not always but usually. with independence, the thing its is possesses the capability. take spotify for example: iphone -> app -> spotifiy service -> spotify catalogue. you posses access to spotify (via subscription). you don't possess spotfiy. same basic pattern across many other things
+
+gmail -> google computers
+chatgpt -> openai computers
+instagram -> meta computers
+uber -> uber computes. 
+
+so say you invert it where the center is the machine itself. models plus information stored on phone so the llm acts as the librarian. 
+
+imagine taking this device out in the world with you instead of your phone. imagine it has some sort of solar capability for recharging. the cetner of everything is the machine. 
+
+also i like the idea of local knowledge first. so say the device ships with X amount of storage. you have wikipedia, text books, medical books, repair manuals. you can brows it with the open soruce llm on top of that library. so when you ask is this berry poisonous? its not question -> mysterias gigantic model -> answer, its question -> local intelligence (llm) -> your local library -> retrieve relevant material -> reason -> answer. 
+
+in this case the disappearance of the company does not stop the device from working or its core capabilities. 
+
+apple could make this but would they? obviously an iphone would be way better than i could make but i _could_ make _something_ and i could own the storage, model, os, battery and probably learn a lot. 
+
+so you start locally. i would use this. i would love to go out in the world with a device that _cannot_ talk to the internet. i would start by going 10 blocks, then 100, then 1000. how far can i go? that's more the survivalist talkign in me. but its cool 
+
+
+and the more interesting piece of this is i actually jsut learn a lot about 1) hardware, 2) open source OS, 3) open source LLMS, 4) different types of sensors/modules (think gps, camera, microphone), how do you put this all together? could i put this all together in my house with a 3d printer printing somethign around it. i need a screen, batter, chip, gpu? 
+

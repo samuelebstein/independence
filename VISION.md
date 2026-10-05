@@ -1,6 +1,6 @@
 # independence
 
-since i decided to leave my job, i’ve had a few conversations with friends that seem, at first, to be about different things. we talk about money, work, climate change, artificial intelligence, art, and where we want to live. but underneath those conversations, i keep hearing versions of the same question: how do we build a life we believe in, in a world we don’t feel particularly in control of?
+i’ve had a few conversations with friends that seem, at first, to be about different things. we talk about, work, climate change, artificial intelligence, art, and where we want to live. but underneath those conversations, i keep hearing versions of the same question: how do we build a life we believe in, in a world we don’t feel particularly in control of?
 
 some of us want financial independence. some want work that feels worthwhile. some want to live closer to friends and spend more time with the people they love. there is excitement about what technology might make possible, but also confusion about what it is doing to us. will our skills still matter? are the tools we use making us more capable, or are we becoming less capable without them?
 

@@ -5,7 +5,7 @@ since i decided to leave my job, i’ve had a few conversations with friends tha
 some of us want financial independence. some want work that feels worthwhile. some want to live closer to friends and spend more time with the people they love. there is excitement about what technology might make possible, but also confusion about what it is doing to us. will our skills still matter? are the tools we use making us more capable, or are we becoming less capable without them?
 
 
-## a foundation
+## inspiration 
 
 talking with b, i realized how poorly prepared i feel for a world even modestly different from the current one. i have spent the last seven years teaching myself computer science. those skills are valuable now. they have allowed me to work and support myself. i’m less sure what they will mean in ten years, or how useful i would be outside the particular arrangements that make them valuable today.
 
@@ -23,7 +23,7 @@ e approaches these questions through open-source software. he refuses to work on
 
 these are not identical concerns, but i recognize myself in all of them. i want a stronger foundation. i want work and tools that fit the kind of life i want. i want to be close to people. i want to understand more of what i depend on.
 
-## access is not possession
+## the things i am using seem to be making me less capable 
 
 this is part of why my relationship with ai feels conflicted.
 
@@ -31,7 +31,7 @@ i want to learn, and i keep turning to frontier models to help me. at the same t
 
 i also resent the feeling that knowledge people have created and shared is being gathered up and sold back to them. e described open models to me as a way for the community to take that knowledge back. i find that idea compelling: not just getting a cheaper answer, but possessing the means to produce one.
 
-i have a strong dislike of apple products, probably encouraged by spending time with people who dislike much more than i do. but i’m trying to get more precise about what bothers me. it isn’t that the devices lack capability. it is that so much of the experience hides where that capability lives, how it works, and who controls it.
+i have a strong dislike of apple products, probably encouraged by spending time with people who dislike them much more than i do. but i’m trying to get more precise about what bothers me. it isn’t that the devices lack capability. it is that so much of the experience hides where that capability lives, how it works, and who controls it. you feel tethered to the thing because the more we use it, the less capable we become.
 
 the iphone brought computing to our fingertips. but much of what i do with it makes it feel less like a computer i possess and more like a portal to infrastructure elsewhere.
 
@@ -45,7 +45,7 @@ instead of beginning with a device that connects me to services, i could begin w
 
 the network could still be useful. but it would be something the computer could use, rather than the place where the computer’s purpose resides.
 
-## a library with a librarian
+## a library and librarian that can become more knowledgable and accessible without any corporation
 
 the part of this i love most is local knowledge first.
 
@@ -61,7 +61,7 @@ that is a different relationship from asking a distant system a question and acc
 
 i also don’t want to confuse carrying knowledge with having learned it. a device full of manuals would not suddenly make me practically competent. what i want is something that helps me build that competence: an explanation when i am curious, a reference when i am stuck, a way into a subject i don’t yet understand.
 
-but then why isn't htis just an app?
+but then why isn't this just an app?
 
 a local model could be an app. a library could be an app. maps could be an app. apple could build many of these capabilities, and they can make infinitely better hardware than i can.
 
@@ -69,7 +69,7 @@ but i am interested in making this the starting assumption of the whole device, 
 
 a useful test would be what happens if the company that made it disappears. the device should still perform its core functions. its knowledge should still be readable. its software should still be runnable. it should remain something i have, not something i used to be allowed to access.
 
-## from hand to hand
+## building local knowledge from the ground up
 
 there is another part of the idea that makes it more than a private library.
 
@@ -78,7 +78,6 @@ suppose i encounter someone with another device. they have a newer map, or a col
 i imagine signed, versioned knowledge packs moving between devices. someone publishes a set of reference materials. other people keep copies and help distribute them. a person with the 1998 bmw repair manuals can pass them to someone who needs them. knowledge moves from hand to hand, rather than always making a round trip through a central service.
 
 i imagine something with bittorrent's distributed ownership of information and airdoprs ability to move information directly between nearby devices.
-
 
 communication could follow a similar principle. e introduced me to meshtastic and lora, where a device can also participate in a network. if mine can reach yours, and yours can reach someone else’s, perhaps a message can travel beyond the people i can reach directly.
 
@@ -90,10 +89,12 @@ i like the possibility of tools that are useful on their own and become more use
 
 ## starting close
 
-i am interested in building and using the thing. that seems like a reasonable place to start.
+i am interested in building and using the thing. that seems like a reasonable place to start. i haven't run a local llm. i've never really put together any pieces of hardware. 
 
 i want to build something i can hold, disconnect it from the internet, and take it outside. i want to see what it helps me notice, understand, and do. i like the idea of beginning ten blocks from home, then a hundred, then a thousand. how far could i go? what would i need to know? what would i discover i had forgotten to put in the library?
 
 there is a survivalist impulse in that, but there is also curiosity. i don’t need a disaster to want to understand a machine, learn about a plant, find my way somewhere, or talk to another person. i want the device to have a reason to exist on an ordinary day.
 
-i don't know if there are companies building something like this but each individual piece exists already and it would require me to learn A LOT. also, i think my dad would fine it cool. could i make it at home? maybe with a 3d printer i can build an enclosure for all the parts? could it have some sort of solar charging?
+i don't know if there are companies building something like this but each individual piece exists already and it would require me to learn A LOT. also, i think my dad would find it cool. could i make it at home? maybe with a 3d printer i can build an enclosure for all the parts? could it have some sort of solar charging?
+
+an iphone is designed primarily as a portal to services and infrastructure elsewhere; this device is designed around the opposite assumption: the intelligence, knowledge, software, data, and essentail capabilites should live with and belong to the person holding it. it should work without the internet, communicate directly with other devices, be open and repairable, and remain fully useful even if the company that made it disappears. 

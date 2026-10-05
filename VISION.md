@@ -1,69 +1,99 @@
-take your time
+# independence
+
+since i decided to leave my job, i’ve had a few conversations with friends that seem, at first, to be about different things. we talk about money, work, climate change, artificial intelligence, art, and where we want to live. but underneath those conversations, i keep hearing versions of the same question: how do we build a life we believe in, in a world we don’t feel particularly in control of?
+
+some of us want financial independence. some want work that feels worthwhile. some want to live closer to friends and spend more time with the people they love. there is excitement about what technology might make possible, but also confusion about what it is doing to us. will our skills still matter? are the tools we use making us more capable, or are we becoming less capable without them?
 
 
-i've had a few conversations with some friends since i decided to leave my job and each person i've talked to is trying to understand the world and their place in it. can they make a change that betters theirs and the people they love's existence? can they survive in a new world that is rapidly changing? some things that come up are financial independence, a feeling that the current world is not what they want, a feeling of being lost, confused, and worried. there are worries about climate change, worries about ai and how it will affect jobs/their industry/their career, worries about how technology (not just ai) is affecting our brains (are we as a human species becoming dumber?)
+## a foundation
 
-J: my conversation with J was about how i don't believe i could survive in a world that is modestly different from the current world. i've spent the last 7 years teaching myself computer science, infrastructure, security and although those things are valuable right now, will those exact skills be valuable 10 years from now? how much of the world is going to change, and how owns our future? J has an amazingly diverse set of skills and knowledge that make him much more able to survive. and we all want to feel like we could survive. that gives us confidence to go out in the world and take risks because you know that no matter what happens, you have a foundation on which to build. how will the world change with climate chagne? is where i'm living going to be liveable. what will shelter, food, water, hygiene look like in 10 years (J mentioned a word i'm forgetting about certain things like perafrost melting and taking us on a much quicker escalation in climate change)? 
+talking with b, i realized how poorly prepared i feel for a world even modestly different from the current one. i have spent the last seven years teaching myself computer science. those skills are valuable now. they have allowed me to work and support myself. i’m less sure what they will mean in ten years, or how useful i would be outside the particular arrangements that make them valuable today.
 
-shelter, food, water, hygiene. what else? 
+b has a much more diverse collection of practical skills and knowledge. there is something reassuring about that. being able to take care of yourself gives you a foundation. it makes taking a risk feel less like stepping into nothing.
 
-i have no knowledge of anything related to these fundamental necessities of being. so 1) i want to be able to learn things related to this, 2) i want to know that i can learn these things if the worst case scenario happesn (sort of in a survival doomsday way), 3) i hate how these massive frontier model companies are taking everyone's data and doing god knows what with it (training models, building profiles of people) and how they will use it. 
+i know something about the systems that keep computers running. i know much less about the things that keep me alive: shelter, food, water, hygiene. i struggle to cook, navigate, and, often, communicate. i don’t think a survival course would go particularly well for me.
+
+part of this worry takes an extreme form. what happens if the world changes quickly? will the place i live remain livable? what would i do if the systems i rely on stopped working? but underneath the disaster scenario is a much more ordinary desire: i want to understand the world around me, and i want to feel capable of participating in it.
+
+my conversations with c approach this from another direction. he is an artist, and the shape of a normal working life in america does not feel natural or good to him. he is surviving, but surviving is not the whole question. how do you make a life inside a world whose expectations don’t fit you? how do you help make a world you actually believe in?
+
+d thinks about financial security, starting a company, and finding an idea worth taking a risk on. but the freedom he wants has a particular shape: time with friends, proximity to the people he cares about, more control over his life. he is also interested in private inference, using models without surrendering the privacy of the information you bring to them.
+
+e approaches these questions through open-source software. he refuses to work on proprietary code and is interested in building a more provable internet. his work with linux and trusted execution environments is tied to a larger ambition: a more equal, democratic, benevolent society. what interests me is that the technical choices are not separate from that ambition. they are one way of trying to realize it.
+
+these are not identical concerns, but i recognize myself in all of them. i want a stronger foundation. i want work and tools that fit the kind of life i want. i want to be close to people. i want to understand more of what i depend on.
+
+## access is not possession
+
+this is part of why my relationship with ai feels conflicted.
+
+i want to learn, and i keep turning to frontier models to help me. at the same time, i dislike the arrangement. i am paying a company to mediate my access to knowledge, and i am handing it my questions in the process. i don’t feel comfortable not knowing what becomes of those questions, what they reveal about me, or how that information might eventually be used.
+
+i also resent the feeling that knowledge people have created and shared is being gathered up and sold back to them. e described open models to me as a way for the community to take that knowledge back. i find that idea compelling: not just getting a cheaper answer, but possessing the means to produce one.
+
+i have a strong dislike of apple products, probably encouraged by spending time with people who dislike much more than i do. but i’m trying to get more precise about what bothers me. it isn’t that the devices lack capability. it is that so much of the experience hides where that capability lives, how it works, and who controls it.
+
+the iphone brought computing to our fingertips. but much of what i do with it makes it feel less like a computer i possess and more like a portal to infrastructure elsewhere.
+
+spotify is a an example. i have an app on my phone, but the app is my interface to a service and its catalog. i possess access to spotify. i don’t possess spotify. i see a similar arrangement when i use gmail, instagram, or a cloud-based model: the thing in my hand is how i reach the thing i need.
+
+of course, not everything on a phone works this way. i can write notes or play locally stored music without a connection. the distinction is not that an iphone is useless offline. it is a question of where the capabilities i care about live, and what conditions i have to satisfy to keep using them.
+
+what would happen if i started from the other direction?
+
+instead of beginning with a device that connects me to services, i could begin with a device that contains the capabilities i want. the intelligence would run locally. the knowledge and maps would be stored locally. my data and keys would stay with me. the software would be open. communication with another device would not necessarily require both of us to pass through someone else’s service.
+
+the network could still be useful. but it would be something the computer could use, rather than the place where the computer’s purpose resides.
+
+## a library with a librarian
+
+the part of this i love most is local knowledge first.
+
+i don’t want to start with an empty chat box connected to a model somewhere else. i want to start with a library i can browse: encyclopedias, textbooks, repair manuals, maps, reference books, and my own documents. i want the material itself to be there, on storage i control.
+
+the model would sit on top of that library. it would be a librarian, not a replacement for the books.
+
+i could ask how a diesel engine works, and it could help me find and understand an explanation. i could ask it to teach me calculus. i could use a camera to ask questions about something in front of me, or use local speech recognition and translation to help understand another person.
+
+the important part is not just that an answer appears. it is that i can get to the material behind the answer. i can follow a reference, inspect a diagram, or decide to read the chapter myself. the interface should make the knowledge easier to approach, not put another opaque layer between me and it.
+
+that is a different relationship from asking a distant system a question and accepting whatever it sends back. the library is here. the program helping me explore it is here. i can use one without having to surrender the other.
+
+i also don’t want to confuse carrying knowledge with having learned it. a device full of manuals would not suddenly make me practically competent. what i want is something that helps me build that competence: an explanation when i am curious, a reference when i am stuck, a way into a subject i don’t yet understand.
+
+but then why isn't htis just an app?
+
+a local model could be an app. a library could be an app. maps could be an app. apple could build many of these capabilities, and they can make infinitely better hardware than i can.
+
+but i am interested in making this the starting assumption of the whole device, rather than one optional feature inside it. i want to choose the model, inspect the software, control the storage, replace the battery, and learn how the thing works. i want the library to remain usable whether or not i use the model. i don’t want continued access to the essential capabilities to depend on an account or a company’s willingness to keep providing a service.
+
+a useful test would be what happens if the company that made it disappears. the device should still perform its core functions. its knowledge should still be readable. its software should still be runnable. it should remain something i have, not something i used to be allowed to access.
+
+## from hand to hand
+
+there is another part of the idea that makes it more than a private library.
+
+suppose i encounter someone with another device. they have a newer map, or a collection of repair manuals i don’t have. why shouldn’t they be able to share it directly with me?
+
+i imagine signed, versioned knowledge packs moving between devices. someone publishes a set of reference materials. other people keep copies and help distribute them. a person with the 1998 bmw repair manuals can pass them to someone who needs them. knowledge moves from hand to hand, rather than always making a round trip through a central service.
+
+i imagine something with bittorrent's distributed ownership of information and airdoprs ability to move information directly between nearby devices.
 
 
-A: my conversation with A is about how he does nto feel is able to hold a normal job because hte way of being in america is so different than what feels good and natural to him. we discuss things philosphically. he is surviving, he is an artist. how do we make change so that we live in a world that we believe in and love?
+communication could follow a similar principle. e introduced me to meshtastic and lora, where a device can also participate in a network. if mine can reach yours, and yours can reach someone else’s, perhaps a message can travel beyond the people i can reach directly.
 
+i can imagine devices around los angeles forming connections that do not require a cellular service for every exchange. under the right conditions, another person joining would make the network more useful to the people already there. the device would be useful by itself, but it could gain something from being among others.
 
-Z: my conversations with Z are generally about financial security, and a desire to be free and to spend time with and live close to friends. Z wants to start their own company and is searching for an idea that will make it worth it to take a risk. he is interested in private inference, which i think is incredibly important and i do not know if it exists as a service. likely has tie-ins with TEEs and likely is a SAAS model. 
+further out, there is the possibility of shared observations. devices might have cameras, location information, air-quality sensors, or other modules. people could choose to contribute observations about smoke, a tremor, or a wildfire. asking what is happening nearby could mean learning from the people and instruments nearby, not only consulting a distant platform.
 
+i like the possibility of tools that are useful on their own and become more useful when people bring them together.
 
-L: my conversation with L revolve around hating prioritary code and knowledge. he will only ever work on open source code, and he is trying to create a provalble internet, fundamentally in order to create a more equal, democratic benevolent society. he is very knowledgable of linux, worknig on creating architectures for deploying TEEs extremely easy so all code can run within them. at the hardware level, you can prove what code is running where and when. 
+## starting close
 
+i am interested in building and using the thing. that seems like a reasonable place to start.
 
-me: i have been noticing that i have deep desire to understand the world around me and yet i know practically nothing. i survive in this world mostly by sheer will power. i taught myself how to code, got a job and now have an general understanding of how computing works but i'm not an expert in anything. i don't have much practical knowledge. i struggle to cook, navigate, communicate (lol). i would fail any survival course. i also hate that i'm using these frontier models and paying these companies for knowledge. when that knowledge is _mostly_ freely available. when the knowledge that is not freely available was _stolen_ by these companies to train their models. i love the idea L described to me as open source models are basically the community taking back the knowledege that these big companies stole. 
+i want to build something i can hold, disconnect it from the internet, and take it outside. i want to see what it helps me notice, understand, and do. i like the idea of beginning ten blocks from home, then a hundred, then a thousand. how far could i go? what would i need to know? what would i discover i had forgotten to put in the library?
 
-i also have this deep hatred of apple products. probably from my time with 3 individuals who hate apple products. they obfuscate, and abstract and although they brought computing into our fingertips, it also enslaved every person to these devices. at this level the iPhone is a portal to infrastructure. most of the value of an iphone ultimately comes throught phone -> cellular/wifi -> servers -> services. what if you started from the opposite direction/assumption. the device itself should contain the essentail capabilites of a computer. make intelligence local, knowledge local, maps local, identity local sensors local, communication local, software open. 
+there is a survivalist impulse in that, but there is also curiosity. i don’t need a disaster to want to understand a machine, learn about a plant, find my way somewhere, or talk to another person. i want the device to have a reason to exist on an ordinary day.
 
-todo: add a bit about wnating to start local
-
-
-today you put an iPhone in airplane mode and it suddently feels dramatically less intelligent. you can play music, write notes and then.. what?
-
-imagine you put a device into airplane mode and almost nothing important changes. 
-
-you ask: how does a diesel engine work? it knows. teach me calculus. it can. whats this plant? camer +vision model + local inference. translate what this person is saying. local speech recognition and translation. 
-
-so you have knowledge in the palm of your hand. 
-
-suppose i have a device and i encounter another device (say through lora instead of wifi/cellular), they could exchange signed/versioned knowledge packs. no central server necessarily required. bittorent but personal handheld device to device. eventully knowledge propagates physcially thogugh the newrok like bittorrent meets airdrop meets knowledge. someoen publsihs emergency medicie pack v34 and devices distribute it peer to peer. someone publishes 1998 bmw repair manuals, and the same thing. the network becomes the distribution layer for knowledge and no knowledge is centralized. its all diversified over devices. it can't be taken away, it cant be controlled. 
-
-imagine every device has LoRa/meshtastic-style networking, imagine every device is also a node. imagine A talks to B and B can talk to C. now A potentially reaches C through B. now add 100 devices to los angeles and suddently you've created an independent communications network. the more people who own and use the device, the more useful the network becomes. 
-
-then imagine you have collective sensing. devices have gps, camera, air-quality sensor, radio and other modules? 
-
-supposed 100 devices around LA detect smoke, or detect a tremor from an earthquake or report a wildfire, you could construct a decentralized real-time picture of the physical world. you ask what's happenign around me? no google, no chat/codex, no claude, no twitter. just other devices. 
-
-so why isn't htis an app? local llm on iphone. apple can do it. offline maps? app. plant identifcation? app. 
-
-
-on an uiphone the device is the interface to things elsewhere. not always but usually. with independence, the thing its is possesses the capability. take spotify for example: iphone -> app -> spotifiy service -> spotify catalogue. you posses access to spotify (via subscription). you don't possess spotfiy. same basic pattern across many other things
-
-gmail -> google computers
-chatgpt -> openai computers
-instagram -> meta computers
-uber -> uber computes. 
-
-so say you invert it where the center is the machine itself. models plus information stored on phone so the llm acts as the librarian. 
-
-imagine taking this device out in the world with you instead of your phone. imagine it has some sort of solar capability for recharging. the cetner of everything is the machine. 
-
-also i like the idea of local knowledge first. so say the device ships with X amount of storage. you have wikipedia, text books, medical books, repair manuals. you can brows it with the open soruce llm on top of that library. so when you ask is this berry poisonous? its not question -> mysterias gigantic model -> answer, its question -> local intelligence (llm) -> your local library -> retrieve relevant material -> reason -> answer. 
-
-in this case the disappearance of the company does not stop the device from working or its core capabilities. 
-
-apple could make this but would they? obviously an iphone would be way better than i could make but i _could_ make _something_ and i could own the storage, model, os, battery and probably learn a lot. 
-
-so you start locally. i would use this. i would love to go out in the world with a device that _cannot_ talk to the internet. i would start by going 10 blocks, then 100, then 1000. how far can i go? that's more the survivalist talkign in me. but its cool 
-
-
-and the more interesting piece of this is i actually jsut learn a lot about 1) hardware, 2) open source OS, 3) open source LLMS, 4) different types of sensors/modules (think gps, camera, microphone), how do you put this all together? could i put this all together in my house with a 3d printer printing somethign around it. i need a screen, batter, chip, gpu? 
-
+i don't know if there are companies building something like this but each individual piece exists already and it would require me to learn A LOT. also, i think my dad would fine it cool. could i make it at home? maybe with a 3d printer i can build an enclosure for all the parts? could it have some sort of solar charging?

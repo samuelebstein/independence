@@ -16,4 +16,31 @@ A: my conversation with A is about how he does nto feel is able to hold a normal
 Z: my conversations with Z are generally about financial security, and a desire to be free and to spend time with and live close to friends. Z wants to start their own company and is searching for an idea that will make it worth it to take a risk. he is interested in private inference, which i think is incredibly important and i do not know if it exists as a service. likely has tie-ins with TEEs and likely is a SAAS model. 
 
 
-L: my conversation with L revolve around hating prioritary code and knowledge. he will only ever work on open source code, and he is trying to create a provalble internet, fundamentally in order to create a more equal, democratic benevolent society. he is very knowledgable of linux 
+L: my conversation with L revolve around hating prioritary code and knowledge. he will only ever work on open source code, and he is trying to create a provalble internet, fundamentally in order to create a more equal, democratic benevolent society. he is very knowledgable of linux, worknig on creating architectures for deploying TEEs extremely easy so all code can run within them. at the hardware level, you can prove what code is running where and when. 
+
+
+me: i have been noticing that i have deep desire to understand the world around me and yet i know practically nothing. i survive in this world mostly by sheer will power. i taught myself how to code, got a job and now have an general understanding of how computing works but i'm not an expert in anything. i don't have much practical knowledge. i struggle to cook, navigate, communicate (lol). i would fail any survival course. i also hate that i'm using these frontier models and paying these companies for knowledge. when that knowledge is _mostly_ freely available. when the knowledge that is not freely available was _stolen_ by these companies to train their models. i love the idea L described to me as open source models are basically the community taking back the knowledege that these big companies stole. 
+
+i also have this deep hatred of apple products. probably from my time with 3 individuals who hate apple products. they obfuscate, and abstract and although they brought computing into our fingertips, it also enslaved every person to these devices. at this level the iPhone is a portal to infrastructure. most of the value of an iphone ultimately comes throught phone -> cellular/wifi -> servers -> services. what if you started from the opposite direction/assumption. the device itself should contain the essentail capabilites of a computer. make intelligence local, knowledge local, maps local, identity local sensors local, communication local, software open. 
+
+todo: add a bit about wnating to start local
+
+
+today you put an iPhone in airplane mode and it suddently feels dramatically less intelligent. you can play music, write notes and then.. what?
+
+imagine you put a device into airplane mode and almost nothing important changes. 
+
+you ask: how does a diesel engine work? it knows. teach me calculus. it can. whats this plant? camer +vision model + local inference. translate what this person is saying. local speech recognition and translation. 
+
+so you have knowledge in the palm of your hand. 
+
+suppose i have a device and i encounter another device (say through lora instead of wifi/cellular), they could exchange signed/versioned knowledge packs. no central server necessarily required. bittorent but personal handheld device to device. eventully knowledge propagates physcially thogugh the newrok like bittorrent meets airdrop meets knowledge. someoen publsihs emergency medicie pack v34 and devices distribute it peer to peer. someone publishes 1998 bmw repair manuals, and the same thing. the network becomes the distribution layer for knowledge and no knowledge is centralized. its all diversified over devices. it can't be taken away, it cant be controlled. 
+
+imagine every device has LoRa/meshtastic-style networking, imagine every device is also a node. imagine A talks to B and B can talk to C. now A potentially reaches C through B. now add 100 devices to los angeles and suddently you've created an independent communications network. the more people who own and use the device, the more useful the network becomes. 
+
+then imagine you have collective sensing. devices have gps, camera, air-quality sensor, radio and other modules? 
+
+supposed 100 devices around LA detect smoke, or detect a tremor from an earthquake or report a wildfire, you could construct a decentralized real-time picture of the physical world. you ask what's happenign around me? no google, no chat/codex, no claude, no twitter. just other devices. 
+
+so why isn't htis an app? local llm on iphone. apple can do it. offline maps? app. plant identifcation? app. 
+

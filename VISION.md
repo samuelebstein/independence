@@ -95,6 +95,6 @@ i want to build something i can hold, disconnect it from the internet, and take 
 
 there is a survivalist impulse in that, but there is also curiosity. i don’t need a disaster to want to understand a machine, learn about a plant, find my way somewhere, or talk to another person. i want the device to have a reason to exist on an ordinary day.
 
-i don't know if there are companies building something like this but each individual piece exists already and it would require me to learn A LOT. also, i think my dad would find it cool. could i make it at home? maybe with a 3d printer i can build an enclosure for all the parts? could it have some sort of solar charging?
+i don't know if there are companies building something like this but each individual piece exists already and it would require me to learn A LOT. also, i think my mom and dad would find it cool. could i make it at home? maybe with a 3d printer i can build an enclosure for all the parts? could it have some sort of solar charging?
 
 an iphone is designed primarily as a portal to services and infrastructure elsewhere; this device is designed around the opposite assumption: the intelligence, knowledge, software, data, and essentail capabilites should live with and belong to the person holding it. it should work without the internet, communicate directly with other devices, be open and repairable, and remain fully useful even if the company that made it disappears. 

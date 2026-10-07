@@ -58,6 +58,59 @@ you've proven the intelligence is on your computer. you downloaded the capabilit
 
 # more stuff if you're curious
 
+## save your session
+
+while you're talking to a model, you can save the current conversation:
+
+```text
+/save diesel-engine-notes
+```
+
+ollama saves that conversation locally as a new model entry built on top of the model you're already using.
+
+conceptually, it looks like this:
+
+```text
+qwen3:8b
+├── model weights
+└── base config
+
+/save diesel-engine-notes
+
+diesel-engine-notes
+├── from: qwen3:8b
+├── messages:
+│   ├── user: "how does a diesel engine work?"
+│   ├── assistant: "..."
+│   ├── user: "what does internal combustion work?"
+│   └── assistant: "..."
+└── settings
+```
+
+when you load it again, ollama starts the model with those messages already included in its context:
+
+```text
+/load diesel-engine-notes
+```
+
+or:
+
+```bash
+ollama run diesel-engine-notes
+```
+
+you can see saved sessions/models with:
+
+```bash
+ollama list
+```
+
+and remove one with:
+
+```bash
+ollama rm diesel-engine-notes
+```
+
 ## choosing a model
 
 check your memory under apple menu → about this mac.

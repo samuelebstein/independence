@@ -147,36 +147,6 @@ ollama ps
 ollama stop qwen3:8b
 ```
 
-## what this isn't yet
-
-this downloads a model, not a browsable copy of wikipedia or a library of verified references. the model has knowledge encoded in its weights, but you can't inspect where every answer came from.
-
-the next independence experiment is connecting the model to a local library: wikipedia, maps, textbooks, repair manuals, medical references, and other knowledge you actually have on your computer.
-
-then instead of:
-
-```text
-question
-  ↓
-mysterious model
-  ↓
-answer
-```
-
-you could have:
-
-```text
-question
-  ↓
-local model
-  ↓
-local library
-  ↓
-retrieve relevant material
-  ↓
-answer + sources
-```
-
 ## references
 
 - [ollama mac installation guide](https://docs.ollama.com/macos)

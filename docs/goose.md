@@ -90,12 +90,6 @@ goose gives the model access to:
 └── other tools/extensions
 ```
 
-## a warning
-
-local models are much less capable than claude or codex at agentic work right now. `qwen3:8b` can also be pretty slow, especially if ollama is running it on your cpu.
-
-this is mostly an experiment to see what it feels like to have the entire agent stack running locally.
-
 ## references
 [goose repository](https://github.com/aaif-goose/goose)  
 [goose installation guide](https://github.com/aaif-goose/goose/blob/main/documentation/docs/getting-started/installation.md)  

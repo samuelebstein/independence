@@ -1,9 +1,12 @@
-# goose 
-"goose is a general-purpose AI agent that runs on your machine. Not just for code — use it for research, writing, automation, data analysis, or anything you need to get done."
+# goose setup instructions
 
-importantly, goose is open source aka not claude or codex!
+**goose is similar to claude and codex in functionality but differs as it is open source, allowing transparency and community contributions.**
 
-## setup instructions
+## check ollama status and configuration
+```bash
+ollama ps
+```
+if not running, go to [ollama.md](ollama.md) for setup instructions.
 
 ### 1. install goose cli (linux/mac)
 ```bash
@@ -26,13 +29,22 @@ when prompted:
 - enter host: `http://localhost:11434` (press enter for default)
 - select model: `qwen3:8b`
 
-### 4. check ollama status and configuration
+### 4. navigate to your workspace
 ```bash
-ollama ps
+cd /path/to/your/project
 ```
-if not running, go to ollama.md for setup instructions.
+this directory will be your workspace for all goose operations.
 
-### 7. start a goose session
+### 5. start a goose session
 ```bash
 goose session
 ```
+
+## references
+
+- [goose-docs.ai](https://goose-docs.ai/) contains tutorials on:
+  - installing and configuring goose
+  - using ollama with goose
+  - advanced session management
+  - troubleshooting common setup issues
+

@@ -82,7 +82,7 @@ diesel-engine-notes
 ├── messages:
 │   ├── user: "how does a diesel engine work?"
 │   ├── assistant: "..."
-│   ├── user: "what does internal combustion work?"
+│   ├── user: "how does internal combustion work?"
 │   └── assistant: "..."
 └── settings
 ```

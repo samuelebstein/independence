@@ -7,3 +7,7 @@ we had a short conversation on how you could build a necklace with "beads" and b
 
 ## no screen
 interesting conversation harnek and i had around screen usage / component. harnek didn't think i should use a screen and i think i agree... 
+
+
+## projector
+one idea i had when i got back home was there might be some down the line usecase for a projector. for example, say i'm trying to learn some math and i'm a visual learning it would be nice if there was some sort of projector so you could see math equations, definitions and it not be _all_ dialogue.

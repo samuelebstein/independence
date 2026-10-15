@@ -1,10 +1,10 @@
-# would you rather a big company or i have your data?
+# who would you rather have your data: a big company or me?
 
 i don't like how much i depend on tools i don't control. put me in a world without my phone, without an internet connection and can i survive? how capable am i actually? it feels like the tools i am using today are making me less capable as a *human being* than ever before. and a lot of that is because i don't have control over most of it; most of it is run by these big companies in their big clouds. 
 
 so i did a little experiment. could i at least combine open source tools instead of needing a company to run them for me? and would that help me feel like i have more control over life?
 
-running ai infrastructure in my house isn't the same as being able to survive without my phone. but i wanted to start somewhere. below you'll find a link to a substack post on how i get ai infrastructure running in my home. its highly technical and idk how many of my friends or family could do it themselves.i felt *magic* when i stood it up myself and knew where the data was stored and that i was the only one who could see it (using a turris router, caddy for tls, openwebui, ollama and qwen models). i could ask it any question without any fear. have you ever worried about typing something into google that's a legal question or a health question, and wondered who can see it or who *might* see it in the future?
+running ai infrastructure in my house isn't the same as being able to survive without my phone. but i wanted to start somewhere. below you'll find a link to a substack post on how i got ai infrastructure running in my home. its highly technical and idk how many of my friends or family could do it themselves.i felt *magic* when i stood it up myself and knew where the data was stored and that i was the only one who could see it (using a turris router, caddy for tls, openwebui, ollama and qwen models). i could ask it any question without any fear. have you ever worried about typing something into google that's a legal question or a health question, and wondered who can see it or who *might* see it in the future?
 
 my friends didn't experience that *magic*. why? they wouldn't use this. they don't want *me* to see their queries. as the owner of the service, i can see everything. they would rather have a big company see their information than me. there is anonymity in volume, and that makes them feel a little safer. but it pales in comparison to the safety you feel when that data is truly yours.
 

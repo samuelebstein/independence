@@ -2,19 +2,21 @@
 
 Independence is an experiment in a local-first computer for noticing and
 learning about the physical world. This repository currently contains a narrow
-terminal prototype—not a camera device or general agent.
+terminal prototype—not a finished camera device or general agent.
 
 It can:
 
 - take keyboard input as its `listen` capability;
 - send a text question, or one explicitly selected JPEG/PNG plus a question,
   to a local Ollama model as `think`;
+- list local Linux V4L2 cameras and explicitly capture one still image as
+  `see` input;
 - retain the last successfully accepted photograph and conversation for
   follow-up questions as `see` context; and
 - print an accepted answer as `speak`.
 
-It does not access a microphone or camera, persist a conversation, stream
-tokens, call tools autonomously, or use a cloud model.
+It does not access a microphone, persist a conversation, stream tokens, call
+tools autonomously, or use a cloud model.
 
 ## Start here
 
@@ -57,6 +59,13 @@ project. For example, `ollama pull qwen3-vl:4b` uses the network and consumes
 local disk space; it is not run automatically by this application. Starting
 `ollama serve` starts a local service and binds its configured local endpoint.
 
+The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
+download and compile it on the first build; this current Linux Mint machine
+already compiled it using its existing toolchain. The application does not
+install packages, alter `/dev/video*` permissions, or run as root. On another
+machine, a build error about the C/Clang toolchain is a system-setup issue to
+resolve deliberately outside this repository.
+
 ## Use the terminal prototype
 
 ```text
@@ -64,6 +73,10 @@ What is the primary gas in Earth's atmosphere?
 
 /look data/tree.jpg | What might this tree be?
 What detail would help distinguish it from an oak?
+
+/cameras
+/camera 0 | What visible features should I notice?
+What should I inspect next?
 
 /stop
 /reset
@@ -80,6 +93,82 @@ The app reads at most 10 MiB, recognizes JPEG/PNG by content, and fully
 decode-validates the image before any model request. It keeps the bytes only
 in memory. A failed, cancelled, missing, oversized, or unsupported `/look`
 does not replace the last accepted photograph or history.
+
+### Camera commands (Linux V4L2)
+
+Run `/cameras` first. It inspects `/dev/video*` nodes for the capture and
+streaming capabilities this prototype supports, but does **not** start a
+capture stream. It prints the numeric identifier and a kernel-provided name:
+
+```text
+independence: usable cameras:
+  0  Laptop Camera: Laptop Camera  (/dev/video0)
+```
+
+Then use one of these literal commands:
+
+```text
+/camera | What visible features should I notice?
+/camera 0 | What visible features should I notice?
+```
+
+The no-ID form works only when exactly one usable camera is listed. With two
+or more entries, explicitly choose one; the application never guesses the
+first `/dev/video*` node. A malformed ID, an ID not currently listed, no
+camera, or ambiguous no-ID command reports an error before capture begins and
+does not interrupt an unrelated active turn.
+
+For an accepted camera turn, Independence requests a conservative MJPEG or
+YUYV format at up to 1280×720, validates the format actually negotiated with
+the driver, discards up to two warm-up frames, and keeps one final still in
+memory. It emits the negotiated dimensions after capture, closes the V4L2
+stream and device, restores the prior format when possible, and only then
+contacts Ollama. YUYV frames are encoded as JPEG in memory; MJPEG frames are
+fully validated as JPEG. No capture is written to disk or logged as payload
+data.
+
+Like `/look`, `/camera` stages a proposed new scene. The camera image and its
+new history replace the accepted scene only after Ollama returns an accepted
+answer. A failure or cancellation retains the previously accepted photo and
+history. Follow-up questions use the last accepted camera image; they do not
+activate the camera again.
+
+`/stop` makes the application immediately reject the camera turn. A running
+blocking V4L2 frame read cannot be safely killed by Tokio, so it is allowed to
+finish its bounded three-second capture window and release its handle in the
+background. A one-permit gate prevents repeated cancellations from piling up
+camera workers or opening the device twice. The three-second bound applies to
+the poll-based frame waits; V4L2 open/configuration ioctls are driver calls
+without a separate timeout exposed by this backend, so a broken kernel driver
+can still misbehave there. Independence does not claim to forcibly stop that
+kind of driver failure.
+
+### Small manual experiments
+
+Start the app with `cargo run` from the repository root. For an explicit file
+photo and follow-up, type:
+
+```text
+/look /home/samebstein/Downloads/testtree.jpeg | What visible features can help identify this tree?
+What part of the image should I inspect next?
+```
+
+For a camera still, use the ID `/cameras` reported, then type:
+
+```text
+/camera 0 | What visible features should I notice?
+What observation would reduce uncertainty?
+```
+
+To test cancellation, submit a camera question and type `/stop` while the
+capture or local inference is active. The application should not print an
+accepted answer or add an exchange. The camera may remain busy for up to the
+three-second bounded acquisition window while its worker closes. To test an
+error that must not alter an accepted scene, use a deliberately invalid file:
+
+```text
+/look /definitely/not/a/photo.jpeg | What is this?
+```
 
 `/stop` cancels the application-owned request task without adding a model
 answer to history. It cannot prove that the independent Ollama server stopped
@@ -128,6 +217,20 @@ remote server is required. `clippy` treats lint warnings as failures. Cargo may
 need network access the first time it downloads declared crates; subsequent
 runs normally use its local cache.
 
+The ordinary test suite intentionally does not touch a real camera. To test
+enumeration, acquisition, validation, release, and negotiated dimensions on
+this computer **without Ollama**, first identify an explicit ID with
+`/cameras`, then run this from the repository root:
+
+```bash
+INDEPENDENCE_CAMERA_ID=0 cargo test manual_v4l_capture_without_ollama -- --ignored --nocapture
+```
+
+This intentionally opens the selected local camera for one bounded capture,
+prints its dimensions/format, and releases it. It does not save a photo or
+make an HTTP request. Replace `0` with the ID you chose. Do not run it as root
+or change device permissions merely to make it pass.
+
 ## Structure
 
 ```text
@@ -137,7 +240,8 @@ src/
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
   listen/        blocking keyboard adapter and command parser
-  see/           bounded, validated explicit photo loading
+  see/           bounded, validated file-photo and camera-image handling
+    camera.rs    V4L2 inventory, capture, conversion, and capture gate
   think/         Ollama /api/chat client and teacher prompt
   speak/         terminal answers, diagnostics, and help
 ```
@@ -155,8 +259,11 @@ application code.
 
 ## Current limits
 
-- Keyboard input only; no microphone, wake word, camera, or text-to-speech.
-- One explicit JPEG/PNG at a time; no live view or automatic capture.
+- Keyboard input only; no microphone, wake word, or text-to-speech.
+- One explicit JPEG/PNG or one explicit camera still at a time; no live view,
+  continuous vision, background capture, or autonomous camera use.
+- Camera support is Linux V4L2 single-plane MJPEG/YUYV only; unusual drivers or
+  multi-plane-only devices may not be listed as usable.
 - Non-streaming Ollama responses; no partial answer is printed.
 - Six accepted exchanges per scene/session; this is a simple context cap, not
   exact token budgeting. Start a new scene with `/look` or use `/reset`.

@@ -2,7 +2,13 @@
 
 use std::path::PathBuf;
 
-use crate::{see::Photo, think::ConversationTurn};
+use crate::{
+    see::{
+        Photo,
+        camera::{CameraDescriptor, CameraId, CameraPhotoSource},
+    },
+    think::ConversationTurn,
+};
 
 /// A unique identifier for one proposed model turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -14,10 +20,36 @@ impl TurnId {
     }
 }
 
+/// A unique identifier for a camera-command preflight.
+///
+/// Camera selection happens before a turn exists, so invalid hardware choices
+/// cannot supersede unrelated accepted work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CameraRequestId(u64);
+
+impl CameraRequestId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// A fact that reached the controller.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Input(Input),
+    CamerasListed(Result<Vec<CameraDescriptor>, String>),
+    CameraPrepared {
+        id: CameraRequestId,
+        result: Result<CameraDescriptor, String>,
+    },
+    CameraCaptureStarted {
+        id: TurnId,
+        camera: CameraDescriptor,
+    },
+    CameraCaptureReady {
+        id: TurnId,
+        source: CameraPhotoSource,
+    },
     TurnFinished(TurnFinished),
 }
 
@@ -25,7 +57,15 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Ask(String),
-    Look { path: PathBuf, question: String },
+    Look {
+        path: PathBuf,
+        question: String,
+    },
+    Cameras,
+    Camera {
+        requested: Option<CameraId>,
+        question: String,
+    },
     Stop,
     Reset,
     Help,
@@ -50,6 +90,14 @@ pub struct TurnRequest {
 pub enum VisualRequest {
     UseAccepted(Option<Photo>),
     ProposeNew(PathBuf),
+    ProposeCamera(CameraDescriptor),
+}
+
+/// A no-stream validation request for `/camera`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraPreparation {
+    pub id: CameraRequestId,
+    pub requested: Option<CameraId>,
 }
 
 /// A worker result. Workers never print or alter accepted session state.
@@ -75,6 +123,8 @@ pub enum TurnResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     StartTurn(TurnRequest),
+    PrepareCamera(CameraPreparation),
+    ListCameras,
     CancelTurn(TurnId),
     Display(Output),
     Exit,
@@ -85,5 +135,6 @@ pub enum Effect {
 pub enum Output {
     Answer(String),
     Diagnostic(String),
+    Cameras(Vec<CameraDescriptor>),
     Help,
 }

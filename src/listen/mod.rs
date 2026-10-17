@@ -15,7 +15,10 @@ use std::{
 
 use tokio::sync::mpsc::Sender;
 
-use crate::protocol::{Event, Input};
+use crate::{
+    protocol::{Event, Input},
+    see::camera::CameraId,
+};
 
 /// Starts the blocking keyboard adapter for this process.
 pub fn spawn_stdin_reader(sender: Sender<Event>) -> io::Result<()> {
@@ -78,6 +81,7 @@ pub fn parse_line(line: &str, working_directory: &Path) -> Input {
         "/reset" => return Input::Reset,
         "/quit" => return Input::Quit,
         "/help" => return Input::Help,
+        "/cameras" => return Input::Cameras,
         _ => {}
     }
 
@@ -89,8 +93,23 @@ pub fn parse_line(line: &str, working_directory: &Path) -> Input {
         return Input::Malformed("/stop, /reset, /quit, and /help do not accept arguments".into());
     }
 
+    if line.starts_with("/cameras") {
+        return Input::Malformed("/cameras does not accept arguments".into());
+    }
+
     if line == "/look" {
         return Input::Malformed("/look needs `path | question`".into());
+    }
+
+    if line == "/camera" {
+        return Input::Malformed("/camera needs `[id] | question`".into());
+    }
+
+    if let Some(rest) = line.strip_prefix("/camera") {
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            return Input::Malformed(format!("unknown command `{line}`; try /help"));
+        }
+        return parse_camera(rest);
     }
 
     let Some(rest) = line.strip_prefix("/look") else {
@@ -102,6 +121,36 @@ pub fn parse_line(line: &str, working_directory: &Path) -> Input {
     }
 
     parse_look(rest, working_directory)
+}
+
+fn parse_camera(rest: &str) -> Input {
+    let Some((raw_identifier, raw_question)) = rest.split_once('|') else {
+        return Input::Malformed("/camera needs `[id] | question`".into());
+    };
+
+    let identifier = raw_identifier.trim();
+    let question = raw_question.trim();
+    if question.is_empty() {
+        return Input::Malformed("/camera needs a question after `|`".into());
+    }
+
+    let requested = if identifier.is_empty() {
+        None
+    } else {
+        match CameraId::parse(identifier) {
+            Some(id) => Some(id),
+            None => {
+                return Input::Malformed(
+                    "/camera identifier must be a non-negative number listed by /cameras".into(),
+                );
+            }
+        }
+    };
+
+    Input::Camera {
+        requested,
+        question: question.to_owned(),
+    }
 }
 
 fn parse_look(rest: &str, working_directory: &Path) -> Input {
@@ -135,7 +184,7 @@ fn parse_look(rest: &str, working_directory: &Path) -> Input {
 mod tests {
     use std::path::Path;
 
-    use crate::protocol::Input;
+    use crate::{protocol::Input, see::camera::CameraId};
 
     use super::{classify_read, parse_line};
 
@@ -163,6 +212,42 @@ mod tests {
         assert!(matches!(
             parse_line("/look", Path::new("/work")),
             Input::Malformed(message) if message.contains("path | question")
+        ));
+    }
+
+    #[test]
+    fn camera_commands_keep_selection_separate_from_the_question() {
+        let working_directory = Path::new("/work");
+        assert_eq!(parse_line("/cameras", working_directory), Input::Cameras);
+        assert_eq!(
+            parse_line("/camera | What should I notice?", working_directory),
+            Input::Camera {
+                requested: None,
+                question: "What should I notice?".into(),
+            }
+        );
+        assert_eq!(
+            parse_line("/camera 12 | What should I notice?", working_directory),
+            Input::Camera {
+                requested: Some(CameraId::new(12)),
+                question: "What should I notice?".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_camera_does_not_become_a_question() {
+        assert!(matches!(
+            parse_line("/camera laptop | What is this?", Path::new("/work")),
+            Input::Malformed(message) if message.contains("identifier")
+        ));
+        assert!(matches!(
+            parse_line("/camera 0 |    ", Path::new("/work")),
+            Input::Malformed(message) if message.contains("question")
+        ));
+        assert!(matches!(
+            parse_line("/cameras extra", Path::new("/work")),
+            Input::Malformed(message) if message.contains("does not accept")
         ));
     }
 

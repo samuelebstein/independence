@@ -6,7 +6,8 @@
 
 use crate::{
     protocol::{
-        Effect, Event, Input, Output, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
+        CameraPreparation, CameraRequestId, Effect, Event, Input, Output, TurnFinished, TurnId,
+        TurnRequest, TurnResult, VisualRequest,
     },
     see::Photo,
     think::ConversationTurn,
@@ -19,7 +20,9 @@ pub const MAX_HISTORY_TURNS: usize = 6;
 pub struct Controller {
     session: Session,
     active: Option<ActiveTurn>,
+    pending_camera: Option<PendingCamera>,
     next_turn_id: u64,
+    next_camera_request_id: u64,
 }
 
 #[derive(Debug, Default)]
@@ -35,10 +38,17 @@ struct ActiveTurn {
     replaces_scene: bool,
 }
 
+#[derive(Debug)]
+struct PendingCamera {
+    id: CameraRequestId,
+    question: String,
+}
+
 impl Controller {
     pub fn new() -> Self {
         Self {
             next_turn_id: 1,
+            next_camera_request_id: 1,
             ..Self::default()
         }
     }
@@ -47,6 +57,14 @@ impl Controller {
     pub fn handle(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Input(input) => self.handle_input(input),
+            Event::CamerasListed(result) => self.handle_cameras_listed(result),
+            Event::CameraPrepared { id, result } => self.handle_camera_prepared(id, result),
+            Event::CameraCaptureStarted { id, camera } => {
+                self.handle_camera_capture_started(id, camera)
+            }
+            Event::CameraCaptureReady { id, source } => {
+                self.handle_camera_capture_ready(id, source)
+            }
             Event::TurnFinished(finished) => self.handle_turn_finished(finished),
         }
     }
@@ -73,8 +91,17 @@ impl Controller {
             Input::Look { path, question } => {
                 self.start_turn(question, VisualRequest::ProposeNew(path), true)
             }
-            Input::Stop => self.cancel_active(),
+            Input::Cameras => vec![Effect::ListCameras],
+            Input::Camera {
+                requested,
+                question,
+            } => self.prepare_camera(requested, question),
+            Input::Stop => {
+                self.pending_camera = None;
+                self.cancel_active()
+            }
             Input::Reset => {
+                self.pending_camera = None;
                 let mut effects = self.cancel_active();
                 self.session = Session::default();
                 effects.push(Effect::Display(Output::Diagnostic(
@@ -84,6 +111,7 @@ impl Controller {
             }
             Input::Help => vec![Effect::Display(Output::Help)],
             Input::Quit | Input::EndOfInput | Input::Interrupt => {
+                self.pending_camera = None;
                 let mut effects = self.cancel_active();
                 effects.push(Effect::Exit);
                 effects
@@ -101,6 +129,10 @@ impl Controller {
         visual: VisualRequest,
         replaces_scene: bool,
     ) -> Vec<Effect> {
+        // A newer valid question makes an outstanding no-stream camera
+        // preflight stale before it can supersede anything.
+        self.pending_camera = None;
+
         if !replaces_scene && self.session.history.len() >= MAX_HISTORY_TURNS {
             return vec![Effect::Display(Output::Diagnostic(format!(
                 "this session has reached {MAX_HISTORY_TURNS} accepted exchanges; use /reset or /look to start a new scene"
@@ -136,11 +168,96 @@ impl Controller {
         effects
     }
 
+    fn prepare_camera(
+        &mut self,
+        requested: Option<crate::see::camera::CameraId>,
+        question: String,
+    ) -> Vec<Effect> {
+        let id = CameraRequestId::new(self.next_camera_request_id);
+        self.next_camera_request_id = self
+            .next_camera_request_id
+            .checked_add(1)
+            .expect("camera request identifiers exhausted");
+        self.pending_camera = Some(PendingCamera { id, question });
+
+        vec![Effect::PrepareCamera(CameraPreparation { id, requested })]
+    }
+
     fn cancel_active(&mut self) -> Vec<Effect> {
         self.active
             .take()
             .map(|active| vec![Effect::CancelTurn(active.id)])
             .unwrap_or_default()
+    }
+
+    fn handle_cameras_listed(
+        &mut self,
+        result: Result<Vec<crate::see::camera::CameraDescriptor>, String>,
+    ) -> Vec<Effect> {
+        match result {
+            Ok(cameras) => vec![Effect::Display(Output::Cameras(cameras))],
+            Err(message) => vec![Effect::Display(Output::Diagnostic(format!(
+                "could not list cameras: {message}"
+            )))],
+        }
+    }
+
+    fn handle_camera_prepared(
+        &mut self,
+        id: CameraRequestId,
+        result: Result<crate::see::camera::CameraDescriptor, String>,
+    ) -> Vec<Effect> {
+        if self.pending_camera.as_ref().map(|pending| pending.id) != Some(id) {
+            return Vec::new();
+        }
+
+        let pending = self
+            .pending_camera
+            .take()
+            .expect("pending camera request was checked above");
+        match result {
+            Ok(camera) => {
+                self.start_turn(pending.question, VisualRequest::ProposeCamera(camera), true)
+            }
+            Err(message) => vec![Effect::Display(Output::Diagnostic(format!(
+                "could not prepare camera: {message}"
+            )))],
+        }
+    }
+
+    fn handle_camera_capture_started(
+        &mut self,
+        id: TurnId,
+        camera: crate::see::camera::CameraDescriptor,
+    ) -> Vec<Effect> {
+        if self.active.as_ref().map(|active| active.id) != Some(id) {
+            return Vec::new();
+        }
+
+        vec![Effect::Display(Output::Diagnostic(format!(
+            "activating camera {} ({}) to capture one still image",
+            camera.id(),
+            camera.name()
+        )))]
+    }
+
+    fn handle_camera_capture_ready(
+        &mut self,
+        id: TurnId,
+        source: crate::see::camera::CameraPhotoSource,
+    ) -> Vec<Effect> {
+        if self.active.as_ref().map(|active| active.id) != Some(id) {
+            return Vec::new();
+        }
+
+        vec![Effect::Display(Output::Diagnostic(format!(
+            "captured camera {} ({}) at {}x{} as JPEG from {}; camera released, asking local Ollama",
+            source.camera().id(),
+            source.camera().name(),
+            source.width(),
+            source.height(),
+            source.input_format(),
+        )))]
     }
 
     fn handle_turn_finished(&mut self, finished: TurnFinished) -> Vec<Effect> {
@@ -205,10 +322,13 @@ mod tests {
 
     use crate::{
         protocol::{
-            Effect, Event, Input, Output, TurnFinished, TurnId, TurnRequest, TurnResult,
-            VisualRequest,
+            CameraPreparation, Effect, Event, Input, Output, TurnFinished, TurnId, TurnRequest,
+            TurnResult, VisualRequest,
         },
-        see::Photo,
+        see::{
+            Photo, PhotoSource,
+            camera::{CameraDescriptor, CameraId},
+        },
     };
 
     use super::{Controller, MAX_HISTORY_TURNS};
@@ -236,6 +356,28 @@ mod tests {
                 _ => None,
             })
             .expect("a valid /look should start a turn")
+    }
+
+    fn camera(id: u32) -> CameraDescriptor {
+        CameraDescriptor::new(CameraId::new(id), format!("Test Camera {id}"))
+    }
+
+    fn prepare_camera(
+        controller: &mut Controller,
+        requested: Option<CameraId>,
+        question: &str,
+    ) -> CameraPreparation {
+        controller
+            .handle(Event::Input(Input::Camera {
+                requested,
+                question: question.into(),
+            }))
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::PrepareCamera(preparation) => Some(preparation),
+                _ => None,
+            })
+            .expect("a syntactically valid camera command should preflight")
     }
 
     fn successful_answer(
@@ -357,7 +499,7 @@ mod tests {
         );
         assert_eq!(
             controller.accepted_scene().unwrap().path(),
-            PathBuf::from("old.png")
+            Some(PathBuf::from("old.png").as_path())
         );
         assert_eq!(controller.accepted_history().len(), 1);
         assert_eq!(controller.accepted_history()[0].user, "old question");
@@ -386,7 +528,7 @@ mod tests {
 
         assert_eq!(
             controller.accepted_scene().unwrap().path(),
-            PathBuf::from("old.png")
+            Some(PathBuf::from("old.png").as_path())
         );
         assert_eq!(controller.accepted_history().len(), 1);
         assert_eq!(controller.accepted_history()[0].user, "old question");
@@ -404,7 +546,7 @@ mod tests {
         assert_eq!(follow_up.history[0].assistant, "a test tree");
         assert!(matches!(
             follow_up.visual,
-            VisualRequest::UseAccepted(Some(ref photo)) if photo.path() == PathBuf::from("tree.png")
+            VisualRequest::UseAccepted(Some(ref photo)) if photo.path() == Some(PathBuf::from("tree.png").as_path())
         ));
     }
 
@@ -445,5 +587,200 @@ mod tests {
             effects.as_slice(),
             [Effect::Display(Output::Diagnostic(message))] if message.contains("/reset or /look")
         ));
+    }
+
+    #[test]
+    fn invalid_camera_selection_does_not_interrupt_an_active_turn() {
+        let mut controller = Controller::new();
+        let active = start_ask(&mut controller, "keep answering this");
+        let preparation = prepare_camera(
+            &mut controller,
+            Some(CameraId::new(99)),
+            "what should I notice?",
+        );
+
+        assert!(controller.has_active_turn());
+        let effects = controller.handle(Event::CameraPrepared {
+            id: preparation.id,
+            result: Err("camera 99 is not available".into()),
+        });
+
+        assert_eq!(
+            effects,
+            vec![Effect::Display(Output::Diagnostic(
+                "could not prepare camera: camera 99 is not available".into()
+            ))]
+        );
+        assert!(controller.has_active_turn());
+        assert!(
+            controller
+                .handle(Event::TurnFinished(TurnFinished {
+                    id: active.id,
+                    result: TurnResult::Answer {
+                        answer: "still accepted".into(),
+                        proposed_scene: None,
+                    },
+                }))
+                .contains(&Effect::Display(Output::Answer("still accepted".into())))
+        );
+    }
+
+    #[test]
+    fn failed_or_cancelled_camera_scene_preserves_the_previous_camera_scene() {
+        let mut controller = Controller::new();
+        let old_camera = camera(0);
+        let first = start_look(&mut controller, "old.png", "old scene");
+        successful_answer(
+            &mut controller,
+            first.id,
+            "old answer",
+            Some(Photo::test_camera_photo(old_camera.clone())),
+        );
+
+        let preparation = prepare_camera(&mut controller, Some(CameraId::new(1)), "new scene");
+        let replacement = controller
+            .handle(Event::CameraPrepared {
+                id: preparation.id,
+                result: Ok(camera(1)),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .expect("a selected camera should start a staged scene");
+        assert!(matches!(
+            replacement.visual,
+            VisualRequest::ProposeCamera(_)
+        ));
+
+        controller.handle(Event::TurnFinished(TurnFinished {
+            id: replacement.id,
+            result: TurnResult::Failed {
+                message: "camera timed out".into(),
+            },
+        }));
+        assert!(matches!(
+            controller.accepted_scene().unwrap().source(),
+            PhotoSource::Camera(source) if source.camera() == &old_camera
+        ));
+        assert_eq!(controller.accepted_history().len(), 1);
+
+        let preparation = prepare_camera(&mut controller, Some(CameraId::new(1)), "new scene");
+        let replacement = controller
+            .handle(Event::CameraPrepared {
+                id: preparation.id,
+                result: Ok(camera(1)),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        controller.handle(Event::Input(Input::Stop));
+        assert!(
+            controller
+                .handle(Event::TurnFinished(TurnFinished {
+                    id: replacement.id,
+                    result: TurnResult::Answer {
+                        answer: "too late".into(),
+                        proposed_scene: Some(Photo::test_camera_photo(camera(1))),
+                    },
+                }))
+                .is_empty()
+        );
+        assert!(matches!(
+            controller.accepted_scene().unwrap().source(),
+            PhotoSource::Camera(source) if source.camera() == &old_camera
+        ));
+        assert_eq!(controller.accepted_history().len(), 1);
+    }
+
+    #[test]
+    fn reset_makes_late_camera_preflight_and_capture_results_harmless() {
+        let mut controller = Controller::new();
+        let preparation = prepare_camera(&mut controller, None, "a camera question");
+        controller.handle(Event::Input(Input::Reset));
+        assert!(
+            controller
+                .handle(Event::CameraPrepared {
+                    id: preparation.id,
+                    result: Ok(camera(0)),
+                })
+                .is_empty()
+        );
+
+        let preparation = prepare_camera(&mut controller, None, "a camera question");
+        let request = controller
+            .handle(Event::CameraPrepared {
+                id: preparation.id,
+                result: Ok(camera(0)),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        controller.handle(Event::Input(Input::Reset));
+        assert!(
+            controller
+                .handle(Event::TurnFinished(TurnFinished {
+                    id: request.id,
+                    result: TurnResult::Answer {
+                        answer: "too late".into(),
+                        proposed_scene: Some(Photo::test_camera_photo(camera(0))),
+                    },
+                }))
+                .is_empty()
+        );
+        assert!(controller.accepted_scene().is_none());
+        assert!(controller.accepted_history().is_empty());
+    }
+
+    #[test]
+    fn a_new_question_makes_late_camera_preflight_and_capture_results_harmless() {
+        let mut controller = Controller::new();
+        let preparation = prepare_camera(&mut controller, Some(CameraId::new(0)), "camera turn");
+        let newer = start_ask(&mut controller, "newer text turn");
+        assert!(
+            controller
+                .handle(Event::CameraPrepared {
+                    id: preparation.id,
+                    result: Ok(camera(0)),
+                })
+                .is_empty()
+        );
+
+        let preparation = prepare_camera(&mut controller, Some(CameraId::new(0)), "camera turn");
+        let camera_turn = controller
+            .handle(Event::CameraPrepared {
+                id: preparation.id,
+                result: Ok(camera(0)),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        let replacement = start_ask(&mut controller, "newer replacement");
+        assert!(
+            controller
+                .handle(Event::TurnFinished(TurnFinished {
+                    id: camera_turn.id,
+                    result: TurnResult::Answer {
+                        answer: "late camera answer".into(),
+                        proposed_scene: Some(Photo::test_camera_photo(camera(0))),
+                    },
+                }))
+                .is_empty()
+        );
+        successful_answer(&mut controller, replacement.id, "new accepted answer", None);
+        assert!(controller.accepted_scene().is_none());
+        assert_eq!(controller.accepted_history().len(), 1);
+        assert_eq!(controller.accepted_history()[0].user, "newer replacement");
+        assert_ne!(newer.id, replacement.id);
     }
 }

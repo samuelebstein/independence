@@ -43,21 +43,29 @@ cargo run
 ```
 
 This compiles the Rust package (writing only `target/`) and starts the
-terminal app. It uses `http://127.0.0.1:11434` and `qwen3-vl:4b` unless you
-set environment variables for that one command:
+terminal app. It uses `http://127.0.0.1:11434` and the local non-thinking
+vision model `qwen3-vl:4b-instruct` unless you set environment variables for
+that one command:
 
 ```bash
-OLLAMA_URL=http://127.0.0.1:11434 OLLAMA_MODEL=qwen3-vl:4b cargo run
+OLLAMA_URL=http://127.0.0.1:11434 OLLAMA_MODEL=qwen3-vl:4b-instruct cargo run
 ```
 
 This does not change shell configuration or Ollama settings. The model must
 already be available from a running local Ollama server. If it is not, the app
 reports the local connection failure rather than falling back to a cloud API.
 
+`qwen3-vl:4b-instruct` retains text and image input but is a separate
+non-thinking model variant. On this machine it answered a one-word prompt with
+two generated tokens, while the installed `qwen3-vl:4b` thinking variant spent
+hundreds of tokens reasoning first. To deliberately use that slower reasoning
+variant again, set `OLLAMA_MODEL=qwen3-vl:4b` for one `cargo run` command.
+
 If you need to install or download a model, do that deliberately outside this
-project. For example, `ollama pull qwen3-vl:4b` uses the network and consumes
-local disk space; it is not run automatically by this application. Starting
-`ollama serve` starts a local service and binds its configured local endpoint.
+project. For example, `ollama pull qwen3-vl:4b-instruct` uses the network and
+consumes local disk space; it is not run automatically by this application.
+Starting `ollama serve` starts a local service and binds its configured local
+endpoint.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine

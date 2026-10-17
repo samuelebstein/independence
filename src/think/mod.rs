@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
-const DEFAULT_OLLAMA_MODEL: &str = "qwen3-vl:4b";
+// The Instruct tag is the non-thinking Qwen3-VL variant. It remains a vision
+// model, but avoids spending a large part of a short interaction on a hidden
+// reasoning pass. Callers can still choose a different local model through
+// `OLLAMA_MODEL`.
+const DEFAULT_OLLAMA_MODEL: &str = "qwen3-vl:4b-instruct";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 

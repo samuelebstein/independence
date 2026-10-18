@@ -2,6 +2,7 @@
 
 use std::{
     env,
+    ffi::c_void,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -12,6 +13,46 @@ use std::{
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::protocol::CapturedAudio;
+
+/// Returns a stable pointer to the cancellation flag for whisper.cpp's native
+/// abort callback. The caller keeps the `Arc` alive for the whole synchronous
+/// `WhisperState::full` call.
+fn cancellation_callback_data(cancelled: &Arc<AtomicBool>) -> *mut c_void {
+    Arc::as_ptr(cancelled).cast_mut().cast()
+}
+
+/// Native callback used by whisper.cpp while encoding and decoding.
+///
+/// `whisper-rs` 0.16.0 exposes this lower-level API. Using it here avoids its
+/// convenience callback wrapper, whose pointer ownership is not suitable for
+/// repeated dictation calls. The only operation is an atomic read, so it is
+/// safe when whisper.cpp invokes it from its worker threads.
+unsafe extern "C" fn transcription_cancelled_callback(user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        // A null callback pointer should never be configured by this module.
+        // Aborting is safer than dereferencing an invalid address.
+        return true;
+    }
+
+    // SAFETY: `cancellation_callback_data` derives this pointer from an
+    // `Arc<AtomicBool>` that remains owned by `transcribe` until
+    // `WhisperState::full` returns. whisper.cpp uses it only during that
+    // synchronous call, and AtomicBool permits concurrent reads/writes.
+    let cancelled = unsafe { &*user_data.cast::<AtomicBool>() };
+    cancelled.load(Ordering::Acquire)
+}
+
+fn install_cancellation_callback(parameters: &mut FullParams<'_, '_>, cancelled: &Arc<AtomicBool>) {
+    let user_data = cancellation_callback_data(cancelled);
+
+    // SAFETY: the callback and pointer have the lifetime and thread-safety
+    // guarantees documented directly above. `state.full` is synchronous, so
+    // it cannot retain this pointer after `transcribe` returns.
+    unsafe {
+        parameters.set_abort_callback(Some(transcription_cancelled_callback));
+        parameters.set_abort_callback_user_data(user_data);
+    }
+}
 
 /// The recognizer boundary has no notion of questions, commands, Ollama, or
 /// cameras. It receives prepared audio and returns only text or an error.
@@ -132,8 +173,7 @@ impl Transcriber for WhisperTranscriber {
             .unwrap_or(1);
         parameters.set_n_threads(threads);
 
-        let abort = cancelled.clone();
-        parameters.set_abort_callback_safe(Some(move || abort.load(Ordering::Acquire)));
+        install_cancellation_callback(&mut parameters, &cancelled);
         state.full(parameters, audio.samples()).map_err(|error| {
             if cancelled.load(Ordering::Acquire) {
                 TranscriptionError::Cancelled
@@ -170,12 +210,30 @@ impl Transcriber for WhisperTranscriber {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use crate::protocol::CapturedAudio;
 
-    use super::{Transcriber, TranscriptionError, WhisperTranscriber};
+    use super::{
+        Transcriber, TranscriptionError, WhisperTranscriber, cancellation_callback_data,
+        transcription_cancelled_callback,
+    };
+
+    #[test]
+    fn native_cancellation_callback_reads_the_expected_flag() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let callback_data = cancellation_callback_data(&cancelled);
+
+        // SAFETY: callback_data was just produced from the live Arc above.
+        assert!(!unsafe { transcription_cancelled_callback(callback_data) });
+        cancelled.store(true, Ordering::Release);
+        // SAFETY: the Arc remains alive for this callback invocation.
+        assert!(unsafe { transcription_cancelled_callback(callback_data) });
+    }
 
     #[test]
     fn missing_model_is_reported_without_running_recognition() {
@@ -200,5 +258,38 @@ mod tests {
             ),
             Err(TranscriptionError::Cancelled)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires the locally downloaded Whisper base.en model"]
+    fn local_model_handles_two_consecutive_transcriptions() {
+        let transcriber =
+            WhisperTranscriber::new(PathBuf::from("local-data/whisper/ggml-base.en.bin"));
+        assert!(
+            transcriber.model_is_available(),
+            "download the local Whisper model before running this test"
+        );
+
+        // Silence is sufficient to exercise the native encoder twice. It may
+        // legitimately yield no words, which remains a normal application
+        // error; the regression under test is a native encoder failure on the
+        // second call.
+        for attempt in 1..=2 {
+            let result = transcriber.transcribe(
+                CapturedAudio::new(vec![0.0; 16_000 * 2]),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let completed_without_native_failure = match &result {
+                Ok(_) => true,
+                Err(TranscriptionError::Failed(message)) => {
+                    message == "local transcription returned no text"
+                }
+                Err(TranscriptionError::Cancelled) => false,
+            };
+            assert!(
+                completed_without_native_failure,
+                "native Whisper call {attempt} failed unexpectedly: {result:?}"
+            );
+        }
     }
 }

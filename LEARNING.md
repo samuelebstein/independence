@@ -166,12 +166,13 @@ before resampling or transcription. The command loop polls every 100 ms and
 the cap is enforced by the capture owner, not merely displayed by the UI.
 
 Whisper runs in `spawn_blocking`, which keeps native CPU work off Tokio's
-event-loop threads. `FullParams::set_abort_callback_safe` receives an
-`Arc<AtomicBool>` cancellation flag. Esc sets that flag; it does **not** use
-`JoinHandle::abort` to claim that foreign native computation died instantly.
-The outer task waits for Whisper to reach a supported abort callback point,
-then drops the audio and ignores any obsolete result. This is why dictation
-does not accept a new recording while a cancelled worker is still cleaning up.
+event-loop threads. The application installs whisper.cpp's abort callback with
+a pointer into an `Arc<AtomicBool>` that stays alive for the synchronous
+recognition call. Esc sets that flag; it does **not** use `JoinHandle::abort`
+to claim that foreign native computation died instantly. The outer task waits
+for Whisper to reach a supported abort callback point, then drops the audio
+and ignores any obsolete result. This is why dictation does not accept a new
+recording while a cancelled worker is still cleaning up.
 
 ### Serde and reqwest versus our code
 

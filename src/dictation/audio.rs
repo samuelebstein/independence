@@ -108,8 +108,10 @@ impl CpalRecorder {
                 .map_err(|error| format!("could not enumerate microphone devices: {error}"))?;
             for device in devices {
                 let name = device
+                    .description()
+                    .map_err(|error| format!("could not read microphone description: {error}"))?
                     .name()
-                    .map_err(|error| format!("could not read microphone name: {error}"))?;
+                    .to_owned();
                 if &name == requested_name {
                     return Ok(device);
                 }
@@ -128,14 +130,16 @@ impl CpalRecorder {
 
     fn description_for(&self, device: &Device) -> Result<MicrophoneDescription, String> {
         let name = device
+            .description()
+            .map_err(|error| format!("could not read microphone description: {error}"))?
             .name()
-            .map_err(|error| format!("could not read microphone name: {error}"))?;
+            .to_owned();
         let config = device
             .default_input_config()
             .map_err(|error| format!("could not query microphone format: {error}"))?;
         Ok(MicrophoneDescription::new(
             name,
-            config.sample_rate().0,
+            config.sample_rate(),
             config.channels(),
         ))
     }
@@ -176,7 +180,7 @@ impl CpalRecorder {
             .default_input_config()
             .map_err(|error| format!("could not query microphone format: {error}"))?;
         let channels = usize::from(supported_config.channels());
-        let sample_rate = supported_config.sample_rate().0;
+        let sample_rate = supported_config.sample_rate();
         if channels == 0 || sample_rate == 0 {
             return Err("microphone reported an unusable zero-channel or zero-rate format".into());
         }
@@ -463,7 +467,7 @@ where
     let error_slot = stream_error.clone();
     device
         .build_input_stream(
-            config.clone(),
+            *config,
             move |data: &[T], _| input.append(data, channels),
             move |error| {
                 if let Ok(mut slot) = error_slot.lock() {
@@ -484,8 +488,7 @@ fn bounded_raw_sample_limit(sample_rate: u32) -> Result<usize, String> {
         .ok_or_else(|| "microphone sample rate overflows the recording limit".to_owned())?;
     if required > MAX_RAW_SAMPLES {
         return Err(format!(
-            "microphone sample rate {sample_rate} Hz would exceed the {}-sample capture bound",
-            MAX_RAW_SAMPLES
+            "microphone sample rate {sample_rate} Hz would exceed the {MAX_RAW_SAMPLES}-sample capture bound"
         ));
     }
     Ok(required)

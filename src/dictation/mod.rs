@@ -58,7 +58,7 @@ async fn run_with_services(
 ) -> Result<(), DictationError> {
     let microphone = recorder.selected_microphone();
     let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let mut input = listen::spawn_dictation_key_reader(event_sender.clone())
+    let mut input = listen::dictation::spawn_dictation_key_reader(event_sender.clone())
         .map_err(DictationError::InputAdapter)?;
 
     let microphone_label = microphone.as_ref().map(|microphone| microphone.label());

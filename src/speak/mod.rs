@@ -40,6 +40,11 @@ prove that a separate Ollama server has stopped its own computation immediately.
 For the deliberately separate local microphone experiment, start
 `cargo run -- --dictate`. Its transcript is displayed only; it never becomes a
 question, slash command, camera request, or Ollama request.
+
+For integrated voice questions, start `cargo run -- --voice`. It uses the
+same local microphone and Whisper setup, displays each accepted transcript,
+then sends that text as a literal question to local Ollama. Spoken slash-like
+text is never parsed as a terminal command.
 "#;
 
 pub fn welcome() {
@@ -71,6 +76,36 @@ pub fn emit(output: Output) {
     }
 }
 
+/// Emits main-application output while Crossterm raw mode is active.
+///
+/// Voice mode owns raw terminal input, so it must not rely on `println!` for
+/// controller-approved answers or diagnostics. This uses the same explicit
+/// write-and-flush path as the dictation UI.
+pub fn emit_raw(output: Output) {
+    match output {
+        Output::Answer(answer) => raw_prefixed_lines("independence: ", &answer),
+        Output::Diagnostic(message) => raw_prefixed_lines("independence: ", &message),
+        Output::Cameras(cameras) => {
+            if cameras.is_empty() {
+                dictation_line(
+                    "independence: no usable V4L2 cameras found; connect one, check permissions, then run /cameras",
+                );
+            } else {
+                dictation_line("independence: usable cameras:");
+                for camera in cameras {
+                    dictation_line(&format!(
+                        "  {}  {}  (/dev/video{})",
+                        camera.id(),
+                        camera.name(),
+                        camera.id()
+                    ));
+                }
+            }
+        }
+        Output::Help => raw_block(HELP),
+    }
+}
+
 /// Displays the non-sensitive setup information before dictation enters READY.
 pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
     dictation_line("Independence dictation — local transcription only");
@@ -89,6 +124,29 @@ pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, mode
     ));
     dictation_line("Enter starts/stops recording; Esc discards/cancels; Ctrl+C exits.");
     dictation_line("Transcripts are displayed as text only and are never submitted to Ollama.");
+}
+
+/// Displays the setup information for integrated voice questions.
+pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
+    dictation_line("Independence voice — local transcription and local Ollama");
+    match microphone {
+        Ok(microphone) => dictation_line(&format!("Microphone: {microphone}")),
+        Err(message) => dictation_line(&format!("Microphone: unavailable ({message})")),
+    }
+    let availability = if model_available {
+        "available"
+    } else {
+        "missing; recording will not start"
+    };
+    dictation_line(&format!(
+        "Whisper model: {} ({availability})",
+        model_path.display()
+    ));
+    dictation_line("Enter starts/stops recording; Esc cancels; Ctrl+C exits.");
+    dictation_line(
+        "Accepted transcripts are displayed, then sent as literal questions to local Ollama.",
+    );
+    dictation_line("Spoken text such as /camera or /quit cannot execute a terminal command.");
 }
 
 /// Emits raw-mode-safe dictation UI. Ordinary `println!` is not used here:
@@ -120,4 +178,23 @@ fn dictation_line(line: &str) {
     let _ = stdout.write_all(line.as_bytes());
     let _ = stdout.write_all(b"\r\n");
     let _ = stdout.flush();
+}
+
+fn raw_prefixed_lines(prefix: &str, text: &str) {
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(first) => {
+            dictation_line(&format!("{prefix}{first}"));
+            for line in lines {
+                dictation_line(line);
+            }
+        }
+        None => dictation_line(prefix.trim_end()),
+    }
+}
+
+fn raw_block(text: &str) {
+    for line in text.lines() {
+        dictation_line(line);
+    }
 }

@@ -15,14 +15,18 @@ It can:
   follow-up questions as `see` context; and
 - print an accepted answer as `speak`.
 
-It also has a deliberately separate, local-only dictation experiment launched
-with `--dictate`. It records one short microphone clip, transcribes it with
-local Whisper, and displays the text. It does not feed that text to the main
-application.
+It also has two explicit local microphone modes:
 
-The normal observation mode does not access a microphone. Neither mode
-persists a conversation, streams tokens, calls tools autonomously, or uses a
-cloud model.
+- `--dictate` records one short clip, transcribes it with local Whisper, and
+  displays the text only. It never contacts Ollama or invokes a command.
+- `--voice` uses that same bounded recording flow, displays an accepted
+  transcript, then sends it as literal question text to the existing local
+  Ollama/controller path. Spoken `/camera` and `/quit` text is never parsed as
+  a terminal command.
+
+The default observation mode (`cargo run`) does not access a microphone. No
+current mode persists a conversation, streams tokens, calls tools
+autonomously, or uses a cloud model.
 
 ## Start here
 
@@ -76,12 +80,14 @@ consumes local disk space; it is not run automatically by this application.
 Starting `ollama serve` starts a local service and binds its configured local
 endpoint.
 
-## Dictation-only milestone
+## Dictation and voice modes
 
-This is intentionally separate from the observation app. It has no Ollama or
-camera dependency at runtime: Enter records, the next Enter transcribes
-locally, and the recognized text is printed. A transcript that says `/camera`,
-`/quit`, or anything else is just displayed text.
+Both microphone modes use local CPAL capture and local Whisper recognition.
+They share the recording controls below, but have intentionally different
+destinations for an accepted transcript. `--dictate` stops at terminal display
+and has no Ollama or camera dependency at runtime. `--voice` sends an accepted
+nonempty transcript directly to the existing text-question controller; it does
+not parse it with the terminal command parser.
 
 ### One-time local prerequisites
 
@@ -118,7 +124,8 @@ command. The application does not download model weights automatically.
 
 ### Launch and controls
 
-From the repository root, after the model file exists:
+From the repository root, after the model file exists, start transcript-only
+dictation with:
 
 ```bash
 cargo run -- --dictate
@@ -137,21 +144,48 @@ That command changes neither the default device nor shell configuration. If
 the requested name is unavailable, READY reports the problem and recording
 does not start.
 
+To use the speech-to-controller bridge, first ensure the same local Ollama
+setup described above is running, then launch:
+
+```bash
+cargo run -- --voice
+```
+
+This starts the same raw-key recording interface but constructs the normal
+local Ollama runtime as well. It still uses the default
+`qwen3-vl:4b-instruct` unless `OLLAMA_MODEL` is set for that one command. For
+example, this selects both an input device and a model without changing system
+defaults or shell configuration:
+
+```bash
+INDEPENDENCE_MICROPHONE='Exact microphone name' \
+OLLAMA_MODEL=qwen3-vl:4b-instruct \
+cargo run -- --voice
+```
+
 | State | Control | Result |
 | --- | --- | --- |
-| READY | Enter | Opens the selected microphone and begins one recording. |
+| READY | Enter | Opens the selected microphone and begins one recording. In `--voice`, it first cancels an outstanding model answer. |
 | RECORDING | Enter | Stops and releases the microphone, then begins local transcription. |
 | RECORDING | Esc | Discards the clip and waits for microphone cleanup. |
 | RECORDING | 30 seconds | Automatically stops and begins transcription. |
 | TRANSCRIBING | Esc | Requests cooperative cancellation; no late text is displayed. |
+| READY in `--voice` | Esc | Cancels an outstanding model answer while preserving accepted conversation. |
 | Any state | Ctrl+C | Cancels owned work, restores the terminal, and exits. |
 
 Repeated Enter presses outside READY are ignored. The raw-key reader is the
-only terminal input owner in this mode; the normal line reader is not running.
-The microphone stream is opened only after Enter and is dropped before
-resampling or Whisper inference begins. Audio lives only in bounded memory and
-is discarded after transcription or cancellation; Independence writes no
-recordings to disk.
+only terminal input owner in either microphone mode; the normal line reader is
+not running. The microphone stream is opened only after Enter and is dropped
+before resampling or Whisper inference begins. Audio lives only in bounded
+memory and is discarded after transcription or cancellation; Independence
+writes no recordings to disk.
+
+In `--voice`, Whisper has no command or camera authority. After
+`DictationController` accepts the current `RecordingId`, the runtime displays
+the text and constructs `Input::Ask(transcript)` directly. The main controller
+then gives its model turn a separate `TurnId`. A cancelled/stale recording
+never crosses that boundary, and a late model result cannot bypass the normal
+turn-ID acceptance rule.
 
 Try this manual sequence:
 
@@ -163,12 +197,25 @@ Try this manual sequence:
 3. Press Enter a third time, say a different short sentence, then press Enter.
    Only that third transcript should appear after the earlier successful one.
 
+For `--voice`, try this separate sequence:
+
+1. Start `cargo run -- --voice`, press Enter, ask “What is the primary gas in
+   Earth’s atmosphere?”, then press Enter. The transcript appears first, then
+   the local model's text answer.
+2. At READY, press Enter again, ask “Why does that matter for life?”, then
+   press Enter. This is a follow-up using the accepted conversation.
+3. While the second answer is still pending, press Enter to begin a third
+   recording. The old answer must not appear. Press Esc to discard that third
+   recording; the first accepted exchanges remain intact.
+
 Current limits: English `base.en` recognition runs on CPU; no device list UI,
 voice activity detection, streaming partial text, saved audio, microphone
-permissions workflow, Ollama request, camera request, or spoken reply exists
-in this milestone. Whisper cancellation is cooperative: Esc prevents a result
-from being accepted, while the native recognizer exits at its next supported
-abort callback point.
+permissions workflow, text-to-speech, decision-model routing, photo
+permission loop, autonomous camera request, or spoken reply exists. Voice
+questions cannot use typed `/look` or `/camera` commands; keep using the
+default keyboard mode for those. Whisper cancellation is cooperative: Esc
+prevents a result from being accepted, while the native recognizer exits at
+its next supported abort callback point.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine
@@ -353,8 +400,8 @@ src/
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
   listen/        blocking keyboard adapter and command parser
-    dictation.rs raw-key adapter used only by --dictate
-  dictation/     transcription-only controller, CPAL capture, and Whisper wrapper
+    dictation.rs raw-key adapter used by --dictate and --voice
+  dictation/     recording-ID controller, CPAL capture, Whisper, accepted-text boundary
   see/           bounded, validated file-photo and camera-image handling
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
   think/         Ollama /api/chat client and teacher prompt
@@ -374,8 +421,10 @@ application code.
 
 ## Current limits
 
-- Observation mode uses keyboard input only; its separate `--dictate` mode has
-  one explicit microphone recording at a time but no wake word or text-to-speech.
+- Default observation mode uses keyboard input only. `--dictate` is
+  transcript-only; `--voice` can submit one accepted spoken question at a time,
+  but neither has wake words, text-to-speech, decision routing, or camera
+  permission handling.
 - One explicit JPEG/PNG or one explicit camera still at a time; no live view,
   continuous vision, background capture, or autonomous camera use.
 - Camera support is Linux V4L2 single-plane MJPEG/YUYV only; unusual drivers or

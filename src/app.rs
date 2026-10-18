@@ -12,10 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     controller::Controller,
-    dictation, listen,
+    dictation::{self, DictationAction, DictationSession},
+    listen,
     protocol::{
-        CameraPreparation, Effect, Event, Input, TurnFinished, TurnId, TurnRequest, TurnResult,
-        VisualRequest,
+        CameraPreparation, DictationEvent, DictationInput, Effect, Event, Input, TurnFinished,
+        TurnId, TurnRequest, TurnResult, VisualRequest,
     },
     see::{
         Photo, PhotoSource,
@@ -26,6 +27,21 @@ use crate::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 32;
+
+#[derive(Clone, Copy)]
+enum OutputMode {
+    Line,
+    Raw,
+}
+
+impl OutputMode {
+    fn emit(self, output: crate::protocol::Output) {
+        match self {
+            Self::Line => speak::emit(output),
+            Self::Raw => speak::emit_raw(output),
+        }
+    }
+}
 
 /// Runs the interactive terminal application until `/quit`, EOF, or Ctrl+C.
 pub async fn run() -> Result<(), AppError> {
@@ -43,20 +59,7 @@ pub async fn run() -> Result<(), AppError> {
             event = event_receiver.recv() => event.unwrap_or(Event::Input(Input::EndOfInput)),
         };
 
-        if let Event::TurnFinished(finished) = &event {
-            runtime.retire(finished.id).await;
-        }
-
-        let effects = controller.handle(event);
-        let mut should_exit = false;
-        for effect in effects {
-            if !runtime.apply(effect).await {
-                should_exit = true;
-                break;
-            }
-        }
-
-        if should_exit {
+        if !apply_main_event(&mut controller, &mut runtime, event, OutputMode::Line).await {
             break;
         }
     }
@@ -69,6 +72,88 @@ pub async fn run() -> Result<(), AppError> {
 /// services. Its transcript deliberately stops at terminal display.
 pub async fn run_dictation() -> Result<(), AppError> {
     dictation::run().await.map_err(AppError::Dictation)
+}
+
+/// Runs local dictation connected to the existing text-question controller.
+///
+/// This owns the raw-key input adapter, while `DictationSession` continues to
+/// own microphone and Whisper lifetimes. Only an accepted transcript crosses
+/// into the main controller as literal `Input::Ask` text.
+pub async fn run_voice() -> Result<(), AppError> {
+    let client = OllamaClient::from_environment()?;
+    let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let (dictation_event_sender, mut dictation_event_receiver) =
+        mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let mut input = listen::dictation::spawn_dictation_key_reader(dictation_event_sender.clone())
+        .map_err(AppError::InputAdapter)?;
+
+    let dictation = DictationSession::from_environment(dictation_event_sender);
+    let microphone_label = dictation.microphone_label();
+    let microphone_for_display = match &microphone_label {
+        Ok(label) => Ok(label.as_str()),
+        Err(message) => Err(message.as_str()),
+    };
+    speak::voice_welcome(
+        microphone_for_display,
+        dictation.model_path(),
+        dictation.model_is_available(),
+    );
+    speak::emit_dictation(crate::protocol::DictationOutput::Ready);
+
+    let mut runtime = VoiceRuntime::new(
+        Controller::new(),
+        TurnRuntime::new(client, CameraService::v4l(), main_event_sender),
+        dictation,
+    );
+
+    loop {
+        let event = tokio::select! {
+            _ = tokio::signal::ctrl_c() => VoiceEvent::Dictation(DictationEvent::Input(DictationInput::Interrupt)),
+            event = dictation_event_receiver.recv() => VoiceEvent::Dictation(event.unwrap_or(DictationEvent::Input(DictationInput::EndOfInput))),
+            event = main_event_receiver.recv() => VoiceEvent::Main(event.unwrap_or(Event::Input(Input::Interrupt))),
+        };
+
+        let keep_running = match event {
+            VoiceEvent::Dictation(event) => runtime.handle_dictation_event(event).await,
+            VoiceEvent::Main(event) => runtime.handle_main_event(event).await,
+        };
+        if !keep_running {
+            break;
+        }
+    }
+
+    // This adapter owns raw mode. Stop and join it before restoring normal
+    // terminal settings, then release both native dictation work and the
+    // application-owned inference task.
+    input.shutdown();
+    runtime.shutdown().await;
+    Ok(())
+}
+
+enum VoiceEvent {
+    Dictation(DictationEvent),
+    Main(Event),
+}
+
+/// Applies facts at the main controller boundary for both line-input and voice
+/// runtimes. The controller still decides whether a worker completion may
+/// become output or history; this helper only chooses raw-safe rendering.
+async fn apply_main_event(
+    controller: &mut Controller,
+    runtime: &mut TurnRuntime,
+    event: Event,
+    output_mode: OutputMode,
+) -> bool {
+    if let Event::TurnFinished(finished) = &event {
+        runtime.retire(finished.id).await;
+    }
+
+    for effect in controller.handle(event) {
+        if !runtime.apply(effect, output_mode).await {
+            return false;
+        }
+    }
+    true
 }
 
 struct TurnRuntime {
@@ -94,13 +179,13 @@ impl TurnRuntime {
         }
     }
 
-    async fn apply(&mut self, effect: Effect) -> bool {
+    async fn apply(&mut self, effect: Effect, output_mode: OutputMode) -> bool {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
-            Effect::Display(output) => speak::emit(output),
+            Effect::Display(output) => output_mode.emit(output),
             Effect::Exit => {
                 self.shutdown().await;
                 return false;
@@ -218,6 +303,79 @@ impl TurnRuntime {
         // async task. It still owns this gate until V4L2 has released its
         // buffers and device handle, so wait before process shutdown.
         self.camera.wait_for_idle().await;
+    }
+}
+
+/// Coordinates two independent controllers for `--voice`.
+///
+/// `DictationSession` remains responsible for deciding whether a Whisper
+/// completion is current. The main `Controller` remains responsible for turn
+/// ownership, history, and accepted output. This small coordinator only
+/// defines the user-interface policy that a READY Enter/Esc cancels an
+/// outstanding answer before starting or returning to the next recording.
+struct VoiceRuntime {
+    controller: Controller,
+    turns: TurnRuntime,
+    dictation: DictationSession,
+}
+
+impl VoiceRuntime {
+    fn new(controller: Controller, turns: TurnRuntime, dictation: DictationSession) -> Self {
+        Self {
+            controller,
+            turns,
+            dictation,
+        }
+    }
+
+    async fn handle_main_event(&mut self, event: Event) -> bool {
+        apply_main_event(
+            &mut self.controller,
+            &mut self.turns,
+            event,
+            OutputMode::Raw,
+        )
+        .await
+    }
+
+    async fn handle_dictation_event(&mut self, event: DictationEvent) -> bool {
+        let cancel_main_answer = match &event {
+            DictationEvent::Input(DictationInput::Enter | DictationInput::Escape) => {
+                self.dictation.is_ready()
+            }
+            _ => false,
+        };
+        if cancel_main_answer && !self.handle_main_event(Event::Input(Input::Stop)).await {
+            return false;
+        }
+
+        for action in self.dictation.handle(event).await {
+            match action {
+                DictationAction::Display(output) => speak::emit_dictation(output),
+                DictationAction::AcceptedTranscript { text } => {
+                    // This is intentionally a direct construction, not
+                    // `listen::parse_line`: spoken `/camera` or `/quit` text
+                    // is an ordinary question with no command authority.
+                    if !self.handle_main_event(Event::Input(Input::Ask(text))).await {
+                        return false;
+                    }
+                }
+                DictationAction::Exit => {
+                    // Dictation shutdown owns microphone/recognizer cleanup;
+                    // the main controller cancels its owned model turn using
+                    // its ordinary generation-safe exit path.
+                    let _ = self.handle_main_event(Event::Input(Input::Interrupt)).await;
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    async fn shutdown(&mut self) {
+        self.dictation.shutdown().await;
+        self.turns.shutdown().await;
     }
 }
 
@@ -366,13 +524,15 @@ pub enum AppError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         future::Future,
         io::Cursor,
         path::{Path, PathBuf},
+        pin::Pin,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -390,8 +550,14 @@ mod tests {
 
     use crate::{
         controller::Controller,
+        dictation::{
+            DictationSession,
+            audio::{MicrophoneDescription, Recorder, RecordingHandle},
+            transcribe::{Transcriber, TranscriptionError},
+        },
         protocol::{
-            Effect, Event, Input, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
+            CapturedAudio, DictationEvent, DictationInput, Effect, Event, Input, RecordingId,
+            TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
         },
         see::{
             MAX_PHOTO_BYTES, Photo, PhotoSource,
@@ -403,7 +569,7 @@ mod tests {
         think::{OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
     };
 
-    use super::run_turn;
+    use super::{TurnRuntime, VoiceRuntime, run_turn};
 
     fn client(server: &MockServer) -> Arc<OllamaClient> {
         Arc::new(
@@ -464,6 +630,217 @@ mod tests {
     fn unused_event_sender() -> mpsc::Sender<Event> {
         let (sender, _receiver) = mpsc::channel(4);
         sender
+    }
+
+    /// A synthetic capture boundary for the integrated voice tests. It sends
+    /// the same typed events as CPAL, but never opens a physical microphone.
+    #[derive(Default)]
+    struct VoiceRecorder {
+        starts: Arc<AtomicUsize>,
+        finishes: Arc<AtomicUsize>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl Recorder for VoiceRecorder {
+        fn selected_microphone(&self) -> Result<MicrophoneDescription, String> {
+            Ok(MicrophoneDescription::new(
+                "synthetic voice microphone".into(),
+                16_000,
+                1,
+            ))
+        }
+
+        fn start(
+            &self,
+            recording_id: RecordingId,
+            event_sender: mpsc::Sender<DictationEvent>,
+        ) -> Result<Box<dyn RecordingHandle>, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let _ = event_sender.try_send(DictationEvent::RecordingStarted { recording_id });
+            Ok(Box::new(VoiceRecordingHandle {
+                recording_id,
+                event_sender,
+                finishes: self.finishes.clone(),
+                cancels: self.cancels.clone(),
+            }))
+        }
+    }
+
+    struct VoiceRecordingHandle {
+        recording_id: RecordingId,
+        event_sender: mpsc::Sender<DictationEvent>,
+        finishes: Arc<AtomicUsize>,
+        cancels: Arc<AtomicUsize>,
+    }
+
+    impl RecordingHandle for VoiceRecordingHandle {
+        fn finish(&self) {
+            self.finishes.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .event_sender
+                .try_send(DictationEvent::RecordingFinished {
+                    recording_id: self.recording_id,
+                    audio: CapturedAudio::new(vec![0.1; 160]),
+                });
+        }
+
+        fn cancel(&self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .event_sender
+                .try_send(DictationEvent::RecordingCancelled {
+                    recording_id: self.recording_id,
+                });
+        }
+
+        fn wait(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// A queue of preselected recognizer results. It exercises the production
+    /// blocking-worker path without loading a Whisper model or using audio
+    /// hardware.
+    struct VoiceTranscriber {
+        results: Mutex<VecDeque<String>>,
+        calls: AtomicUsize,
+        model_path: PathBuf,
+    }
+
+    impl VoiceTranscriber {
+        fn new(results: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+                model_path: PathBuf::from("synthetic-whisper-model.bin"),
+            }
+        }
+    }
+
+    impl Transcriber for VoiceTranscriber {
+        fn model_path(&self) -> &Path {
+            &self.model_path
+        }
+
+        fn model_is_available(&self) -> bool {
+            true
+        }
+
+        fn transcribe(
+            &self,
+            _audio: CapturedAudio,
+            cancelled: Arc<AtomicBool>,
+        ) -> Result<String, TranscriptionError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if cancelled.load(Ordering::Acquire) {
+                return Err(TranscriptionError::Cancelled);
+            }
+            self.results
+                .lock()
+                .expect("synthetic transcript queue lock")
+                .pop_front()
+                .ok_or_else(|| {
+                    TranscriptionError::Failed(
+                        "synthetic test did not provide a transcript result".into(),
+                    )
+                })
+        }
+    }
+
+    struct VoiceHarness {
+        runtime: VoiceRuntime,
+        dictation_events: mpsc::Receiver<DictationEvent>,
+        main_events: mpsc::Receiver<Event>,
+        recorder: Arc<VoiceRecorder>,
+        transcriber: Arc<VoiceTranscriber>,
+    }
+
+    impl VoiceHarness {
+        async fn next_dictation_event(&mut self) -> DictationEvent {
+            within_test_timeout(self.dictation_events.recv())
+                .await
+                .expect("synthetic dictation event")
+        }
+
+        async fn submit_next_transcript(&mut self) -> (RecordingId, String) {
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                    .await
+            );
+            let recording_id = match self.next_dictation_event().await {
+                DictationEvent::RecordingStarted { recording_id } => recording_id,
+                event => panic!("expected synthetic recording start, got {event:?}"),
+            };
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::RecordingStarted { recording_id })
+                    .await
+            );
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                    .await
+            );
+            let finished = self.next_dictation_event().await;
+            assert!(matches!(
+                &finished,
+                DictationEvent::RecordingFinished {
+                    recording_id: finished_id,
+                    ..
+                } if *finished_id == recording_id
+            ));
+            assert!(self.runtime.handle_dictation_event(finished).await);
+
+            let transcript = self.next_dictation_event().await;
+            let text = match &transcript {
+                DictationEvent::TranscriptReady {
+                    recording_id: transcript_id,
+                    text,
+                } if *transcript_id == recording_id => text.clone(),
+                event => panic!("expected synthetic transcript, got {event:?}"),
+            };
+            assert!(self.runtime.handle_dictation_event(transcript).await);
+            (recording_id, text)
+        }
+
+        async fn accept_next_answer(&mut self) {
+            let event = within_test_timeout(self.main_events.recv())
+                .await
+                .expect("mock Ollama completion");
+            assert!(matches!(event, Event::TurnFinished(_)));
+            assert!(self.runtime.handle_main_event(event).await);
+        }
+    }
+
+    fn voice_harness(
+        server: &MockServer,
+        transcripts: impl IntoIterator<Item = String>,
+        camera: CameraService,
+    ) -> VoiceHarness {
+        let (main_sender, main_events) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let (dictation_sender, dictation_events) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let recorder = Arc::new(VoiceRecorder::default());
+        let transcriber = Arc::new(VoiceTranscriber::new(transcripts));
+        let dictation = DictationSession::with_services(
+            recorder.clone(),
+            transcriber.clone(),
+            dictation_sender,
+        );
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "test-model").unwrap()).unwrap();
+
+        VoiceHarness {
+            runtime: VoiceRuntime::new(
+                Controller::new(),
+                TurnRuntime::new(client, camera, main_sender),
+                dictation,
+            ),
+            dictation_events,
+            main_events,
+            recorder,
+            transcriber,
+        }
     }
 
     fn tiny_png() -> Vec<u8> {
@@ -776,6 +1153,331 @@ mod tests {
         assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(controller.accepted_history().len(), 2);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn accepted_voice_transcript_submits_one_literal_question() {
+        let server = MockServer::start().await;
+        let question = "What makes a fern different from a moss?";
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": question}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Ferns make spores and have vascular tissue."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut harness = voice_harness(&server, [question.to_owned()], unused_camera_service());
+        let (recording_id, text) = harness.submit_next_transcript().await;
+        assert_eq!(text, question);
+
+        // The dictation controller is already READY after accepting the
+        // first completion, so the duplicate cannot cross the bridge again.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::TranscriptReady { recording_id, text })
+                .await
+        );
+        harness.accept_next_answer().await;
+
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_follow_up_uses_the_existing_accepted_conversation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "What is lichen?"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "It is a partnership between a fungus and a photosynthetic partner."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "What is lichen?"},
+                    {"role": "assistant", "content": "It is a partnership between a fungus and a photosynthetic partner."},
+                    {"role": "user", "content": "What should I look for on tree bark?"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Look for leaflike, crusty, or branching patches."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut harness = voice_harness(
+            &server,
+            [
+                "What is lichen?".to_owned(),
+                "What should I look for on tree bark?".to_owned(),
+            ],
+            unused_camera_service(),
+        );
+        harness.submit_next_transcript().await;
+        harness.accept_next_answer().await;
+        harness.submit_next_transcript().await;
+        harness.accept_next_answer().await;
+
+        assert_eq!(harness.runtime.controller.accepted_history().len(), 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn slash_looking_voice_text_cannot_activate_a_camera() {
+        let server = MockServer::start().await;
+        let question = "/camera 7 | take a photo";
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": question}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "I will treat that as words, not an action."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: false,
+            captures: captures.clone(),
+        }));
+        let mut harness = voice_harness(&server, [question.to_owned()], camera_service);
+        harness.submit_next_transcript().await;
+        harness.accept_next_answer().await;
+
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stale_and_empty_voice_transcripts_make_no_request() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, [String::new()], unused_camera_service());
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                .await
+        );
+        let cancelled_id = match harness.next_dictation_event().await {
+            DictationEvent::RecordingStarted { recording_id } => recording_id,
+            event => panic!("expected synthetic recording start, got {event:?}"),
+        };
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::RecordingStarted {
+                    recording_id: cancelled_id,
+                })
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        let cancelled = harness.next_dictation_event().await;
+        assert!(matches!(
+            &cancelled,
+            DictationEvent::RecordingCancelled { recording_id } if *recording_id == cancelled_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(cancelled).await);
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::TranscriptReady {
+                    recording_id: cancelled_id,
+                    text: "late cancelled text".into(),
+                })
+                .await
+        );
+
+        // Put a new recording into TRANSCRIBING, then deliver a completion
+        // from the old recording before the new recognizer's empty result.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                .await
+        );
+        let current_id = match harness.next_dictation_event().await {
+            DictationEvent::RecordingStarted { recording_id } => recording_id,
+            event => panic!("expected synthetic recording start, got {event:?}"),
+        };
+        assert_ne!(current_id, cancelled_id);
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::RecordingStarted {
+                    recording_id: current_id,
+                })
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                .await
+        );
+        let finished = harness.next_dictation_event().await;
+        assert!(harness.runtime.handle_dictation_event(finished).await);
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::TranscriptReady {
+                    recording_id: cancelled_id,
+                    text: "late stale text".into(),
+                })
+                .await
+        );
+        let empty = harness.next_dictation_event().await;
+        assert!(matches!(
+            &empty,
+            DictationEvent::TranscriptReady { recording_id, text }
+                if *recording_id == current_id && text.is_empty()
+        ));
+        assert!(harness.runtime.handle_dictation_event(empty).await);
+
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 1);
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_voice_recording_invalidates_an_old_model_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "old answer"},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+        let mut harness = voice_harness(
+            &server,
+            ["first voice question".to_owned()],
+            unused_camera_service(),
+        );
+        harness.submit_next_transcript().await;
+        assert!(harness.runtime.controller.has_active_turn());
+
+        // READY Enter cancels the old model turn before it opens the next
+        // recording. A controlled late completion cannot restore history.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                .await
+        );
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(
+            harness
+                .runtime
+                .handle_main_event(Event::TurnFinished(TurnFinished {
+                    id: TurnId::new(1),
+                    result: TurnResult::Answer {
+                        answer: "late old answer".into(),
+                        proposed_scene: None,
+                    },
+                }))
+                .await
+        );
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+
+        // The synthetic recorder is active for the new recording; explicit
+        // shutdown must ask it to release instead of leaving a worker behind.
+        harness.runtime.shutdown().await;
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(harness.recorder.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_escape_cancels_an_answer_and_late_result_stays_inert() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "answer that should be cancelled"},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+        let mut harness = voice_harness(
+            &server,
+            ["cancel this answer".to_owned()],
+            unused_camera_service(),
+        );
+        harness.submit_next_transcript().await;
+        assert!(harness.runtime.controller.has_active_turn());
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(
+            harness
+                .runtime
+                .handle_main_event(Event::TurnFinished(TurnFinished {
+                    id: TurnId::new(1),
+                    result: TurnResult::Answer {
+                        answer: "late cancelled answer".into(),
+                        proposed_scene: None,
+                    },
+                }))
+                .await
+        );
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+        harness.runtime.shutdown().await;
     }
 
     #[test]

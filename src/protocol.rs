@@ -78,7 +78,8 @@ impl fmt::Debug for CapturedAudio {
     }
 }
 
-/// Raw-key input understood only by standalone dictation mode.
+/// Raw-key input understood by the microphone modes (`--dictate` and
+/// `--voice`), never by the normal line-oriented terminal interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationInput {
     Enter,
@@ -147,6 +148,14 @@ pub enum DictationEffect {
     },
     CancelTranscription {
         recording_id: RecordingId,
+    },
+    /// A current, nonempty transcript accepted by the dictation controller.
+    ///
+    /// The runtime chooses whether this remains display-only (`--dictate`) or
+    /// becomes literal question text for the integrated voice mode.
+    AcceptedTranscript {
+        recording_id: RecordingId,
+        text: String,
     },
     Display(DictationOutput),
     Exit,

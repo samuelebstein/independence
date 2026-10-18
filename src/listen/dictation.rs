@@ -1,4 +1,4 @@
-//! The sole raw-key terminal owner for standalone dictation mode.
+//! The sole raw-key terminal owner for the microphone modes.
 //!
 //! It is intentionally not started by the normal line-oriented application.
 //! Crossterm raw mode turns Ctrl+C into an ordinary key event, so this adapter
@@ -50,7 +50,8 @@ impl Drop for DictationKeyReader {
     }
 }
 
-/// Starts the raw-key adapter used only by `cargo run -- --dictate`.
+/// Starts the raw-key adapter used by `cargo run -- --dictate` and
+/// `cargo run -- --voice`.
 pub fn spawn_dictation_key_reader(
     sender: Sender<DictationEvent>,
 ) -> io::Result<DictationKeyReader> {

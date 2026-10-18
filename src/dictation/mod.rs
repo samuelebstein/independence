@@ -1,16 +1,17 @@
-//! Standalone local dictation mode.
+//! Local dictation lifecycle and the standalone dictation terminal mode.
 //!
-//! This mode deliberately stops at `TranscriptReady`. It shares the
-//! application's event/effect shape, task ownership, and terminal lifecycle,
-//! but it never creates an Ollama client, calls camera code, or parses a
-//! transcript as terminal input.
+//! `DictationSession` owns capture and transcription work. It turns only a
+//! controller-accepted `TranscriptReady` completion into an
+//! `AcceptedTranscript` action. The standalone `run` function deliberately
+//! displays that action without constructing Ollama or camera services.
 
 pub mod audio;
 mod controller;
-mod transcribe;
+pub(crate) mod transcribe;
 
 use std::{
     io,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -37,6 +38,85 @@ use self::{
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// A completed action from the dictation state machine and its owned runtime.
+///
+/// This deliberately sits after recording-ID validation. Consumers therefore
+/// cannot accidentally forward a raw Whisper completion that the controller
+/// would have rejected as stale or cancelled.
+#[derive(Debug)]
+pub(crate) enum DictationAction {
+    Display(DictationOutput),
+    AcceptedTranscript { text: String },
+    Exit,
+}
+
+/// The reusable, non-UI owner of one microphone/transcription lifecycle.
+///
+/// It has no dependency on the main session controller, Ollama, or camera
+/// code. A caller chooses what an accepted transcript means.
+pub(crate) struct DictationSession {
+    controller: DictationController,
+    runtime: DictationRuntime,
+}
+
+impl DictationSession {
+    pub(crate) fn from_environment(event_sender: mpsc::Sender<DictationEvent>) -> Self {
+        Self::with_services(
+            Arc::new(CpalRecorder::from_environment()),
+            Arc::new(WhisperTranscriber::from_environment()),
+            event_sender,
+        )
+    }
+
+    pub(crate) fn with_services(
+        recorder: Arc<dyn Recorder>,
+        transcriber: Arc<dyn Transcriber>,
+        event_sender: mpsc::Sender<DictationEvent>,
+    ) -> Self {
+        Self {
+            controller: DictationController::new(),
+            runtime: DictationRuntime::new(recorder, transcriber, event_sender),
+        }
+    }
+
+    pub(crate) fn microphone_label(&self) -> Result<String, String> {
+        self.runtime
+            .recorder
+            .selected_microphone()
+            .map(|microphone| microphone.label())
+    }
+
+    pub(crate) fn model_path(&self) -> &Path {
+        self.runtime.transcriber.model_path()
+    }
+
+    pub(crate) fn model_is_available(&self) -> bool {
+        self.runtime.transcriber.model_is_available()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.controller.is_ready()
+    }
+
+    /// Handles one fact, performs its requested capture/transcription work,
+    /// and returns only user-interface or accepted-transcript actions.
+    pub(crate) async fn handle(&mut self, event: DictationEvent) -> Vec<DictationAction> {
+        self.runtime.retire_completed_worker(&event).await;
+        let effects = self.controller.handle(event);
+        let mut actions = Vec::new();
+        for effect in effects {
+            if let Some(action) = self.runtime.apply(effect).await {
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    pub(crate) async fn shutdown(&mut self) {
+        self.runtime.shutdown().await;
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DictationError {
     #[error("could not start dictation terminal input: {0}")]
@@ -56,25 +136,22 @@ async fn run_with_services(
     recorder: Arc<dyn Recorder>,
     transcriber: Arc<dyn Transcriber>,
 ) -> Result<(), DictationError> {
-    let microphone = recorder.selected_microphone();
     let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let mut input = listen::dictation::spawn_dictation_key_reader(event_sender.clone())
         .map_err(DictationError::InputAdapter)?;
 
-    let microphone_label = microphone.as_ref().map(|microphone| microphone.label());
+    let mut session = DictationSession::with_services(recorder, transcriber, event_sender);
+    let microphone_label = session.microphone_label();
     let microphone_for_display = match &microphone_label {
         Ok(label) => Ok(label.as_str()),
         Err(message) => Err((*message).as_str()),
     };
     speak::dictation_welcome(
         microphone_for_display,
-        transcriber.model_path(),
-        transcriber.model_is_available(),
+        session.model_path(),
+        session.model_is_available(),
     );
     speak::emit_dictation(DictationOutput::Ready);
-
-    let mut controller = DictationController::new();
-    let mut runtime = DictationRuntime::new(recorder, transcriber, event_sender);
 
     loop {
         let event = tokio::select! {
@@ -82,11 +159,9 @@ async fn run_with_services(
             event = event_receiver.recv() => event.unwrap_or(DictationEvent::Input(DictationInput::EndOfInput)),
         };
 
-        runtime.retire_completed_worker(&event).await;
-        let effects = controller.handle(event);
         let mut should_exit = false;
-        for effect in effects {
-            if !runtime.apply(effect).await {
+        for action in session.handle(event).await {
+            if !apply_dictation_only_action(action) {
                 should_exit = true;
                 break;
             }
@@ -100,8 +175,22 @@ async fn run_with_services(
     // timeout, so joining restores terminal settings without a blocked line
     // reader competing for the same input.
     input.shutdown();
-    runtime.shutdown().await;
+    session.shutdown().await;
     Ok(())
+}
+
+/// Applies actions for `--dictate` only.
+///
+/// This function has no model client, main-controller input, or camera handle
+/// in scope. An accepted transcript is intentionally consumed as terminal
+/// data; only `--voice` supplies the separate bridge to `Input::Ask`.
+fn apply_dictation_only_action(action: DictationAction) -> bool {
+    match action {
+        DictationAction::Display(output) => speak::emit_dictation(output),
+        DictationAction::AcceptedTranscript { .. } => {}
+        DictationAction::Exit => return false,
+    }
+    true
 }
 
 struct DictationRuntime {
@@ -138,7 +227,7 @@ impl DictationRuntime {
         }
     }
 
-    async fn apply(&mut self, effect: DictationEffect) -> bool {
+    async fn apply(&mut self, effect: DictationEffect) -> Option<DictationAction> {
         match effect {
             DictationEffect::StartRecording { recording_id } => {
                 self.start_recording(recording_id).await;
@@ -171,11 +260,19 @@ impl DictationRuntime {
                     transcription.cancelled.store(true, Ordering::Release);
                 }
             }
-            DictationEffect::Display(output) => speak::emit_dictation(output),
-            DictationEffect::Exit => return false,
+            DictationEffect::AcceptedTranscript { recording_id, text } => {
+                // The controller has just verified this ID against its active
+                // transcription phase. The outward action needs only the
+                // resulting data; the next controller allocates its own
+                // independent TurnId for model work.
+                let _ = recording_id;
+                return Some(DictationAction::AcceptedTranscript { text });
+            }
+            DictationEffect::Display(output) => return Some(DictationAction::Display(output)),
+            DictationEffect::Exit => return Some(DictationAction::Exit),
         }
 
-        true
+        None
     }
 
     async fn start_recording(&mut self, recording_id: RecordingId) {
@@ -353,7 +450,7 @@ mod tests {
     };
 
     use super::{
-        DictationRuntime,
+        DictationAction, DictationRuntime, apply_dictation_only_action,
         audio::{MicrophoneDescription, Recorder, RecordingHandle},
         transcribe::{Transcriber, TranscriptionError},
     };
@@ -589,5 +686,17 @@ mod tests {
     fn transcript_display_output_has_no_command_variant() {
         let output = DictationOutput::Transcript("/camera 0 | take a photo".into());
         assert!(matches!(output, DictationOutput::Transcript(_)));
+    }
+
+    #[test]
+    fn dictation_only_ignores_an_accepted_transcript_without_model_work() {
+        // `apply_dictation_only_action` has no Ollama client or main event
+        // sender in its signature. This verifies the explicit standalone
+        // policy rather than relying on terminal output as a side effect.
+        assert!(apply_dictation_only_action(
+            DictationAction::AcceptedTranscript {
+                text: "what is this tree?".into(),
+            }
+        ));
     }
 }

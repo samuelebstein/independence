@@ -6,6 +6,8 @@
 //! `read_line` cannot be forced awake. It exits on EOF, on a closed channel,
 //! or when the process exits, and it never owns inference work.
 
+pub mod dictation;
+
 use std::{
     env,
     io::{self, BufRead},

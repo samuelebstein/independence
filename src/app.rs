@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     controller::Controller,
-    listen,
+    dictation, listen,
     protocol::{
         CameraPreparation, Effect, Event, Input, TurnFinished, TurnId, TurnRequest, TurnResult,
         VisualRequest,
@@ -63,6 +63,12 @@ pub async fn run() -> Result<(), AppError> {
 
     runtime.shutdown().await;
     Ok(())
+}
+
+/// Runs standalone local dictation without constructing Ollama or camera
+/// services. Its transcript deliberately stops at terminal display.
+pub async fn run_dictation() -> Result<(), AppError> {
+    dictation::run().await.map_err(AppError::Dictation)
 }
 
 struct TurnRuntime {
@@ -352,6 +358,9 @@ pub enum AppError {
 
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
+
+    #[error("could not run local dictation: {0}")]
+    Dictation(#[from] dictation::DictationError),
 }
 
 #[cfg(test)]

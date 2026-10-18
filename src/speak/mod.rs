@@ -1,6 +1,8 @@
 //! Terminal output for the prototype's `speak` capability.
 
-use crate::protocol::Output;
+use std::{io::Write, path::Path};
+
+use crate::protocol::{DictationOutput, Output};
 
 pub const HELP: &str = r#"Independence local observation prototype
 
@@ -30,10 +32,14 @@ scene.
 
 Camera captures are not saved by Independence, but the original source file
 for /look remains where it was.
-This prototype has keyboard input and terminal output only: no microphone,
-speech synthesis, persistent memory, continuous vision, streaming, or
-autonomous tools. /stop cancels this application's request task, but cannot
+This observation mode has keyboard input and terminal output only: no
+microphone, speech synthesis, persistent memory, continuous vision, streaming,
+or autonomous tools. /stop cancels this application's request task, but cannot
 prove that a separate Ollama server has stopped its own computation immediately.
+
+For the deliberately separate local microphone experiment, start
+`cargo run -- --dictate`. Its transcript is displayed only; it never becomes a
+question, slash command, camera request, or Ollama request.
 "#;
 
 pub fn welcome() {
@@ -63,4 +69,55 @@ pub fn emit(output: Output) {
         }
         Output::Help => println!("{HELP}"),
     }
+}
+
+/// Displays the non-sensitive setup information before dictation enters READY.
+pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
+    dictation_line("Independence dictation — local transcription only");
+    match microphone {
+        Ok(microphone) => dictation_line(&format!("Microphone: {microphone}")),
+        Err(message) => dictation_line(&format!("Microphone: unavailable ({message})")),
+    }
+    let availability = if model_available {
+        "available"
+    } else {
+        "missing; recording will not start"
+    };
+    dictation_line(&format!(
+        "Whisper model: {} ({availability})",
+        model_path.display()
+    ));
+    dictation_line("Enter starts/stops recording; Esc discards/cancels; Ctrl+C exits.");
+    dictation_line("Transcripts are displayed as text only and are never submitted to Ollama.");
+}
+
+/// Emits raw-mode-safe dictation UI. Ordinary `println!` is not used here:
+/// Crossterm raw mode requires explicit writes and flushing for predictable
+/// terminal output.
+pub fn emit_dictation(output: DictationOutput) {
+    match output {
+        DictationOutput::Ready => dictation_line("READY — Enter starts recording."),
+        DictationOutput::Recording { elapsed } => dictation_line(&format!(
+            "RECORDING {:02}:{:02} — Enter finishes; Esc discards.",
+            elapsed.as_secs() / 60,
+            elapsed.as_secs() % 60
+        )),
+        DictationOutput::Discarding => {
+            dictation_line("Discarding recording and releasing microphone…")
+        }
+        DictationOutput::Transcribing => {
+            dictation_line("TRANSCRIBING — microphone released; Esc cancels the pending text.")
+        }
+        DictationOutput::Transcript(text) => dictation_line(&format!("Transcript: {text}")),
+        DictationOutput::Diagnostic(message) => {
+            dictation_line(&format!("independence dictation: {message}"))
+        }
+    }
+}
+
+fn dictation_line(line: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(line.as_bytes());
+    let _ = stdout.write_all(b"\r\n");
+    let _ = stdout.flush();
 }

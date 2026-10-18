@@ -43,8 +43,10 @@ question, slash command, camera request, or Ollama request.
 
 For integrated voice questions, start `cargo run -- --voice`. It uses the
 same local microphone and Whisper setup, displays each accepted transcript,
-then sends that text as a literal question to local Ollama. Spoken slash-like
-text is never parsed as a terminal command.
+then asks local Ollama whether text alone can answer or one new photograph
+would help. A requested photo is selected without opening it, then requires an
+explicit spoken reply interpreted by the local model before one capture. Spoken
+slash-like text is never parsed as a terminal command.
 "#;
 
 pub fn welcome() {
@@ -55,6 +57,15 @@ pub fn emit(output: Output) {
     match output {
         Output::Answer(answer) => println!("independence: {answer}"),
         Output::Diagnostic(message) => eprintln!("independence: {message}"),
+        Output::PermissionQuestion(question) => {
+            println!("independence: {question}");
+            println!("independence: Press Enter, speak your reply, then press Enter.");
+        }
+        Output::PermissionClarification(question) => {
+            eprintln!("independence: I could not tell whether you authorize that capture.");
+            println!("independence: {question}");
+            println!("independence: Press Enter, speak your reply, then press Enter.");
+        }
         Output::Cameras(cameras) => {
             if cameras.is_empty() {
                 eprintln!(
@@ -85,6 +96,15 @@ pub fn emit_raw(output: Output) {
     match output {
         Output::Answer(answer) => raw_prefixed_lines("independence: ", &answer),
         Output::Diagnostic(message) => raw_prefixed_lines("independence: ", &message),
+        Output::PermissionQuestion(question) => {
+            raw_prefixed_lines("independence: ", &question);
+            dictation_line("independence: Press Enter, speak your reply, then press Enter.");
+        }
+        Output::PermissionClarification(question) => {
+            dictation_line("independence: I could not tell whether you authorize that capture.");
+            raw_prefixed_lines("independence: ", &question);
+            dictation_line("independence: Press Enter, speak your reply, then press Enter.");
+        }
         Output::Cameras(cameras) => {
             if cameras.is_empty() {
                 dictation_line(
@@ -144,7 +164,10 @@ pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_av
     ));
     dictation_line("Enter starts/stops recording; Esc cancels; Ctrl+C exits.");
     dictation_line(
-        "Accepted transcripts are displayed, then sent as literal questions to local Ollama.",
+        "Accepted transcripts are displayed, then locally routed as a question or pending permission reply.",
+    );
+    dictation_line(
+        "A camera remains off until a current spoken reply is model-interpreted as approval.",
     );
     dictation_line("Spoken text such as /camera or /quit cannot execute a terminal command.");
 }

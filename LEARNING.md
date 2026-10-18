@@ -77,19 +77,73 @@ constructs an Ollama client, an application `Controller`, or a camera service.
 A transcript that looks like `/camera`, `/quit`, or any other command remains
 displayed data.
 
-`--voice` has one narrow, explicit extra arrow:
+`--voice` has a narrow, explicit bridge, but it no longer turns every
+transcript directly into `Input::Ask`:
 
 ```text
 accepted DictationSession transcript
-  -> VoiceRuntime constructs Input::Ask(text) directly
-  -> existing Controller assigns a new TurnId and starts the normal Ollama turn
-  -> existing controller accepts the result by TurnId before raw-mode-safe output
+  -> VoiceRuntime constructs Event::VoiceTranscript(text)
+  -> Controller either starts a new DecisionId or recognizes a pending permission reply
+  -> TurnRuntime asks local Ollama for a JSON-schema-validated result
+  -> Controller alone accepts, rejects, or starts later work from that result
 ```
 
 It deliberately does **not** call `listen::parse_line`. Spoken `/camera` or
 `/quit` text therefore has no command or hardware authority. The dictation and
 main controllers remain separate: `RecordingId` decides whether speech is
-current; `TurnId` decides whether a model answer is current.
+current; `DecisionId` decides whether a structured choice is current; and
+`TurnId` decides whether a final answer/camera turn is current.
+
+## Follow one spoken photo-permission request
+
+This flow exists only in `--voice`; normal keyboard questions and explicit
+`/camera` commands keep their established paths.
+
+```text
+accepted spoken question
+  -> Controller snapshots accepted history + accepted Photo into DecisionRequest::ChoosePhoto
+  -> think::OllamaClient::decide_photo returns JSON: respond or request_photo + needed_visual_evidence
+  -> respond: controller accepts its answer/history
+  -> request_photo: app inventories/selects one camera without a capture stream
+  -> Controller shows one exact question with the missing visible detail,
+     and stores original question + action + camera
+  -> next accepted spoken text becomes DecisionRequest::InterpretPermission
+  -> Ollama sees exact question, action, selected camera, and reply; returns yes/no/unclear
+  -> yes: controller starts VisualRequest::ProposeCamera using the original question
+  -> no: controller starts the original question without a new photo
+  -> unclear: controller re-shows the exact permission question, with no capture
+```
+
+`ChoosePhoto` is not a live-camera operation. If there is an accepted scene,
+`TurnRuntime::run_decision` passes its in-memory bytes to
+`OllamaClient::decide_photo` alongside the accepted conversation and current
+spoken question. The routing prompt says that this is an existing still image,
+so the model should answer questions about it first. A `request_photo` in that
+case means an additional/different view, not another copy of the same scene.
+The structured `needed_visual_evidence` field is a short, user-facing purpose
+such as “the other side of the label”; it is not a displayed hidden-reasoning
+trace. Empty or malformed purposes are rejected before camera preflight.
+
+The decision prompt also establishes capability limits: this prototype has no
+system clock, calendar, GPS, web, live video, or other sensors. A generic
+question about the current time/date should receive that limitation, not a
+speculative request to photograph the room. This is a local-model instruction;
+the test suite verifies the prompt and protocol boundary, not Qwen's wisdom on
+every live question.
+
+The words in the reply are not matched against a list. Qwen receives structured
+context and produces a schema-constrained classification; Serde validates it
+again. The controller checks that the `DecisionId` is still current and moves
+the pending request out of state before a `yes` can start capture. Therefore a
+late, failed, malformed, duplicate, reset, or cancelled decision cannot turn
+on the camera.
+
+Only a safely selected single V4L2 camera can reach the permission question.
+If no camera exists or selection is ambiguous, the prototype reports that it
+cannot make this request; it does not guess a `/dev/video*` device. Selection
+inspects hardware but does not start a stream. The actual capture begins only
+after the controller accepts a current `yes`, then immediately uses the
+existing bounded `VisualRequest::ProposeCamera` path.
 
 `DictationController` has READY, recording, finishing, transcribing, and two
 internal cancelling states. The extra cancelling states solve a real ownership
@@ -97,21 +151,25 @@ problem: pressing Esc must not say READY while CPAL still owns a device or
 while native recognition might still return text. Once a cancel changes the
 active phase, a completion with that ID is either used only for cleanup or
 ignored; it cannot display or submit a stale transcript. In voice mode, Enter
-at READY first stops any active model turn before it starts the next recording;
-Esc at READY stops that model turn without clearing accepted history.
+at READY first stops active decision/answer work before it starts the next
+question recording. The exception is a visible permission question: Enter
+preserves that request and records its reply. Esc at READY abandons the
+permission request or stops model work without clearing accepted history.
 
 ## Why the controller owns state
 
-The model worker gets an owned snapshot of history, question, and photograph.
-It cannot print and it cannot mutate the session. The controller stores:
+Model workers get owned snapshots; they cannot print and they cannot mutate the
+session. The controller stores:
 
 - the accepted `Photo`, if any;
 - accepted user/assistant exchanges only; and
-- at most one active `TurnId`.
+- at most one active `TurnId`, one active `DecisionId`, and one pending
+  permission request.
 
-The key invariant is simple: a result is accepted only when its `TurnId` is
-still active. Starting a new valid question, `/stop`, `/reset`, EOF, and Ctrl+C
-remove the old ID first. A late completion then becomes a harmless no-op.
+The key invariant is simple: a result is accepted only when its `TurnId` or
+`DecisionId` is still active. Starting a new valid question, `/stop`, `/reset`,
+EOF, and Ctrl+C remove old IDs and pending permission first. A late completion
+then becomes a harmless no-op.
 
 A `/look` is different from a regular question. Its photo is only a proposal
 until both loading and inference succeed. On success it replaces the accepted
@@ -196,9 +254,11 @@ recording while a cancelled worker is still cleaning up.
 
 `reqwest` performs HTTP, timeout handling, proxy/redirect policy, and body
 transfer. `serde` serializes/deserializes JSON. `base64` encodes image bytes.
-`image` recognizes and decodes image data. Our code chooses the allowed
-formats/limits, builds the application message sequence, and decides whether a
-completed response still belongs to the session.
+`image` recognizes and decodes image data. For the photo and permission steps,
+Ollama's `format` field carries a JSON Schema and our Serde enums validate the
+returned JSON again. Our code chooses the allowed formats/limits, builds the
+application message sequence, and decides whether a completed response still
+belongs to the session.
 
 The new `v4l` crate is the Linux V4L2 binding. It enumerates `/dev/video*`,
 queries capabilities, negotiates a pixel format, manages MMAP buffers, and
@@ -215,8 +275,9 @@ the actual device rate instead of merely relabeling samples. `whisper-rs`
 builds on whisper.cpp and performs the English CPU transcription. Our code
 chooses explicit limits, manages stream/task lifetimes, and decides whether a
 result is still current. `--dictate` displays accepted text only; `--voice`
-hands the already accepted text directly to `Input::Ask`, without interpreting
-it as an application command.
+hands accepted text to `Event::VoiceTranscript`, without interpreting it as an
+application command. The main controller then decides whether it is a new
+question or a reply to a pending permission prompt.
 
 ## Useful experiments
 
@@ -281,7 +342,7 @@ loading or recognition takes longer than expected, Esc is still processed by
 the raw-key thread; the UI waits for cooperative native cleanup before it
 returns to READY.
 
-For the integrated bridge, use a running local Ollama server and launch:
+For integrated voice decisions, use a running local Ollama server and launch:
 
 ```bash
 cargo run -- --voice
@@ -290,11 +351,31 @@ cargo run -- --voice
 Press Enter, ask “What is the primary gas in Earth's atmosphere?”, and press
 Enter again. The accepted transcript should appear before the text answer.
 Repeat with “Why does that matter for life?” to observe that the normal
-controller receives the accepted history. While that second answer is pending,
-press Enter to begin another recording: the old answer must become ineligible.
-Press Esc to discard this new recording. `cargo run -- --dictate` remains the
-separate transcript-only check; it should display speech but never contact
-Ollama.
+controller receives the accepted history. While that second decision/answer is
+pending, press Enter to begin another recording: the old result must become
+ineligible. Press Esc to discard this new recording.
+
+For the permission loop, use normal `cargo run` and `/cameras` first to check
+that exactly one usable camera is available. Then use `--voice`, ask about an
+object in front of the camera, and wait. If the model requests a photo, the
+camera remains off while its exact question is displayed. Press Enter, say an
+unambiguous reply such as “I approve that one still image now,” then press
+Enter. The program should capture once, release the device, and answer the
+original question. Repeat with “I would rather continue without a new photo”:
+there should be no capture. Try a conditional reply or a question to exercise
+the `unclear` path; it should re-ask without capturing. `cargo run --
+--dictate` remains the separate transcript-only check; it should display speech
+but never contact Ollama.
+
+After an accepted voice capture, ask “What was in the photo?”, then “Which
+visible feature should I inspect first?”, and then “What remains uncertain from
+this view?” Each decision request should receive the same accepted still and
+no second capture should begin. If a genuinely new view is requested, its
+permission question should explicitly say that Independence already has one
+accepted still and should name the missing visual detail. To approve, speak a
+plain authorization such as “Yes, capture that one still now”; hedged or
+conditional replies remain `unclear` under the deliberately conservative
+privacy rule.
 
 ## What tests establish—and what they cannot
 
@@ -315,9 +396,12 @@ Dictation tests use synthetic PCM for conversion/resampling and fake recorder
 and transcriber boundaries for lifecycle events. Voice-bridge tests use those
 same fakes plus a local mock Ollama server; they cover accepted versus
 cancelled/stale/empty transcripts, duplicate completions, follow-up history,
-literal slash-looking text, and old-answer invalidation when another recording
-starts. They do not prove that the physical microphone works, that
-ALSA/PipeWire picks the desired device, that Whisper recognizes a particular
-voice, or that a real local model answers quickly. Those are the separate
-manual checks above; no model weight, microphone, Ollama server, or camera is
-required for the ordinary suite.
+literal slash-looking text, structured decision serialization, permission
+context, no/unclear/failure/stale outcomes, malformed photo-request purposes,
+and one approved fake capture followed by three separate voice follow-ups that
+reuse the same image bytes without another capture. They do not prove that the
+physical microphone works, that ALSA/PipeWire picks the desired device, that
+Whisper recognizes a particular voice, that a real local model follows the
+structured prompt, or that a real camera is released on this machine. Those are
+the separate manual checks above; no model weight, microphone, Ollama server,
+or camera is required for the ordinary suite.

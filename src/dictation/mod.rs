@@ -183,7 +183,7 @@ async fn run_with_services(
 ///
 /// This function has no model client, main-controller input, or camera handle
 /// in scope. An accepted transcript is intentionally consumed as terminal
-/// data; only `--voice` supplies the separate bridge to `Input::Ask`.
+/// data; only `--voice` supplies the separate bridge to its main controller.
 fn apply_dictation_only_action(action: DictationAction) -> bool {
     match action {
         DictationAction::Display(output) => speak::emit_dictation(output),
@@ -263,8 +263,8 @@ impl DictationRuntime {
             DictationEffect::AcceptedTranscript { recording_id, text } => {
                 // The controller has just verified this ID against its active
                 // transcription phase. The outward action needs only the
-                // resulting data; the next controller allocates its own
-                // independent TurnId for model work.
+                // resulting data; the voice controller may allocate its own
+                // independent DecisionId or TurnId for later model work.
                 let _ = recording_id;
                 return Some(DictationAction::AcceptedTranscript { text });
             }

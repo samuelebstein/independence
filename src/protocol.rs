@@ -91,12 +91,15 @@ impl fmt::Debug for CapturedAudio {
     }
 }
 
-/// Raw-key input understood by the microphone modes (`--dictate` and
-/// `--voice`), never by the normal line-oriented terminal interface.
+/// Raw-key input understood by the microphone modes, never by the normal
+/// line-oriented terminal interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationInput {
     Enter,
     Escape,
+    /// Toggles explicit microphone capture in the VAD diagnostic monitor.
+    /// Existing dictation modes deliberately ignore it.
+    ToggleMute,
     Interrupt,
     EndOfInput,
 }

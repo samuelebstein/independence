@@ -15,7 +15,7 @@ It can:
   follow-up questions as `see` context; and
 - print an accepted answer as `speak`.
 
-It also has two explicit local microphone modes:
+It also has three explicit local microphone modes:
 
 - `--dictate` records one short clip, transcribes it with local Whisper, and
   displays the text only. It never contacts Ollama or invokes a command.
@@ -26,6 +26,9 @@ It also has two explicit local microphone modes:
   detail and needs a second explicit spoken reply that the local model
   interprets in context before Independence captures anything. Spoken `/camera`
   and `/quit` text is never parsed as a terminal command.
+- `--voice --vad-monitor` continuously monitors local acoustic speech activity
+  with an explicit visible microphone indicator. It does not transcribe,
+  contact Ollama, infer that a turn is complete, or access the camera.
 
 The default observation mode (`cargo run`) does not access a microphone. No
 current mode persists a conversation, streams tokens, captures a camera image
@@ -83,16 +86,17 @@ consumes local disk space; it is not run automatically by this application.
 Starting `ollama serve` starts a local service and binds its configured local
 endpoint.
 
-## Dictation and voice modes
+## Dictation, voice, and VAD monitor modes
 
-Both microphone modes use local CPAL capture and local Whisper recognition.
-They share the recording controls below, but have intentionally different
-destinations for an accepted transcript. `--dictate` stops at terminal display
-and has no Ollama or camera dependency at runtime. `--voice` sends an accepted
-nonempty transcript to the main controller as voice input; it does not parse it
-with the terminal command parser. The controller either accepts a structured
-text answer or starts the narrow, permission-gated still-photo flow described
-below.
+`--dictate` and ordinary `--voice` use local CPAL capture and local Whisper
+recognition. They share the recording controls below, but have intentionally
+different destinations for an accepted transcript. `--dictate` stops at
+terminal display and has no Ollama or camera dependency at runtime. `--voice`
+sends an accepted nonempty transcript to the main controller as voice input;
+it does not parse it with the terminal command parser. The controller either
+accepts a structured text answer or starts the narrow, permission-gated
+still-photo flow described below. The separate `--vad-monitor` option uses
+CPAL too, but never starts Whisper or creates a transcript.
 
 ### One-time local prerequisites
 
@@ -126,6 +130,18 @@ network and writes the model there; it does not modify source code or contact
 Ollama. The default path is exactly `local-data/whisper/ggml-base.en.bin`.
 To keep a model elsewhere, set `INDEPENDENCE_WHISPER_MODEL` only for the launch
 command. The application does not download model weights automatically.
+
+The VAD monitor has a different local runtime requirement. It uses
+`voice_activity_detector 0.2.1`, whose Silero VAD v5 ONNX model is embedded in
+the Rust crate—there is no second speech model file to download or configure.
+Its default ONNX Runtime dependency downloads a prebuilt native runtime bundle
+during the first Cargo build into Cargo's ORT cache. On this Linux Mint build,
+the build script selected static `onnxruntime` linking from that cache, so no
+`libonnxruntime.so` was installed system-wide or copied into this repository.
+That one-time build step needs network access and disk space, but does not
+install a system package, alter microphone permissions, start Ollama, or upload
+audio. The alternative dynamic-runtime mode would require you to deliberately
+provide and point `ORT_DYLIB_PATH` at your own `libonnxruntime.so`.
 
 ### Launch and controls
 
@@ -196,6 +212,60 @@ Only the controller can consume a current `yes` result and start the existing
 camera turn with the original question. A cancelled/stale recording or decision
 cannot bypass those ID checks.
 
+### Continuous VAD diagnostic monitor
+
+This is the first hands-free-input building block, not automatic conversation
+turn-taking. Start it from the repository root with:
+
+```bash
+cargo run -- --voice --vad-monitor
+```
+
+It does **not** require Ollama, the Whisper model file, a camera, or a running
+server. It immediately and visibly opens the selected microphone. Use the same
+optional exact-device selection as dictation:
+
+```bash
+INDEPENDENCE_MICROPHONE='Exact microphone name' \
+cargo run -- --voice --vad-monitor
+```
+
+The monitor prints the selected device and the actual CPAL format, then shows
+`speech started`, `speech resumed`, `speech paused`, and rate-limited elapsed
+non-speech status. “Paused” means only that the acoustic classifier currently
+hears non-speech. It does **not** mean that you completed a question, and it
+does not start Whisper, a response, a permission request, or a camera capture.
+
+| Control | Result |
+| --- | --- |
+| `M` | Mute: drops CPAL's stream, releases the microphone, and discards queued audio. Press it again to open one fresh capture generation. |
+| `Esc` or `Ctrl+C` | Releases the microphone, clears pending audio, stops the one VAD worker, restores normal terminal mode, and exits. |
+| `Enter` | Ignored in this diagnostic mode; it cannot queue a recording or trigger a turn. |
+
+The monitor keeps at most two seconds of downmixed source audio in memory. Its
+callback only converts/downmixes into that bounded queue; a separate worker
+continuously resamples to the Silero-required 16 kHz mono PCM, groups exact
+512-sample (32 ms) frames, and preserves both Rubato and Silero recurrent state
+for the whole unmuted generation. If the queue overflows, a callback is lost,
+or the device stops delivering callbacks, the UI says so; missing callbacks
+are never reported as silence. No audio is written to disk or printed.
+
+The defaults are a speech probability threshold of `0.50`, two consecutive
+speech frames to enter speech, eight consecutive non-speech frames to mark an
+acoustic pause, and one status update per second. For deliberate local tuning,
+set these only for one launch:
+
+```bash
+INDEPENDENCE_VAD_THRESHOLD=0.60 \
+INDEPENDENCE_VAD_SPEECH_FRAMES=2 \
+INDEPENDENCE_VAD_SILENCE_FRAMES=8 \
+INDEPENDENCE_VAD_STATUS_MS=1000 \
+cargo run -- --voice --vad-monitor
+```
+
+All values are validated at startup. These control acoustic smoothing only;
+they are not a future “person finished speaking” policy.
+
 ### Spoken photo permission in `--voice`
 
 For a spoken question, the local Qwen model returns a schema-validated choice:
@@ -242,6 +312,26 @@ Try this manual sequence:
 3. Press Enter a third time, say a different short sentence, then press Enter.
    Only that third transcript should appear after the earlier successful one.
 
+For a separate hands-free VAD hardware smoke test that needs no Ollama or
+Whisper model, run `cargo run -- --voice --vad-monitor`. The display should
+say `MICROPHONE ON` and name the actual format. Speak for a few seconds, pause
+for at least a second, then speak again: expect `speech started`, `speech
+paused`, a limited `no speech for …` update, then `speech resumed`. Press `M`:
+it should immediately say `MICROPHONE OFF`; speak again and verify no activity
+appears. Press `M` again to start a fresh monitor generation, then use `Esc` or
+Ctrl+C to exit. This is a live hardware check, so it is intentionally not part
+of the ordinary automated suite.
+
+If you want to validate only the embedded Silero/ONNX Runtime setup before
+opening a microphone, run this ignored manual check from the repository root:
+
+```bash
+cargo test manual_silero_vad_smoke_without_microphone -- --ignored --nocapture
+```
+
+It initializes the local VAD and processes one synthetic silent 512-sample
+frame. It does not open a microphone, call Ollama, or access a camera.
+
 For `--voice`, try this separate sequence:
 
 1. Start `cargo run -- --voice`, press Enter, ask “What is the primary gas in
@@ -271,15 +361,17 @@ has a still and name the different visual detail it needs. A response such as
 “I guess so” or “You could if you want” remains deliberately conservative
 `unclear`; say plainly that you authorize one still now to approve.
 
-Current limits: English `base.en` recognition runs on CPU; no device list UI,
-voice activity detection, streaming partial text, saved audio, microphone
-permissions workflow, text-to-speech, or continuous recording exists. The
-voice photo flow has no spoken camera-selection/disambiguation UI: if none or
-more than one usable V4L2 camera is found, it reports that it cannot safely
-propose a capture. Voice questions cannot use typed `/look` or `/camera`
-commands; keep using the default keyboard mode for those. Whisper cancellation
-is cooperative: Esc prevents a result from being accepted, while the native
-recognizer exits at its next supported abort callback point.
+Current limits: English `base.en` recognition runs on CPU; there is no device
+list UI, streaming partial text, saved audio, microphone-permissions workflow,
+text-to-speech, or automatic conversation turn-taking. The new VAD monitor is
+continuous acoustic diagnostics only: it does not collect a turn, transcribe,
+or decide that a pause is meaningful. The voice photo flow has no spoken
+camera-selection/disambiguation UI: if none or more than one usable V4L2 camera
+is found, it reports that it cannot safely propose a capture. Voice questions
+cannot use typed `/look` or `/camera` commands; keep using the default keyboard
+mode for those. Whisper cancellation is cooperative: Esc prevents a result
+from being accepted, while the native recognizer exits at its next supported
+abort callback point.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine
@@ -464,7 +556,8 @@ src/
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
   listen/        blocking keyboard adapter and command parser
-    dictation.rs raw-key adapter used by --dictate and --voice
+    dictation.rs raw-key adapter used by all microphone modes
+    vad.rs       continuous diagnostic CPAL → Rubato → Silero VAD pipeline
   dictation/     recording-ID controller, CPAL capture, Whisper, accepted-text boundary
   see/           bounded, validated file-photo and camera-image handling
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
@@ -487,8 +580,9 @@ application code.
 
 - Default observation mode uses keyboard input only. `--dictate` is
   transcript-only; `--voice` can use local structured decisions to request one
-  consented still photo, but has no wake words, text-to-speech, camera-selection
-  dialogue, or continuous recording.
+  consented still photo. `--voice --vad-monitor` can continuously report local
+  acoustic activity, but it has no wake words, transcription, turn-completion
+  rule, text-to-speech, or camera-selection dialogue.
 - One explicit JPEG/PNG or one explicitly consented `--voice` camera still at a
   time; no live view, continuous vision, background capture, or unrestricted
   camera/tool use.
@@ -510,9 +604,9 @@ application code.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
 
-This is a map of what exists **now**. It shows three ways into the same local
-learning system: typed questions, transcript-only dictation, and integrated
-voice questions.
+This is a map of what exists **now**. It shows four deliberately separate
+paths: typed questions, transcript-only dictation, integrated voice questions,
+and a continuous acoustic VAD diagnostic monitor.
 
 ```text
                          cargo run
@@ -537,6 +631,7 @@ flowchart TD
     Main[src/main.rs] --> Typed["cargo run"]
     Main --> Dictate["cargo run -- --dictate"]
     Main --> Voice["cargo run -- --voice"]
+    Main --> Vad["cargo run -- --voice --vad-monitor"]
 
     Typed --> TypedApp["app::run()"]
     Dictate --> DictationApp["app::run_dictation()"]
@@ -545,6 +640,9 @@ flowchart TD
     TypedApp --> LineInput["listen/mod.rs\nstdin line reader"]
     DictationApp --> RawInput["listen/dictation.rs\nraw Enter / Esc / Ctrl+C"]
     VoiceApp --> RawInput
+    Vad --> VadApp["app::run_vad_monitor()"]
+    VadApp --> RawInput
+    VadApp --> VadWorker["listen/vad.rs\nCPAL + Rubato + Silero"]
 ```
 
 | Mode | What it does | What it deliberately does not do |
@@ -552,6 +650,7 @@ flowchart TD
 | `cargo run` | Typed questions, `/look`, `/camera`, accepted photo follow-ups | Use microphone input |
 | `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
 | `cargo run -- --voice` | Record → local Whisper → structured local answer-or-photo decision → text answer, or one permission-gated still photo | Parse spoken commands, guess among cameras, or capture without a current model-interpreted approval |
+| `cargo run -- --voice --vad-monitor` | Continuous local speech-activity diagnostics; `M` explicitly mutes/unmutes | Transcribe, call Ollama, infer a completed turn, request permission, or access a camera |
 
 ### Typed question path
 
@@ -653,6 +752,47 @@ discarded rather than displayed.
 In `--dictate`, the path stops at **Display**. There is no Ollama client, main
 controller, command parser, or camera service in that mode.
 
+### Continuous VAD diagnostic path
+
+The monitor intentionally has a shorter path than dictation. It is not a
+hidden alternate `--voice` loop: `app::run_vad_monitor` does not construct an
+`OllamaClient`, `DictationSession`, `Controller`, `TurnRuntime`, or
+`CameraService`.
+
+```mermaid
+flowchart LR
+    K["M / Esc / Ctrl+C"] --> Raw["listen/dictation.rs\none raw-key owner"]
+    CPAL["one CPAL input stream"] --> Queue["bounded mono queue\nmax 2 seconds"]
+    Queue --> Worker["listen/vad.rs worker\npersistent Rubato resampler"]
+    Worker --> Frames["exact 16 kHz / 512-sample frames"]
+    Frames --> Silero["voice_activity_detector\nSilero VAD state"]
+    Silero --> Events["VadMonitorEvent + generation"]
+    Events --> Monitor["VadMonitorSession\naccept current generation only"]
+    Monitor --> Display["speak::emit_vad_monitor"]
+    Raw --> Monitor
+    Monitor --> CPAL
+```
+
+The CPAL callback is intentionally small: it converts the actual device sample
+format to f32, averages channels to mono, and writes into a preallocated
+bounded queue. It does not run inference, print, block on a channel, or grow a
+recording. A worker owns the persistent Rubato `Fft` resampler and the one
+Silero detector instance. It does not reset either one for each callback; a
+mute/unmute starts a new generation and resets state once for that fresh stream.
+
+`VadMonitorSession` owns the current `CaptureGeneration`. Pressing `M` moves
+the controller to muted before it drops CPAL's stream and clears queued audio.
+Every later worker status includes the old generation, so it is ignored rather
+than repainting a muted or newly unmuted monitor. This guarantees status
+correctness, not forced interruption of a native ONNX inference call: shutdown
+releases the microphone immediately and asks the one worker to stop between
+frames. The bundled Silero frame call is normally short, but ONNX Runtime does
+not expose the same cooperative cancellation callback that Whisper does.
+
+There is deliberately no arrow from VAD output to Whisper, Ollama, a pending
+permission reply, or a camera. A status such as `speech paused` is an acoustic
+observation only—not “the user has completed a turn.”
+
 ### Integrated voice path
 
 `--voice` reuses the same microphone and transcription machinery, then gives
@@ -730,6 +870,12 @@ TurnRuntime (src/app.rs)
 DictationSession (src/dictation/mod.rs)
   owns: one recording handle and one Whisper worker
   performs: microphone/recognizer lifecycle and cleanup
+
+VadMonitorSession (src/listen/vad.rs)
+  owns: active CaptureGeneration, one CPAL stream, bounded audio queue,
+        and one long-lived Silero worker
+  decides: whether a status belongs to the current unmuted generation
+  does not own: a transcript, model question, permission request, or camera
 ```
 
 The controllers make decisions; runtimes perform I/O. Neither worker is allowed
@@ -746,7 +892,8 @@ src/
 
   listen/
     mod.rs                 typed terminal-line parsing for normal mode
-    dictation.rs           raw-key input for --dictate and --voice
+    dictation.rs           sole raw-key owner for microphone modes
+    vad.rs                 continuous CPAL queue, streaming Rubato, Silero VAD, monitor state
 
   dictation/
     mod.rs                 DictationSession and standalone dictation runtime
@@ -770,5 +917,7 @@ src/
 
 There is no microphone transcription in normal typed mode, TTS, wake word,
 continuous vision, persistent memory, cloud fallback, arbitrary agent/tool
-framework, or open-ended autonomous camera use. `--voice` can only request one
-still photo through the narrow current-question/current-permission flow above.
+framework, or open-ended autonomous camera use. The continuous VAD monitor has
+no automatic turn boundary or connection to transcription yet. `--voice` can
+only request one still photo through the narrow
+current-question/current-permission flow above.

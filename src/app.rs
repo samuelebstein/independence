@@ -4,16 +4,17 @@
 //! `see` and `think` run in a cancellable worker, and `speak` emits only
 //! controller-approved output.
 
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     controller::Controller,
     dictation::{self, DictationAction, DictationSession},
     listen,
+    listen::vad::{VadMonitor, VadMonitorAction},
     protocol::{
         CameraPreparation, DecisionId, DecisionRequest, DecisionResult, DictationEvent,
         DictationInput, Effect, Event, Input, TurnFinished, TurnId, TurnRequest, TurnResult,
@@ -130,6 +131,69 @@ pub async fn run_voice() -> Result<(), AppError> {
     input.shutdown();
     runtime.shutdown().await;
     Ok(())
+}
+
+/// Runs continuous local acoustic activity diagnostics only.
+///
+/// This intentionally constructs no Whisper transcriber, Ollama client,
+/// application controller, camera service, or permission workflow. It owns the
+/// one raw-key reader while active and leaves the monitor's microphone stream
+/// under explicit M mute/unmute control.
+pub async fn run_vad_monitor() -> Result<(), AppError> {
+    let (key_sender, mut key_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let (monitor_sender, mut monitor_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let mut monitor = VadMonitor::from_environment(monitor_sender).map_err(AppError::VadMonitor)?;
+    let mut input = listen::dictation::spawn_microphone_key_reader(key_sender)
+        .map_err(AppError::InputAdapter)?;
+
+    let microphone_label = monitor.microphone_label();
+    let microphone_for_display = match &microphone_label {
+        Ok(label) => Ok(label.as_str()),
+        Err(message) => Err(message.as_str()),
+    };
+    speak::vad_monitor_welcome(microphone_for_display, &monitor.settings_summary());
+
+    let mut keep_running = apply_vad_monitor_actions(monitor.start());
+    let mut health_tick = tokio::time::interval(Duration::from_millis(100));
+    health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    while keep_running {
+        let actions = tokio::select! {
+            _ = tokio::signal::ctrl_c() => monitor.handle_key(DictationInput::Interrupt),
+            input = key_receiver.recv() => monitor.handle_key(input.unwrap_or(DictationInput::EndOfInput)),
+            event = monitor_receiver.recv() => match event {
+                Some(event) => monitor.handle_event(event),
+                None => {
+                    keep_running = false;
+                    monitor.worker_channel_closed()
+                }
+            },
+            _ = health_tick.tick() => monitor.poll(),
+        };
+        if !apply_vad_monitor_actions(actions) {
+            keep_running = false;
+        }
+    }
+
+    // The raw reader owns raw mode, so stop it before terminal settings are
+    // restored. The monitor then drops CPAL's stream, clears queued samples,
+    // asks its one worker to exit, and awaits that cleanup.
+    input.shutdown();
+    // The worker may be delivering a final bounded status. Closing its
+    // receiver makes that send fail promptly before shutdown waits for it.
+    drop(monitor_receiver);
+    monitor.shutdown().await;
+    Ok(())
+}
+
+fn apply_vad_monitor_actions(actions: Vec<VadMonitorAction>) -> bool {
+    for action in actions {
+        match action {
+            VadMonitorAction::Display(output) => speak::emit_vad_monitor(output),
+            VadMonitorAction::Exit => return false,
+        }
+    }
+    true
 }
 
 enum VoiceEvent {
@@ -658,6 +722,9 @@ pub enum AppError {
 
     #[error("could not run local dictation: {0}")]
     Dictation(#[from] dictation::DictationError),
+
+    #[error("could not start local VAD monitor: {0}")]
+    VadMonitor(String),
 }
 
 #[cfg(test)]

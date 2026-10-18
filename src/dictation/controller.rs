@@ -126,6 +126,9 @@ impl DictationController {
                 | Phase::CancellingTranscription { .. }
                 | Phase::Exiting => Vec::new(),
             },
+            // M is reserved for the continuous VAD monitor. The existing
+            // recording modes retain their documented controls unchanged.
+            DictationInput::ToggleMute => Vec::new(),
             DictationInput::Interrupt | DictationInput::EndOfInput => self.exit(),
         }
     }

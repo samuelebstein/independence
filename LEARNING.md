@@ -94,6 +94,67 @@ main controllers remain separate: `RecordingId` decides whether speech is
 current; `DecisionId` decides whether a structured choice is current; and
 `TurnId` decides whether a final answer/camera turn is current.
 
+## Follow the continuous VAD monitor
+
+`cargo run -- --voice --vad-monitor` is deliberately a fourth mode, separate
+from both dictation paths. It uses the raw-key reader because it needs `M`, Esc,
+and Ctrl+C immediately, but it creates no `DictationSession`, Whisper
+transcriber, Ollama client, main `Controller`, camera service, transcript, or
+turn request.
+
+```text
+M unmute
+  -> VadMonitorSession allocates CaptureGeneration N
+  -> CPAL opens exactly one selected input stream
+  -> callback converts sample format + downmixes into a two-second bounded queue
+  -> one blocking VAD worker drains that queue
+  -> persistent Rubato Fft resampler converts actual rate -> 16 kHz mono
+  -> exact 512-sample frames enter one stateful Silero VAD instance
+  -> VadMonitorEvent { CaptureGeneration N, activity } returns to the session
+  -> session accepts only N and asks speak::emit_vad_monitor to display it
+```
+
+Silero VAD v5 accepts only 16 kHz frames of 512 samples (32 ms), so the code
+does not pass arbitrary CPAL callback buffers to the detector. A callback may
+contain any number of interleaved samples and may arrive at the device’s actual
+rate, such as 48 kHz stereo. CPAL's `FromSample` conversion and a channel
+average make it mono f32; a persistent Rubato `Fft` preserves resampling state
+as it accumulates exactly the next input chunk. The detector also preserves its
+recurrent state across frames. Resetting either one per callback would produce
+incorrect, jittery stream behavior.
+
+The callback is intentionally a producer, not a worker: it never runs ONNX,
+prints, blocks on a message send, or appends to an unbounded recording. If the
+preallocated queue is full or temporarily locked by the worker, it counts the
+dropped mono frames. The monitor reports that condition rather than silently
+treating missing samples as silence. If CPAL delivers no callbacks for two
+seconds, the monitor reports that it is waiting/stalled; it does not emit a
+fake “no speech” period.
+
+`VadSettings` keeps the classifier readable rather than flickery: the default
+requires two consecutive frames at or above 0.50 to start/resume speech and
+eight below it to pause. It reports elapsed non-speech at most once per second.
+Those environment-configurable values are acoustic smoothing only. A pause is
+explicitly **not** a future conversation-completion rule.
+
+Mute is a state transition, not an indicator change. The controller first
+marks generation N obsolete, then drops CPAL's stream, clears its queue, and
+asks the long-lived worker to deactivate N. A late event from N cannot print
+after muting or a new unmute because the monitor accepts only the current
+generation. The worker is created once so repeated mute/unmute does not pile
+up native ONNX workers. The native detector call has no cooperative cancellation
+hook; shutdown releases CPAL immediately and the worker observes shutdown
+between short frames. This is a cleanup strategy, not a claim that arbitrary
+native code can be force-killed safely.
+
+`voice_activity_detector 0.2.1` embeds the Silero ONNX model. Its default
+`ort` dependency downloads a prebuilt ONNX Runtime bundle during the first
+Cargo build; this Linux Mint build selected static `onnxruntime` linking from
+the ORT cache rather than requiring a system-wide shared library. No separate
+VAD model path is needed. That build-time network/native dependency is
+different from the local Whisper weight file, which remains needed only for
+`--dictate` and ordinary `--voice`.
+
 ## Follow one spoken photo-permission request
 
 This flow exists only in `--voice`; normal keyboard questions and explicit
@@ -200,11 +261,13 @@ process exit.
 Dictation and voice input need individual keys rather than submitted lines, so
 they do not start the normal reader. `listen::dictation` enables Crossterm raw
 mode and owns one separate polling thread. It maps only `KeyEventKind::Press`:
-Enter, Esc, and Ctrl+C. Repeat and release events are ignored, so holding Enter
-cannot queue a second recording. Its short poll interval lets shutdown join the
-thread before the raw-mode guard restores normal terminal settings. `--voice`
-uses raw-mode-safe output for model answers too; ordinary `println!` is not
-assumed to behave correctly while raw mode is active.
+Enter, Esc, Ctrl+C, and `M`. Repeat and release events are ignored, so holding
+Enter cannot queue a second recording and holding `M` cannot repeatedly toggle
+the monitor. `M` is deliberately ignored by `--dictate` and ordinary `--voice`;
+it is the explicit mute/unmute control only in `--vad-monitor`. Its short poll
+interval lets shutdown join the thread before the raw-mode guard restores normal
+terminal settings. `--voice` and the monitor use raw-mode-safe output; ordinary
+`println!` is not assumed to behave correctly while raw mode is active.
 
 ### Ownership snapshots and `Arc`
 

@@ -2,7 +2,10 @@
 
 use std::{io::Write, path::Path};
 
-use crate::protocol::{DictationOutput, Output};
+use crate::{
+    listen::vad::VadMonitorOutput,
+    protocol::{DictationOutput, Output},
+};
 
 pub const HELP: &str = r#"Independence local observation prototype
 
@@ -170,6 +173,55 @@ pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_av
         "A camera remains off until a current spoken reply is model-interpreted as approval.",
     );
     dictation_line("Spoken text such as /camera or /quit cannot execute a terminal command.");
+}
+
+/// Displays setup for the continuous acoustic monitor. It deliberately names
+/// what is active so microphone use is never invisible or confused with a
+/// completed conversational turn.
+pub(crate) fn vad_monitor_welcome(microphone: Result<&str, &str>, settings: &str) {
+    dictation_line("Independence voice activity monitor — local acoustic diagnostics only");
+    match microphone {
+        Ok(microphone) => dictation_line(&format!("Selected microphone: {microphone}")),
+        Err(message) => dictation_line(&format!("Selected microphone: unavailable ({message})")),
+    }
+    dictation_line(settings);
+    dictation_line(
+        "Microphone starts ON. Press M to mute/release it or unmute it again; Esc or Ctrl+C exits.",
+    );
+    dictation_line(
+        "This monitor does not transcribe, call Ollama, infer a completed turn, or access a camera.",
+    );
+}
+
+/// Emits rate-limited status from the local VAD worker while raw mode is
+/// active. It intentionally contains no audio contents or transcript text.
+pub(crate) fn emit_vad_monitor(output: VadMonitorOutput) {
+    match output {
+        VadMonitorOutput::MicrophoneOn { microphone, format } => dictation_line(&format!(
+            "MICROPHONE ON — {microphone}; actual capture format: {format}"
+        )),
+        VadMonitorOutput::MicrophoneOff => {
+            dictation_line("MICROPHONE OFF — capture released and queued audio discarded.")
+        }
+        VadMonitorOutput::SpeechStarted => dictation_line("VAD: speech started."),
+        VadMonitorOutput::SpeechResumed => dictation_line("VAD: speech resumed."),
+        VadMonitorOutput::SpeechPaused => {
+            dictation_line("VAD: speech paused — this is not a completed turn.")
+        }
+        VadMonitorOutput::NonspeechElapsed { elapsed } => dictation_line(&format!(
+            "VAD: no speech for {:.1} s — activity only, no turn inferred.",
+            elapsed.as_secs_f32()
+        )),
+        VadMonitorOutput::WaitingForAudio => dictation_line(
+            "VAD: microphone is ON but has not delivered audio frames; this is not treated as silence.",
+        ),
+        VadMonitorOutput::AudioStalled => dictation_line(
+            "VAD: microphone callbacks stopped delivering audio frames; this is not treated as silence.",
+        ),
+        VadMonitorOutput::Diagnostic(message) => {
+            dictation_line(&format!("independence VAD: {message}"))
+        }
+    }
 }
 
 /// Emits raw-mode-safe dictation UI. Ordinary `println!` is not used here:

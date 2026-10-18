@@ -2,7 +2,10 @@
 
 use std::{io::Write, path::Path};
 
-use crate::protocol::{DictationOutput, Output};
+use crate::{
+    listen::vad::VadMonitorOutput,
+    protocol::{DictationOutput, Output},
+};
 
 pub const HELP: &str = r#"Independence local observation prototype
 
@@ -40,6 +43,13 @@ prove that a separate Ollama server has stopped its own computation immediately.
 For the deliberately separate local microphone experiment, start
 `cargo run -- --dictate`. Its transcript is displayed only; it never becomes a
 question, slash command, camera request, or Ollama request.
+
+For integrated voice questions, start `cargo run -- --voice`. It uses the
+same local microphone and Whisper setup, displays each accepted transcript,
+then asks local Ollama whether text alone can answer or one new photograph
+would help. A requested photo is selected without opening it, then requires an
+explicit spoken reply interpreted by the local model before one capture. Spoken
+slash-like text is never parsed as a terminal command.
 "#;
 
 pub fn welcome() {
@@ -50,6 +60,15 @@ pub fn emit(output: Output) {
     match output {
         Output::Answer(answer) => println!("independence: {answer}"),
         Output::Diagnostic(message) => eprintln!("independence: {message}"),
+        Output::PermissionQuestion(question) => {
+            println!("independence: {question}");
+            println!("independence: Press Enter, speak your reply, then press Enter.");
+        }
+        Output::PermissionClarification(question) => {
+            eprintln!("independence: I could not tell whether you authorize that capture.");
+            println!("independence: {question}");
+            println!("independence: Press Enter, speak your reply, then press Enter.");
+        }
         Output::Cameras(cameras) => {
             if cameras.is_empty() {
                 eprintln!(
@@ -71,6 +90,45 @@ pub fn emit(output: Output) {
     }
 }
 
+/// Emits main-application output while Crossterm raw mode is active.
+///
+/// Voice mode owns raw terminal input, so it must not rely on `println!` for
+/// controller-approved answers or diagnostics. This uses the same explicit
+/// write-and-flush path as the dictation UI.
+pub fn emit_raw(output: Output) {
+    match output {
+        Output::Answer(answer) => raw_prefixed_lines("independence: ", &answer),
+        Output::Diagnostic(message) => raw_prefixed_lines("independence: ", &message),
+        Output::PermissionQuestion(question) => {
+            raw_prefixed_lines("independence: ", &question);
+            dictation_line("independence: Press Enter, speak your reply, then press Enter.");
+        }
+        Output::PermissionClarification(question) => {
+            dictation_line("independence: I could not tell whether you authorize that capture.");
+            raw_prefixed_lines("independence: ", &question);
+            dictation_line("independence: Press Enter, speak your reply, then press Enter.");
+        }
+        Output::Cameras(cameras) => {
+            if cameras.is_empty() {
+                dictation_line(
+                    "independence: no usable V4L2 cameras found; connect one, check permissions, then run /cameras",
+                );
+            } else {
+                dictation_line("independence: usable cameras:");
+                for camera in cameras {
+                    dictation_line(&format!(
+                        "  {}  {}  (/dev/video{})",
+                        camera.id(),
+                        camera.name(),
+                        camera.id()
+                    ));
+                }
+            }
+        }
+        Output::Help => raw_block(HELP),
+    }
+}
+
 /// Displays the non-sensitive setup information before dictation enters READY.
 pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
     dictation_line("Independence dictation — local transcription only");
@@ -89,6 +147,81 @@ pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, mode
     ));
     dictation_line("Enter starts/stops recording; Esc discards/cancels; Ctrl+C exits.");
     dictation_line("Transcripts are displayed as text only and are never submitted to Ollama.");
+}
+
+/// Displays the setup information for integrated voice questions.
+pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
+    dictation_line("Independence voice — local transcription and local Ollama");
+    match microphone {
+        Ok(microphone) => dictation_line(&format!("Microphone: {microphone}")),
+        Err(message) => dictation_line(&format!("Microphone: unavailable ({message})")),
+    }
+    let availability = if model_available {
+        "available"
+    } else {
+        "missing; recording will not start"
+    };
+    dictation_line(&format!(
+        "Whisper model: {} ({availability})",
+        model_path.display()
+    ));
+    dictation_line("Enter starts/stops recording; Esc cancels; Ctrl+C exits.");
+    dictation_line(
+        "Accepted transcripts are displayed, then locally routed as a question or pending permission reply.",
+    );
+    dictation_line(
+        "A camera remains off until a current spoken reply is model-interpreted as approval.",
+    );
+    dictation_line("Spoken text such as /camera or /quit cannot execute a terminal command.");
+}
+
+/// Displays setup for the continuous acoustic monitor. It deliberately names
+/// what is active so microphone use is never invisible or confused with a
+/// completed conversational turn.
+pub(crate) fn vad_monitor_welcome(microphone: Result<&str, &str>, settings: &str) {
+    dictation_line("Independence voice activity monitor — local acoustic diagnostics only");
+    match microphone {
+        Ok(microphone) => dictation_line(&format!("Selected microphone: {microphone}")),
+        Err(message) => dictation_line(&format!("Selected microphone: unavailable ({message})")),
+    }
+    dictation_line(settings);
+    dictation_line(
+        "Microphone starts ON. Press M to mute/release it or unmute it again; Esc or Ctrl+C exits.",
+    );
+    dictation_line(
+        "This monitor does not transcribe, call Ollama, infer a completed turn, or access a camera.",
+    );
+}
+
+/// Emits rate-limited status from the local VAD worker while raw mode is
+/// active. It intentionally contains no audio contents or transcript text.
+pub(crate) fn emit_vad_monitor(output: VadMonitorOutput) {
+    match output {
+        VadMonitorOutput::MicrophoneOn { microphone, format } => dictation_line(&format!(
+            "MICROPHONE ON — {microphone}; actual capture format: {format}"
+        )),
+        VadMonitorOutput::MicrophoneOff => {
+            dictation_line("MICROPHONE OFF — capture released and queued audio discarded.")
+        }
+        VadMonitorOutput::SpeechStarted => dictation_line("VAD: speech started."),
+        VadMonitorOutput::SpeechResumed => dictation_line("VAD: speech resumed."),
+        VadMonitorOutput::SpeechPaused => {
+            dictation_line("VAD: speech paused — this is not a completed turn.")
+        }
+        VadMonitorOutput::NonspeechElapsed { elapsed } => dictation_line(&format!(
+            "VAD: no speech for {:.1} s — activity only, no turn inferred.",
+            elapsed.as_secs_f32()
+        )),
+        VadMonitorOutput::WaitingForAudio => dictation_line(
+            "VAD: microphone is ON but has not delivered audio frames; this is not treated as silence.",
+        ),
+        VadMonitorOutput::AudioStalled => dictation_line(
+            "VAD: microphone callbacks stopped delivering audio frames; this is not treated as silence.",
+        ),
+        VadMonitorOutput::Diagnostic(message) => {
+            dictation_line(&format!("independence VAD: {message}"))
+        }
+    }
 }
 
 /// Emits raw-mode-safe dictation UI. Ordinary `println!` is not used here:
@@ -120,4 +253,23 @@ fn dictation_line(line: &str) {
     let _ = stdout.write_all(line.as_bytes());
     let _ = stdout.write_all(b"\r\n");
     let _ = stdout.flush();
+}
+
+fn raw_prefixed_lines(prefix: &str, text: &str) {
+    let mut lines = text.lines();
+    match lines.next() {
+        Some(first) => {
+            dictation_line(&format!("{prefix}{first}"));
+            for line in lines {
+                dictation_line(line);
+            }
+        }
+        None => dictation_line(prefix.trim_end()),
+    }
+}
+
+fn raw_block(text: &str) {
+    for line in text.lines() {
+        dictation_line(line);
+    }
 }

@@ -1,4 +1,4 @@
-//! State ownership and output authorization for standalone dictation.
+//! State ownership and accepted-transcript authorization for local dictation.
 //!
 //! This controller intentionally has no dependency on `think`, `see`, or the
 //! main session controller. A transcript is displayed as data, never parsed as
@@ -37,6 +37,13 @@ impl DictationController {
             phase: Phase::Ready,
             next_recording_id: 1,
         }
+    }
+
+    /// Voice mode uses this to decide whether an Enter or Esc key should also
+    /// cancel an outstanding main-application answer. The dictation controller
+    /// remains the sole owner of recording/transcription state.
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self.phase, Phase::Ready)
     }
 
     /// Reacts to one fact without performing I/O itself.
@@ -119,6 +126,9 @@ impl DictationController {
                 | Phase::CancellingTranscription { .. }
                 | Phase::Exiting => Vec::new(),
             },
+            // M is reserved for the continuous VAD monitor. The existing
+            // recording modes retain their documented controls unchanged.
+            DictationInput::ToggleMute => Vec::new(),
             DictationInput::Interrupt | DictationInput::EndOfInput => self.exit(),
         }
     }
@@ -271,7 +281,10 @@ impl DictationController {
                     return effects;
                 }
 
-                let mut effects = vec![DictationEffect::Display(DictationOutput::Transcript(text))];
+                let mut effects = vec![
+                    DictationEffect::Display(DictationOutput::Transcript(text.clone())),
+                    DictationEffect::AcceptedTranscript { recording_id, text },
+                ];
                 effects.extend(ready_effects());
                 effects
             }
@@ -500,8 +513,9 @@ mod tests {
             effects.as_slice(),
             [
                 DictationEffect::Display(DictationOutput::Transcript(transcript)),
+                DictationEffect::AcceptedTranscript { recording_id, text: accepted },
                 DictationEffect::Display(DictationOutput::Ready)
-            ] if transcript == text
+            ] if transcript == text && *recording_id == id && accepted == text
         ));
     }
 

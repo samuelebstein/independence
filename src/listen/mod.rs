@@ -7,6 +7,7 @@
 //! or when the process exits, and it never owns inference work.
 
 pub mod dictation;
+pub mod vad;
 
 use std::{
     env,

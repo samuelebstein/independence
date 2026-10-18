@@ -20,6 +20,19 @@ impl TurnId {
     }
 }
 
+/// A unique identifier for a structured local-model decision.
+///
+/// Decisions are separate from answer turns: a decision can be cancelled or
+/// become stale before it is allowed to ask for permission or begin a turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecisionId(u64);
+
+impl DecisionId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// A unique identifier for a camera-command preflight.
 ///
 /// Camera selection happens before a turn exists, so invalid hardware choices
@@ -78,11 +91,15 @@ impl fmt::Debug for CapturedAudio {
     }
 }
 
-/// Raw-key input understood only by standalone dictation mode.
+/// Raw-key input understood by the microphone modes, never by the normal
+/// line-oriented terminal interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationInput {
     Enter,
     Escape,
+    /// Toggles explicit microphone capture in the VAD diagnostic monitor.
+    /// Existing dictation modes deliberately ignore it.
+    ToggleMute,
     Interrupt,
     EndOfInput,
 }
@@ -148,6 +165,15 @@ pub enum DictationEffect {
     CancelTranscription {
         recording_id: RecordingId,
     },
+    /// A current, nonempty transcript accepted by the dictation controller.
+    ///
+    /// The runtime chooses whether this remains display-only (`--dictate`) or
+    /// becomes an accepted voice input for the integrated mode. The main
+    /// controller—not dictation—then decides its meaning.
+    AcceptedTranscript {
+        recording_id: RecordingId,
+        text: String,
+    },
     Display(DictationOutput),
     Exit,
 }
@@ -167,6 +193,11 @@ pub enum DictationOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     Input(Input),
+    /// An accepted Whisper transcript entering the integrated voice workflow.
+    ///
+    /// It is deliberately not `Input::Ask`: the controller decides whether it
+    /// starts a new question or replies to a currently pending permission.
+    VoiceTranscript(String),
     CamerasListed(Result<Vec<CameraDescriptor>, String>),
     CameraPrepared {
         id: CameraRequestId,
@@ -179,6 +210,10 @@ pub enum Event {
     CameraCaptureReady {
         id: TurnId,
         source: CameraPhotoSource,
+    },
+    DecisionFinished {
+        id: DecisionId,
+        result: DecisionResult,
     },
     TurnFinished(TurnFinished),
 }
@@ -213,6 +248,74 @@ pub struct TurnRequest {
     pub question: String,
     pub history: Vec<ConversationTurn>,
     pub visual: VisualRequest,
+}
+
+/// A local-model decision requested by the controller.
+///
+/// The worker can only return a typed result. It cannot capture a photograph,
+/// print a response, or update the accepted conversation itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecisionRequest {
+    /// Decide whether to answer the current spoken question or ask to take a
+    /// new photograph. The accepted scene, if any, is available only as input
+    /// to the model; it remains owned by the controller.
+    ChoosePhoto {
+        id: DecisionId,
+        question: String,
+        history: Vec<ConversationTurn>,
+        scene: Option<Photo>,
+    },
+    /// Interpret a reply to one exact, still-current permission request.
+    InterpretPermission {
+        id: DecisionId,
+        proposed_action: String,
+        selected_camera: CameraDescriptor,
+        permission_question: String,
+        reply: String,
+    },
+}
+
+impl DecisionRequest {
+    pub(crate) fn id(&self) -> DecisionId {
+        match self {
+            Self::ChoosePhoto { id, .. } | Self::InterpretPermission { id, .. } => *id,
+        }
+    }
+}
+
+/// A validated structured answer from a photo-use decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PhotoDecision {
+    Answer {
+        answer: String,
+    },
+    /// A request for one new still image, with the concrete visible detail
+    /// that is missing from the available context.
+    ///
+    /// This is deliberately an operational, user-facing purpose—not hidden
+    /// model reasoning. When there is already an accepted scene, it means a
+    /// different or closer view, never a silent replacement of that scene.
+    RequestPhoto {
+        needed_visual_evidence: String,
+    },
+}
+
+/// A validated structured interpretation of one permission reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Yes,
+    No,
+    Unclear,
+}
+
+/// A decision worker result. Like `TurnResult`, it has no direct output or
+/// session-state authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecisionResult {
+    Photo(PhotoDecision),
+    Permission(PermissionDecision),
+    Failed { message: String },
+    Cancelled,
 }
 
 /// Whether a turn continues the accepted scene or stages a proposed replacement.
@@ -253,9 +356,11 @@ pub enum TurnResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     StartTurn(TurnRequest),
+    StartDecision(DecisionRequest),
     PrepareCamera(CameraPreparation),
     ListCameras,
     CancelTurn(TurnId),
+    CancelDecision(DecisionId),
     Display(Output),
     Exit,
 }
@@ -265,6 +370,8 @@ pub enum Effect {
 pub enum Output {
     Answer(String),
     Diagnostic(String),
+    PermissionQuestion(String),
+    PermissionClarification(String),
     Cameras(Vec<CameraDescriptor>),
     Help,
 }

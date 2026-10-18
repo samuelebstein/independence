@@ -18,7 +18,7 @@ use std::{
 };
 
 use cpal::{
-    Device, FromSample, Sample, SampleFormat, SizedSample,
+    Device, FromSample, Sample, SampleFormat, SizedSample, SupportedStreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::owned::InterleavedOwned};
@@ -128,20 +128,26 @@ impl CpalRecorder {
         })
     }
 
-    fn description_for(&self, device: &Device) -> Result<MicrophoneDescription, String> {
-        let name = device
-            .description()
-            .map_err(|error| format!("could not read microphone description: {error}"))?
-            .name()
-            .to_owned();
+    /// Resolves the selected input device and the exact default format that a
+    /// caller will use to build a CPAL input stream. This does not open a
+    /// stream or activate the microphone.
+    pub(crate) fn selected_input_configuration(
+        &self,
+    ) -> Result<(Device, SupportedStreamConfig, MicrophoneDescription), String> {
+        let device = self.select_device()?;
         let config = device
             .default_input_config()
             .map_err(|error| format!("could not query microphone format: {error}"))?;
-        Ok(MicrophoneDescription::new(
-            name,
+        let description = MicrophoneDescription::new(
+            device
+                .description()
+                .map_err(|error| format!("could not read microphone description: {error}"))?
+                .name()
+                .to_owned(),
             config.sample_rate(),
             config.channels(),
-        ))
+        );
+        Ok((device, config, description))
     }
 
     fn run_capture(
@@ -240,8 +246,8 @@ impl CpalRecorder {
 
 impl Recorder for CpalRecorder {
     fn selected_microphone(&self) -> Result<MicrophoneDescription, String> {
-        let device = self.select_device()?;
-        self.description_for(&device)
+        let (_, _, description) = self.selected_input_configuration()?;
+        Ok(description)
     }
 
     fn start(

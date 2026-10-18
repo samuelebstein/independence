@@ -53,6 +53,37 @@ metadata. A file source has a literal path. A camera source has a camera ID,
 name, negotiated dimensions, and input format—not a made-up filesystem path.
 Both become the same base64 image field in the existing Ollama request.
 
+## Follow one dictation recording
+
+The `--dictate` flag selects a separate event loop before the normal app
+constructs an Ollama client, a camera service, or the normal line reader.
+
+```text
+raw Enter key
+  -> listen::dictation sends DictationInput::Enter
+  -> dictation controller allocates a RecordingId and requests capture
+  -> CPAL opens the selected microphone only for that recording
+  -> callback downmixes to bounded mono f32 samples
+  -> Enter (or 30 seconds) drops the stream and releases the microphone
+  -> Rubato resamples the retained clip to 16 kHz
+  -> whisper-rs runs whisper.cpp on a blocking worker
+  -> worker sends TranscriptReady { recording_id, text }
+  -> dictation controller checks the ID and speaks the text to the terminal
+```
+
+There is deliberately no arrow from `TranscriptReady` to `Input::Ask`,
+`/camera`, Ollama, or any other capability. A transcript is data, even if it
+looks like a command. That small boundary is what keeps this milestone useful
+without accidentally implementing milestone 2.
+
+`DictationController` has READY, recording, finishing, transcribing, and two
+internal cancelling states. The extra cancelling states solve a real ownership
+problem: pressing Esc must not say READY while CPAL still owns a device or
+while native recognition might still return text. A `RecordingId` travels with
+every event. Once a cancel changes the active phase, a completion with that ID
+is either used only for cleanup or ignored; it cannot display a stale
+transcript.
+
 ## Why the controller owns state
 
 The model worker gets an owned snapshot of history, question, and photograph.
@@ -92,6 +123,13 @@ cannot be portably forced awake, so the thread is not joined on shutdown; it
 does not own an inference task and exits naturally on EOF, closed channel, or
 process exit.
 
+Dictation needs individual keys rather than submitted lines, so it does not
+start that reader. `listen::dictation` enables Crossterm raw mode and owns one
+separate polling thread. It maps only `KeyEventKind::Press`: Enter, Esc, and
+Ctrl+C. Repeat and release events are ignored, so holding Enter cannot queue a
+second recording. Its short poll interval lets shutdown join the thread before
+the raw-mode guard restores normal terminal settings.
+
 ### Ownership snapshots and `Arc`
 
 `TurnRequest` owns the data a worker needs, which avoids shared mutable session
@@ -120,6 +158,21 @@ three-second bound covers frame polling; V4L2 setup ioctls themselves are
 driver calls without a separate timeout exposed by this backend, so a broken
 driver can still misbehave there.
 
+Dictation has a similar but narrower qualification. CPAL's callback runs on a
+platform audio thread, so it only converts sample format, averages channels,
+and appends to a preallocated bounded buffer. It does not wait on Tokio or run
+recognition. On Enter, Esc, or the cap, the capture owner drops CPAL's stream
+before resampling or transcription. The command loop polls every 100 ms and
+the cap is enforced by the capture owner, not merely displayed by the UI.
+
+Whisper runs in `spawn_blocking`, which keeps native CPU work off Tokio's
+event-loop threads. `FullParams::set_abort_callback_safe` receives an
+`Arc<AtomicBool>` cancellation flag. Esc sets that flag; it does **not** use
+`JoinHandle::abort` to claim that foreign native computation died instantly.
+The outer task waits for Whisper to reach a supported abort callback point,
+then drops the audio and ignores any obsolete result. This is why dictation
+does not accept a new recording while a cancelled worker is still cleaning up.
+
 ### Serde and reqwest versus our code
 
 `reqwest` performs HTTP, timeout handling, proxy/redirect policy, and body
@@ -134,6 +187,16 @@ performs the bounded poll used by one-frame capture. `image` still does the
 JPEG validation and the YUYV-to-JPEG encoding step. Our code chooses the small
 format/resolution policy, protects allocation sizes, restores the prior device
 format, and owns the application-level cancellation and scene rules.
+
+For dictation, CPAL discovers and opens the operating system's input stream;
+it tells us the real channel count, sample format, and sample rate. Our code
+uses CPAL's `FromSample` conversion and averages each input frame to mono.
+Whisper requires 16 kHz mono f32 PCM, so Rubato's offline FFT resampler changes
+the actual device rate instead of merely relabeling samples. `whisper-rs`
+builds on whisper.cpp and performs the English CPU transcription. Our code
+chooses explicit limits, manages stream/task lifetimes, decides whether a
+result is still current, and deliberately prints the text without interpreting
+it.
 
 ## Useful experiments
 
@@ -182,6 +245,22 @@ tests because a real camera is external hardware. Try `/stop` during a camera
 turn as well: no answer should be accepted, though the device can take up to
 three seconds to finish its bounded cleanup.
 
+For dictation, after completing the setup in `README.md`, run this from the
+repository root:
+
+```bash
+cargo run -- --dictate
+```
+
+At READY, press Enter, say one short sentence, then press Enter again. The
+microphone indicator should become TRANSCRIBING only after the stream has been
+released. Press Enter for a second recording and Esc to discard it; no text
+from it should appear. Finally record a third, distinct sentence. The first
+and third texts may appear, but never the cancelled second text. If model
+loading or recognition takes longer than expected, Esc is still processed by
+the raw-key thread; the UI waits for cooperative native cleanup before it
+returns to READY.
+
 ## What tests establish—and what they cannot
 
 The test suite exercises real controller transitions, real request
@@ -196,3 +275,12 @@ image-plus-question request construction, scene follow-ups, cancellation,
 and the one-worker capture gate. They do not prove that every physical V4L2
 driver behaves well; the ignored manual capture check is the separate hardware
 exercise for that.
+
+Dictation tests use synthetic PCM for conversion/resampling and fake recorder
+and transcriber boundaries for lifecycle events. They cover Enter/Esc/cap
+transitions, key-repeat handling, silence/errors, stale completion rejection,
+model-missing-before-capture behavior, and inert command-looking transcripts.
+They do not prove that the physical microphone works, that ALSA/PipeWire picks
+the desired device, or that Whisper recognizes a particular voice. Those are
+the separate manual checks above; no model weight, microphone, Ollama server,
+or camera is required for the ordinary suite.

@@ -1,6 +1,6 @@
 //! Typed boundaries between terminal input, session decisions, and side effects.
 
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf, time::Duration};
 
 use crate::{
     see::{
@@ -31,6 +31,136 @@ impl CameraRequestId {
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
+}
+
+/// A unique identifier for one in-memory dictation recording.
+///
+/// It is intentionally separate from `TurnId`: dictation does not start an
+/// Ollama turn, and its transcript has no command or tool authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecordingId(u64);
+
+impl RecordingId {
+    pub(crate) fn new(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Validated audio for the local recognizer: mono f32 PCM at 16 kHz.
+///
+/// The samples are deliberately opaque at the protocol boundary. Debug output
+/// reports only a count, so diagnostics cannot leak a recording's contents.
+pub struct CapturedAudio {
+    samples: Vec<f32>,
+}
+
+impl CapturedAudio {
+    pub(crate) fn new(samples: Vec<f32>) -> Self {
+        Self { samples }
+    }
+
+    pub(crate) fn samples(&self) -> &[f32] {
+        &self.samples
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+impl fmt::Debug for CapturedAudio {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedAudio")
+            .field("sample_count", &self.samples.len())
+            .finish()
+    }
+}
+
+/// Raw-key input understood only by standalone dictation mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictationInput {
+    Enter,
+    Escape,
+    Interrupt,
+    EndOfInput,
+}
+
+/// A fact that reached the dictation controller.
+///
+/// This is deliberately distinct from `Event`: it prevents a transcript from
+/// accidentally becoming an `Input::Ask` or slash command for the main app.
+#[derive(Debug)]
+pub enum DictationEvent {
+    Input(DictationInput),
+    RecordingStarted {
+        recording_id: RecordingId,
+    },
+    RecordingElapsed {
+        recording_id: RecordingId,
+        elapsed: Duration,
+    },
+    RecordingLimitReached {
+        recording_id: RecordingId,
+    },
+    RecordingFinished {
+        recording_id: RecordingId,
+        audio: CapturedAudio,
+    },
+    RecordingCancelled {
+        recording_id: RecordingId,
+    },
+    RecordingFailed {
+        recording_id: RecordingId,
+        message: String,
+    },
+    /// The listening/transcription boundary promised by this milestone.
+    TranscriptReady {
+        recording_id: RecordingId,
+        text: String,
+    },
+    TranscriptionCancelled {
+        recording_id: RecordingId,
+    },
+    TranscriptionFailed {
+        recording_id: RecordingId,
+        message: String,
+    },
+}
+
+/// A side effect requested by the dictation controller.
+#[derive(Debug)]
+pub enum DictationEffect {
+    StartRecording {
+        recording_id: RecordingId,
+    },
+    FinishRecording {
+        recording_id: RecordingId,
+    },
+    CancelRecording {
+        recording_id: RecordingId,
+    },
+    StartTranscription {
+        recording_id: RecordingId,
+        audio: CapturedAudio,
+    },
+    CancelTranscription {
+        recording_id: RecordingId,
+    },
+    Display(DictationOutput),
+    Exit,
+}
+
+/// Terminal output authorized by the dictation controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DictationOutput {
+    Ready,
+    Recording { elapsed: Duration },
+    Discarding,
+    Transcribing,
+    Transcript(String),
+    Diagnostic(String),
 }
 
 /// A fact that reached the controller.

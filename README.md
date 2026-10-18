@@ -15,8 +15,14 @@ It can:
   follow-up questions as `see` context; and
 - print an accepted answer as `speak`.
 
-It does not access a microphone, persist a conversation, stream tokens, call
-tools autonomously, or use a cloud model.
+It also has a deliberately separate, local-only dictation experiment launched
+with `--dictate`. It records one short microphone clip, transcribes it with
+local Whisper, and displays the text. It does not feed that text to the main
+application.
+
+The normal observation mode does not access a microphone. Neither mode
+persists a conversation, streams tokens, calls tools autonomously, or uses a
+cloud model.
 
 ## Start here
 
@@ -25,12 +31,15 @@ Read these files in this order:
 1. [`VISION.md`](VISION.md) — why the project exists.
 2. [`src/main.rs`](src/main.rs) — the tiny executable entry point.
 3. [`src/app.rs`](src/app.rs) — runs input, worker tasks, and shutdown.
-4. [`src/controller.rs`](src/controller.rs) — the session state machine and
+4. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
+   [`src/dictation/controller.rs`](src/dictation/controller.rs) — the separate
+   dictation event loop and state machine.
+5. [`src/controller.rs`](src/controller.rs) — the session state machine and
    result-acceptance rule.
-5. [`src/think/mod.rs`](src/think/mod.rs) and
+6. [`src/think/mod.rs`](src/think/mod.rs) and
    [`src/think/teacher.txt`](src/think/teacher.txt) — Ollama transport and
    editable teaching guidance.
-6. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
+7. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
 
 ## Run it on the same laptop
@@ -66,6 +75,100 @@ project. For example, `ollama pull qwen3-vl:4b-instruct` uses the network and
 consumes local disk space; it is not run automatically by this application.
 Starting `ollama serve` starts a local service and binds its configured local
 endpoint.
+
+## Dictation-only milestone
+
+This is intentionally separate from the observation app. It has no Ollama or
+camera dependency at runtime: Enter records, the next Enter transcribes
+locally, and the recognized text is printed. A transcript that says `/camera`,
+`/quit`, or anything else is just displayed text.
+
+### One-time local prerequisites
+
+On Linux Mint, CPAL's Linux microphone backend needs ALSA development headers.
+Run this in your own terminal, from any directory:
+
+```bash
+sudo apt-get install libasound2-dev
+```
+
+This asks your package manager to install one system-wide development package
+(and may use the network); it changes the system but does not open the
+microphone or alter this repository. A successful install lets
+`pkg-config --modversion alsa` print an ALSA version. Independence never runs
+this command itself.
+
+Dictation also needs one local Whisper model file. The CPU starting point is
+the English `ggml-base.en.bin` file published in the
+[whisper.cpp model repository](https://huggingface.co/ggerganov/whisper.cpp/tree/main).
+It is about 148 MiB. Download it deliberately—using a browser or the command
+below—from this repository root:
+
+```bash
+mkdir -p local-data/whisper
+curl -L -o local-data/whisper/ggml-base.en.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+The first command creates an ignored local-data directory. The second uses the
+network and writes the model there; it does not modify source code or contact
+Ollama. The default path is exactly `local-data/whisper/ggml-base.en.bin`.
+To keep a model elsewhere, set `INDEPENDENCE_WHISPER_MODEL` only for the launch
+command. The application does not download model weights automatically.
+
+### Launch and controls
+
+From the repository root, after the model file exists:
+
+```bash
+cargo run -- --dictate
+```
+
+Cargo compiles the package (writing `target/`) and starts raw-key dictation
+mode. At READY it prints the selected microphone and Whisper model path. CPAL
+chooses the system default input by default. To select a particular input by
+its exact CPAL device name, use an environment variable for one launch:
+
+```bash
+INDEPENDENCE_MICROPHONE='Exact microphone name' cargo run -- --dictate
+```
+
+That command changes neither the default device nor shell configuration. If
+the requested name is unavailable, READY reports the problem and recording
+does not start.
+
+| State | Control | Result |
+| --- | --- | --- |
+| READY | Enter | Opens the selected microphone and begins one recording. |
+| RECORDING | Enter | Stops and releases the microphone, then begins local transcription. |
+| RECORDING | Esc | Discards the clip and waits for microphone cleanup. |
+| RECORDING | 30 seconds | Automatically stops and begins transcription. |
+| TRANSCRIBING | Esc | Requests cooperative cancellation; no late text is displayed. |
+| Any state | Ctrl+C | Cancels owned work, restores the terminal, and exits. |
+
+Repeated Enter presses outside READY are ignored. The raw-key reader is the
+only terminal input owner in this mode; the normal line reader is not running.
+The microphone stream is opened only after Enter and is dropped before
+resampling or Whisper inference begins. Audio lives only in bounded memory and
+is discarded after transcription or cancellation; Independence writes no
+recordings to disk.
+
+Try this manual sequence:
+
+1. Start `cargo run -- --dictate`, press Enter, say “The creek is loud after
+   last night's rain,” then press Enter. Only the resulting transcript should
+   appear.
+2. Press Enter again, speak a few words, then press Esc. No text from that
+   recording should appear.
+3. Press Enter a third time, say a different short sentence, then press Enter.
+   Only that third transcript should appear after the earlier successful one.
+
+Current limits: English `base.en` recognition runs on CPU; no device list UI,
+voice activity detection, streaming partial text, saved audio, microphone
+permissions workflow, Ollama request, camera request, or spoken reply exists
+in this milestone. Whisper cancellation is cooperative: Esc prevents a result
+from being accepted, while the native recognizer exits at its next supported
+abort callback point.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine
@@ -216,14 +319,16 @@ cargo fmt --check
 cargo check
 cargo test
 cargo clippy --all-targets -- -D warnings
+git diff --check
 ```
 
 `fmt --check` verifies formatting without changing source. `check` type-checks
-without producing a runnable binary. `test` uses Wiremock loopback servers and
-synthetic temporary image fixtures—no GPU, installed model, real photo, or
-remote server is required. `clippy` treats lint warnings as failures. Cargo may
-need network access the first time it downloads declared crates; subsequent
-runs normally use its local cache.
+without producing a runnable binary. `test` uses Wiremock loopback servers,
+synthetic image fixtures, synthetic audio, and test doubles—no GPU, installed
+speech model, microphone, real photo, camera, or remote server is required.
+`clippy` treats lint warnings as failures. `git diff --check` detects whitespace
+errors in this working change. Cargo may need network access the first time it
+downloads declared crates; subsequent runs normally use its local cache.
 
 The ordinary test suite intentionally does not touch a real camera. To test
 enumeration, acquisition, validation, release, and negotiated dimensions on
@@ -248,6 +353,8 @@ src/
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
   listen/        blocking keyboard adapter and command parser
+    dictation.rs raw-key adapter used only by --dictate
+  dictation/     transcription-only controller, CPAL capture, and Whisper wrapper
   see/           bounded, validated file-photo and camera-image handling
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
   think/         Ollama /api/chat client and teacher prompt
@@ -267,7 +374,8 @@ application code.
 
 ## Current limits
 
-- Keyboard input only; no microphone, wake word, or text-to-speech.
+- Observation mode uses keyboard input only; its separate `--dictate` mode has
+  one explicit microphone recording at a time but no wake word or text-to-speech.
 - One explicit JPEG/PNG or one explicit camera still at a time; no live view,
   continuous vision, background capture, or autonomous camera use.
 - Camera support is Linux V4L2 single-plane MJPEG/YUYV only; unusual drivers or

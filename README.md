@@ -437,3 +437,249 @@ application code.
 - The client uses a 2-second connect timeout and a 120-second request timeout,
   disables redirects and ambient HTTP proxy use, and never logs image payloads
   or full requests.
+
+## Teach Sam About the Latest Milestone
+
+> **Maintenance convention:** After each completed Independence milestone,
+> update this section alongside the relevant README and learning documentation.
+> Keep it grounded in the current code, show what changed, and distinguish the
+> implemented system from the next proposed milestone.
+
+This is a map of what exists **now**. It shows three ways into the same local
+learning system: typed questions, transcript-only dictation, and integrated
+voice questions.
+
+```text
+                         cargo run
+                             |
+                             v
+       keyboard line -> listen/mod.rs -> Controller -> TurnRuntime
+                                              |             |
+                                              |             v
+                                              |      see + think workers
+                                              |             |
+                                              v             v
+                                      accepted state <- TurnFinished
+                                              |
+                                              v
+                                          speak/mod.rs
+```
+
+### Choose a mode
+
+```mermaid
+flowchart TD
+    Main[src/main.rs] --> Typed["cargo run"]
+    Main --> Dictate["cargo run -- --dictate"]
+    Main --> Voice["cargo run -- --voice"]
+
+    Typed --> TypedApp["app::run()"]
+    Dictate --> DictationApp["app::run_dictation()"]
+    Voice --> VoiceApp["app::run_voice()"]
+
+    TypedApp --> LineInput["listen/mod.rs\nstdin line reader"]
+    DictationApp --> RawInput["listen/dictation.rs\nraw Enter / Esc / Ctrl+C"]
+    VoiceApp --> RawInput
+```
+
+| Mode | What it does | What it deliberately does not do |
+| --- | --- | --- |
+| `cargo run` | Typed questions, `/look`, `/camera`, accepted photo follow-ups | Use microphone input |
+| `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
+| `cargo run -- --voice` | Record → local Whisper → display transcript → local Ollama text answer | Parse spoken commands or autonomously use a camera |
+
+### Typed question path
+
+```mermaid
+sequenceDiagram
+    participant K as Keyboard
+    participant L as listen/mod.rs
+    participant C as controller.rs
+    participant R as app.rs TurnRuntime
+    participant T as think/mod.rs
+    participant S as speak/mod.rs
+
+    K->>L: "Why is the sky blue?"
+    L->>C: Event::Input(Input::Ask)
+    C->>R: Effect::StartTurn(TurnRequest + TurnId)
+    R->>T: OllamaClient::answer(history, question, image?)
+    T-->>R: answer or error
+    R->>C: Event::TurnFinished(TurnId, result)
+    C->>S: Effect::Display(accepted output)
+```
+
+The important boundary is in [`src/controller.rs`](src/controller.rs): workers
+cannot print answers or mutate history. They return a result, and the
+controller accepts it only if its `TurnId` is still the active turn.
+
+```text
+new question, /stop, /reset, EOF, or Ctrl+C
+                    |
+                    v
+             active TurnId is removed
+                    |
+                    v
+      old TurnFinished arrives later -> ignored safely
+```
+
+### Photograph and camera path
+
+```text
+/look path/to/photo.jpg | question
+        |
+        v
+listen/mod.rs parses a literal path; it never invokes a shell
+        |
+        v
+Controller stages a proposed new scene
+        |
+        v
+app.rs loads + validates Photo in src/see/mod.rs
+        |
+        v
+think/mod.rs base64-encodes bytes for Ollama /api/chat
+        |
+        v
+answer succeeds and is still the active TurnId
+        |
+        v
+Controller replaces accepted photo + starts that scene's history
+```
+
+```text
+/camera [id] | question
+        |
+        v
+Controller asks TurnRuntime to preflight selection
+        |
+        v
+src/see/camera.rs lists/selects one V4L2 device
+        |
+        v
+one bounded capture -> validated in-memory JPEG -> device released
+        |
+        v
+same Ollama request and accepted-scene rule as /look
+```
+
+A failed, cancelled, missing, or invalid new photo never replaces the last
+accepted scene. Ordinary follow-up questions retain that accepted photo without
+reopening a camera.
+
+### Dictation-only path
+
+```mermaid
+flowchart LR
+    Key["Enter / Esc / Ctrl+C"] --> Raw["listen/dictation.rs"]
+    Raw --> DC["dictation/controller.rs\nDictationController"]
+    DC --> Mic["dictation/audio.rs\nCPAL recording"]
+    Mic --> Resample["Rubato: mono 16 kHz PCM"]
+    Resample --> Whisper["dictation/transcribe.rs\nwhisper-rs / whisper.cpp"]
+    Whisper --> Ready["TranscriptReady { RecordingId, text }"]
+    Ready --> DC
+    DC --> Accepted["AcceptedTranscript"]
+    Accepted --> Display["speak::emit_dictation"]
+```
+
+`RecordingId` protects the microphone/Whisper side. A completion is accepted
+only when it belongs to the current recording. A cancelled or stale result is
+discarded rather than displayed.
+
+In `--dictate`, the path stops at **Display**. There is no Ollama client, main
+controller, command parser, or camera service in that mode.
+
+### Integrated voice path
+
+`--voice` reuses the same microphone and transcription machinery, but adds one
+small, explicit bridge after a transcript has been accepted:
+
+```mermaid
+flowchart TD
+    A["Whisper completion"] --> B["DictationController\nvalidates RecordingId"]
+    B --> C["DictationSession\nAcceptedTranscript { text }"]
+    C --> D["VoiceRuntime in app.rs"]
+    D --> E["Input::Ask(text)\ndirect construction"]
+    E --> F["existing Controller\nallocates TurnId"]
+    F --> G["existing TurnRuntime"]
+    G --> H["OllamaClient::answer"]
+    H --> I["TurnFinished"]
+    I --> F
+    F --> J["raw-mode-safe terminal answer"]
+```
+
+The direct `Input::Ask(text)` construction is intentional:
+
+```text
+spoken "/camera 0 | take a photo"
+        |
+        v
+literal question sent to Ollama
+        |
+        +--> never passed to listen::parse_line
+        +--> never activates camera hardware
+        +--> never acts like /quit or /reset
+```
+
+While Ollama is thinking, dictation is already back at READY. Pressing Enter
+starts another recording and cancels the old model turn first. This is why the
+terminal can show `READY` before the prior answer appears.
+
+### State ownership at a glance
+
+```text
+Controller (src/controller.rs)
+  owns: accepted history, accepted photo, active TurnId, pending camera request
+  decides: whether model/camera results can alter state or print
+
+DictationController (src/dictation/controller.rs)
+  owns: recording/transcription phase and current RecordingId
+  decides: whether a Whisper completion is current enough to become text
+
+TurnRuntime (src/app.rs)
+  owns: one active application task and its CancellationToken
+  performs: photo loading, camera work, Ollama request, task cleanup
+
+DictationSession (src/dictation/mod.rs)
+  owns: one recording handle and one Whisper worker
+  performs: microphone/recognizer lifecycle and cleanup
+```
+
+The controllers make decisions; runtimes perform I/O. Neither worker is allowed
+to independently update conversation history or print an unapproved answer.
+
+### Relevant file structure
+
+```text
+src/
+  main.rs                  selects typed, --dictate, or --voice mode
+  app.rs                   application event loops and worker lifetimes
+  protocol.rs              typed events, effects, IDs, and requests/results
+  controller.rs            accepted scene/history and TurnId authorization
+
+  listen/
+    mod.rs                 typed terminal-line parsing for normal mode
+    dictation.rs           raw-key input for --dictate and --voice
+
+  dictation/
+    mod.rs                 DictationSession and standalone dictation runtime
+    controller.rs          RecordingId state machine
+    audio.rs               CPAL capture, downmixing, resampling, bounds
+    transcribe.rs          local whisper-rs / whisper.cpp wrapper
+
+  see/
+    mod.rs                 explicit JPEG/PNG validation and Photo
+    camera.rs              Linux V4L2 discovery and one-still capture
+
+  think/
+    mod.rs                 loopback-only Ollama /api/chat client
+    teacher.txt            editable model teaching instructions
+
+  speak/
+    mod.rs                 normal and raw-mode-safe terminal output
+```
+
+### Deliberately not present yet
+
+There is currently no decision model, photo-permission state, autonomous
+camera call, microphone transcription in normal typed mode, TTS, wake word,
+continuous vision, persistent memory, cloud fallback, or agent/tool framework.

@@ -7,17 +7,8 @@ async fn main() {
         independence::app::run_dictation().await
     } else if arguments.len() == 1 && arguments[0].to_str() == Some("--voice") {
         independence::app::run_voice().await
-    } else if arguments.len() == 2
-        && arguments
-            .iter()
-            .any(|argument| argument.to_str() == Some("--voice"))
-        && arguments
-            .iter()
-            .any(|argument| argument.to_str() == Some("--vad-monitor"))
-    {
-        independence::app::run_vad_monitor().await
     } else {
-        eprintln!("usage: cargo run -- [--dictate|--voice [--vad-monitor]]");
+        eprintln!("usage: cargo run -- [--dictate|--voice]");
         std::process::exit(2);
     };
 

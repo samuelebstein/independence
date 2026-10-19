@@ -109,9 +109,9 @@ impl OllamaClient {
         &self,
         history: &[ConversationTurn],
         question: &str,
-        image: Option<&[u8]>,
+        images: &[&[u8]],
     ) -> Result<String, ThinkError> {
-        let request = ChatRequest::new(&self.config.model, history, question, image);
+        let request = ChatRequest::new(&self.config.model, history, question, images);
         let endpoint = self.config.chat_url()?;
 
         let response = self
@@ -178,21 +178,16 @@ struct ChatRequest {
 }
 
 impl ChatRequest {
-    fn new(
-        model: &str,
-        history: &[ConversationTurn],
-        question: &str,
-        image: Option<&[u8]>,
-    ) -> Self {
+    fn new(model: &str, history: &[ConversationTurn], question: &str, images: &[&[u8]]) -> Self {
         let mut messages = Vec::with_capacity(2 + history.len() * 2);
         messages.push(ChatMessage::system(TEACHER_INSTRUCTIONS));
 
         for turn in history {
-            messages.push(ChatMessage::user(&turn.user, None));
+            messages.push(ChatMessage::user(&turn.user, &[]));
             messages.push(ChatMessage::assistant(&turn.assistant));
         }
 
-        messages.push(ChatMessage::user(question, image));
+        messages.push(ChatMessage::user(question, images));
 
         Self {
             model: model.to_owned(),
@@ -219,13 +214,11 @@ impl ChatMessage {
         }
     }
 
-    fn user(content: &str, image: Option<&[u8]>) -> Self {
+    fn user(content: &str, images: &[&[u8]]) -> Self {
         Self {
             role: "user",
             content: content.to_owned(),
-            images: image
-                .map(|bytes| vec![STANDARD.encode(bytes)])
-                .unwrap_or_default(),
+            images: images.iter().map(|bytes| STANDARD.encode(bytes)).collect(),
         }
     }
 
@@ -349,7 +342,7 @@ mod tests {
                 assistant: "Bark is the outer protective tissue.".into(),
             }],
             "How does it protect a tree?",
-            None,
+            &[],
         ))
         .await
         .unwrap();
@@ -367,7 +360,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = within_test_timeout(client(&server).answer(&[], "hello", None))
+        let error = within_test_timeout(client(&server).answer(&[], "hello", &[]))
             .await
             .unwrap_err();
 
@@ -402,7 +395,7 @@ mod tests {
                 .await;
 
             assert!(
-                within_test_timeout(client(&server).answer(&[], "hello", None))
+                within_test_timeout(client(&server).answer(&[], "hello", &[]))
                     .await
                     .is_err()
             );
@@ -430,14 +423,43 @@ mod tests {
             .mount(&server)
             .await;
 
+        let answer =
+            within_test_timeout(client(&server).answer(&[], "What can you see?", &[&[0, 1, 2, 3]]))
+                .await
+                .unwrap();
+
+        assert_eq!(answer, "A test image.");
+    }
+
+    #[tokio::test]
+    async fn sends_multiple_image_bytes_in_input_order() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "Compare these.", "images": ["AQI=", "AwQF"]}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "They differ."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
         let answer = within_test_timeout(client(&server).answer(
             &[],
-            "What can you see?",
-            Some(&[0, 1, 2, 3]),
+            "Compare these.",
+            &[&[1, 2], &[3, 4, 5]],
         ))
         .await
         .unwrap();
 
-        assert_eq!(answer, "A test image.");
+        assert_eq!(answer, "They differ.");
     }
 }

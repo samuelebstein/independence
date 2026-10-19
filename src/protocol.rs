@@ -82,7 +82,14 @@ impl fmt::Debug for CapturedAudio {
 /// `--voice`), never by the normal line-oriented terminal interface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationInput {
+    /// The legacy tap-to-start/tap-to-finish control used by `--dictate`.
     Enter,
+    /// A real Enter key press in the hold-to-talk `--voice` mode.
+    HoldStart,
+    /// A real Enter key release in the hold-to-talk `--voice` mode.
+    HoldEnd,
+    /// One distinct `P` press while a voice draft is being recorded.
+    Photo,
     Escape,
     Interrupt,
     EndOfInput,
@@ -101,6 +108,18 @@ pub enum DictationEvent {
     RecordingElapsed {
         recording_id: RecordingId,
         elapsed: Duration,
+    },
+    /// A bounded snapshot of an ongoing recording, prepared for local
+    /// transcription. It never changes the final capture/transcription
+    /// lifecycle; voice mode uses it only for display-only partial text.
+    RecordingSnapshot {
+        recording_id: RecordingId,
+        audio: CapturedAudio,
+    },
+    /// A requested live snapshot had no usable audio yet. This is normal for
+    /// an early quiet hold; it lets voice mode request a later snapshot.
+    RecordingSnapshotUnavailable {
+        recording_id: RecordingId,
     },
     RecordingLimitReached {
         recording_id: RecordingId,
@@ -196,6 +215,15 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Ask(String),
+    /// A literal question accompanied by already validated, in-memory photos.
+    ///
+    /// This is constructed only by the hold-to-talk voice coordinator. It is
+    /// deliberately not part of the line parser, so a transcript cannot gain
+    /// terminal-command authority.
+    AskWithPhotos {
+        question: String,
+        photos: Vec<Photo>,
+    },
     Look {
         path: PathBuf,
         question: String,
@@ -227,7 +255,8 @@ pub struct TurnRequest {
 /// Whether a turn continues the accepted scene or stages a proposed replacement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisualRequest {
-    UseAccepted(Option<Photo>),
+    /// Send the current accepted image context with this turn, in order.
+    UseAccepted(Vec<Photo>),
     ProposeNew(PathBuf),
     ProposeCamera(CameraDescriptor),
 }

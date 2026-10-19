@@ -45,8 +45,14 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// would have rejected as stale or cancelled.
 #[derive(Debug)]
 pub(crate) enum DictationAction {
+    RecordingRequested {
+        recording_id: RecordingId,
+    },
     Display(DictationOutput),
-    AcceptedTranscript { text: String },
+    AcceptedTranscript {
+        recording_id: RecordingId,
+        text: String,
+    },
     Exit,
 }
 
@@ -96,6 +102,19 @@ impl DictationSession {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.controller.is_ready()
+    }
+
+    /// Requests one best-effort snapshot of the current capture. A snapshot
+    /// is display-only partial recognition; final transcription remains owned
+    /// by the controller's normal finish path.
+    pub(crate) fn request_snapshot(&self, recording_id: RecordingId) {
+        self.runtime.request_snapshot(recording_id);
+    }
+
+    /// Voice mode starts cancellable, display-only partial recognizers with
+    /// the same local model as the final recognizer.
+    pub(crate) fn transcriber(&self) -> Arc<dyn Transcriber> {
+        self.runtime.transcriber.clone()
     }
 
     /// Handles one fact, performs its requested capture/transcription work,
@@ -186,6 +205,7 @@ async fn run_with_services(
 /// data; only `--voice` supplies the separate bridge to `Input::Ask`.
 fn apply_dictation_only_action(action: DictationAction) -> bool {
     match action {
+        DictationAction::RecordingRequested { .. } => {}
         DictationAction::Display(output) => speak::emit_dictation(output),
         DictationAction::AcceptedTranscript { .. } => {}
         DictationAction::Exit => return false,
@@ -231,6 +251,7 @@ impl DictationRuntime {
         match effect {
             DictationEffect::StartRecording { recording_id } => {
                 self.start_recording(recording_id).await;
+                return Some(DictationAction::RecordingRequested { recording_id });
             }
             DictationEffect::FinishRecording { recording_id } => {
                 if let Some(recording) = self.active_recording.as_ref()
@@ -262,11 +283,10 @@ impl DictationRuntime {
             }
             DictationEffect::AcceptedTranscript { recording_id, text } => {
                 // The controller has just verified this ID against its active
-                // transcription phase. The outward action needs only the
-                // resulting data; the next controller allocates its own
-                // independent TurnId for model work.
-                let _ = recording_id;
-                return Some(DictationAction::AcceptedTranscript { text });
+                // transcription phase. Preserve that ID so a voice draft can
+                // reject a late result before it ever reaches the main
+                // controller.
+                return Some(DictationAction::AcceptedTranscript { recording_id, text });
             }
             DictationEffect::Display(output) => return Some(DictationAction::Display(output)),
             DictationEffect::Exit => return Some(DictationAction::Exit),
@@ -319,6 +339,14 @@ impl DictationRuntime {
                     })
                     .await;
             }
+        }
+    }
+
+    fn request_snapshot(&self, recording_id: RecordingId) {
+        if let Some(recording) = self.active_recording.as_ref()
+            && recording.id == recording_id
+        {
+            recording.handle.snapshot();
         }
     }
 
@@ -383,6 +411,8 @@ impl DictationRuntime {
             DictationEvent::Input(_)
             | DictationEvent::RecordingStarted { .. }
             | DictationEvent::RecordingElapsed { .. }
+            | DictationEvent::RecordingSnapshot { .. }
+            | DictationEvent::RecordingSnapshotUnavailable { .. }
             | DictationEvent::RecordingLimitReached { .. } => {}
         }
     }
@@ -695,6 +725,7 @@ mod tests {
         // policy rather than relying on terminal output as a side effect.
         assert!(apply_dictation_only_action(
             DictationAction::AcceptedTranscript {
+                recording_id: id(1),
                 text: "what is this tree?".into(),
             }
         ));

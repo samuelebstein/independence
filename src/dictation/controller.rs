@@ -57,6 +57,8 @@ impl DictationController {
                 recording_id,
                 elapsed,
             } => self.recording_elapsed(recording_id, elapsed),
+            DictationEvent::RecordingSnapshot { .. } => Vec::new(),
+            DictationEvent::RecordingSnapshotUnavailable { .. } => Vec::new(),
             DictationEvent::RecordingLimitReached { recording_id } => {
                 self.recording_limit_reached(recording_id)
             }
@@ -102,6 +104,40 @@ impl DictationController {
                     vec![DictationEffect::FinishRecording { recording_id }]
                 }
             },
+            DictationInput::HoldStart => match self.phase {
+                Phase::Ready => self.start_recording(),
+                // A real key repeat is filtered before this controller, but
+                // retain a state-machine guard so no source can queue work.
+                Phase::Starting { .. }
+                | Phase::Recording { .. }
+                | Phase::Finishing { .. }
+                | Phase::CancellingCapture { .. }
+                | Phase::Transcribing { .. }
+                | Phase::CancellingTranscription { .. }
+                | Phase::Exiting => Vec::new(),
+            },
+            DictationInput::HoldEnd => match self.phase {
+                // A fast physical release can precede CPAL's started event.
+                // Keep the ID and finish as soon as the microphone opens;
+                // never invent a timeout-based key release.
+                Phase::Starting { recording_id } => {
+                    self.phase = Phase::Finishing { recording_id };
+                    Vec::new()
+                }
+                Phase::Recording { recording_id } => {
+                    self.phase = Phase::Finishing { recording_id };
+                    vec![DictationEffect::FinishRecording { recording_id }]
+                }
+                Phase::Ready
+                | Phase::Finishing { .. }
+                | Phase::CancellingCapture { .. }
+                | Phase::Transcribing { .. }
+                | Phase::CancellingTranscription { .. }
+                | Phase::Exiting => Vec::new(),
+            },
+            // The voice coordinator owns button-photo capture. The dictation
+            // state machine purposefully has no camera dependency.
+            DictationInput::Photo => Vec::new(),
             DictationInput::Escape => match self.phase {
                 Phase::Starting { recording_id }
                 | Phase::Recording { recording_id }
@@ -141,15 +177,20 @@ impl DictationController {
     }
 
     fn recording_started(&mut self, recording_id: RecordingId) -> Vec<DictationEffect> {
-        if !matches!(self.phase, Phase::Starting { recording_id: active } if active == recording_id)
-        {
-            return Vec::new();
+        match self.phase {
+            Phase::Starting {
+                recording_id: active,
+            } if active == recording_id => {
+                self.phase = Phase::Recording { recording_id };
+                vec![DictationEffect::Display(DictationOutput::Recording {
+                    elapsed: Duration::ZERO,
+                })]
+            }
+            Phase::Finishing {
+                recording_id: active,
+            } if active == recording_id => vec![DictationEffect::FinishRecording { recording_id }],
+            _ => Vec::new(),
         }
-
-        self.phase = Phase::Recording { recording_id };
-        vec![DictationEffect::Display(DictationOutput::Recording {
-            elapsed: Duration::ZERO,
-        })]
     }
 
     fn recording_elapsed(
@@ -408,6 +449,35 @@ mod tests {
                 DictationEffect::Display(DictationOutput::Transcribing),
                 DictationEffect::StartTranscription { recording_id, .. }
             ] if *recording_id == id
+        ));
+    }
+
+    #[test]
+    fn hold_release_finishes_the_same_recording_even_when_it_arrives_before_startup() {
+        let mut controller = DictationController::new();
+        let effects = controller.handle(DictationEvent::Input(DictationInput::HoldStart));
+        let id = match effects.as_slice() {
+            [DictationEffect::StartRecording { recording_id }] => *recording_id,
+            _ => panic!("expected a hold recording start"),
+        };
+        assert!(
+            controller
+                .handle(DictationEvent::Input(DictationInput::HoldStart))
+                .is_empty()
+        );
+
+        // This is a real release event, not a timeout inference. CPAL may
+        // still be opening when it arrives.
+        assert!(
+            controller
+                .handle(DictationEvent::Input(DictationInput::HoldEnd))
+                .is_empty()
+        );
+        assert!(matches!(
+            controller
+                .handle(DictationEvent::RecordingStarted { recording_id: id })
+                .as_slice(),
+            [DictationEffect::FinishRecording { recording_id }] if *recording_id == id
         ));
     }
 

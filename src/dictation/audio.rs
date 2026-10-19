@@ -82,6 +82,9 @@ pub trait Recorder: Send + Sync {
 pub trait RecordingHandle: Send {
     fn finish(&self);
     fn cancel(&self);
+    /// Requests a best-effort in-memory audio snapshot while capture remains
+    /// active. Backends that cannot support it keep the default no-op.
+    fn snapshot(&self) {}
     fn wait(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
@@ -221,8 +224,15 @@ impl CpalRecorder {
         }
 
         let started = Instant::now();
-        let finish_reason =
-            wait_for_finish(recording_id, event_sender, commands, &stream_error, started)?;
+        let finish_reason = wait_for_finish(
+            recording_id,
+            event_sender,
+            commands,
+            &stream_error,
+            captured.as_ref(),
+            sample_rate,
+            started,
+        )?;
 
         // Dropping CPAL's stream ends its callback and releases the device
         // before we inspect samples, resample, or invoke whisper.cpp.
@@ -275,6 +285,10 @@ impl RecordingHandle for CpalRecordingHandle {
         let _ = self.command_sender.send(CaptureCommand::Cancel);
     }
 
+    fn snapshot(&self) {
+        let _ = self.command_sender.send(CaptureCommand::Snapshot);
+    }
+
     fn wait(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let CpalRecordingHandle { task, .. } = *self;
         Box::pin(async move {
@@ -287,6 +301,7 @@ impl RecordingHandle for CpalRecordingHandle {
 enum CaptureCommand {
     Finish,
     Cancel,
+    Snapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +320,8 @@ fn wait_for_finish(
     event_sender: &EventSender<DictationEvent>,
     commands: &Receiver<CaptureCommand>,
     stream_error: &Mutex<Option<String>>,
+    captured: &CaptureBuffer,
+    sample_rate: u32,
     started: Instant,
 ) -> Result<FinishReason, String> {
     let mut last_reported_second = 0;
@@ -333,6 +350,24 @@ fn wait_for_finish(
             Ok(CaptureCommand::Cancel) | Err(RecvTimeoutError::Disconnected) => {
                 return Ok(FinishReason::Cancelled);
             }
+            Ok(CaptureCommand::Snapshot) => {
+                // Partial recognition is opportunistic. In particular, an
+                // early or quiet clip has no useful audio yet; leave final
+                // capture validation authoritative and keep recording. Send
+                // an acknowledgement either way so voice mode can retry once
+                // speech begins instead of treating this request as pending.
+                let event = match captured
+                    .snapshot()
+                    .and_then(|samples| prepare_for_whisper(samples, sample_rate))
+                {
+                    Ok(audio) => DictationEvent::RecordingSnapshot {
+                        recording_id,
+                        audio,
+                    },
+                    Err(_) => DictationEvent::RecordingSnapshotUnavailable { recording_id },
+                };
+                let _ = event_sender.blocking_send(event);
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let whole_seconds = started.elapsed().as_secs();
                 if whole_seconds > last_reported_second {
@@ -350,7 +385,9 @@ fn wait_for_finish(
 fn command_requests_cancel(commands: &Receiver<CaptureCommand>) -> bool {
     match commands.try_recv() {
         Ok(CaptureCommand::Cancel) | Err(TryRecvError::Disconnected) => true,
-        Ok(CaptureCommand::Finish) | Err(TryRecvError::Empty) => false,
+        Ok(CaptureCommand::Finish) | Ok(CaptureCommand::Snapshot) | Err(TryRecvError::Empty) => {
+            false
+        }
     }
 }
 
@@ -414,6 +451,19 @@ impl CaptureBuffer {
             .lock()
             .map_err(|_| "microphone sample buffer lock was poisoned".to_owned())?;
         Ok(std::mem::take(&mut *samples))
+    }
+
+    fn snapshot(&self) -> Result<Vec<f32>, String> {
+        if self.overflowed.load(Ordering::Relaxed) {
+            return Err("recording exceeded the bounded in-memory audio limit".into());
+        }
+        if self.dropped_frames.load(Ordering::Relaxed) != 0 {
+            return Err("recording lost audio frames while buffering; try again".into());
+        }
+        self.samples
+            .lock()
+            .map_err(|_| "microphone sample buffer lock was poisoned".to_owned())
+            .map(|samples| samples.clone())
     }
 }
 

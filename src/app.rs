@@ -4,7 +4,15 @@
 //! `see` and `think` run in a cancellable worker, and `speak` emits only
 //! controller-approved output.
 
-use std::{io, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -12,11 +20,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     controller::Controller,
+    dictation::transcribe::{Transcriber, TranscriptionError},
     dictation::{self, DictationAction, DictationSession},
     listen,
     protocol::{
-        CameraPreparation, DictationEvent, DictationInput, Effect, Event, Input, TurnFinished,
-        TurnId, TurnRequest, TurnResult, VisualRequest,
+        CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
+        Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
     },
     see::{
         Photo, PhotoSource,
@@ -27,18 +36,22 @@ use crate::{
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 32;
+const VOICE_AUX_CHANNEL_CAPACITY: usize = 64;
+const PARTIAL_TRANSCRIPTION_INTERVAL: Duration = Duration::from_millis(750);
+const MAX_QUEUED_PHOTO_CAPTURES: usize = 32;
+const MAX_DRAFT_PHOTO_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum OutputMode {
     Line,
-    Raw,
+    Voice,
 }
 
 impl OutputMode {
     fn emit(self, output: crate::protocol::Output) {
         match self {
             Self::Line => speak::emit(output),
-            Self::Raw => speak::emit_raw(output),
+            Self::Voice => speak::emit_voice(output),
         }
     }
 }
@@ -84,7 +97,8 @@ pub async fn run_voice() -> Result<(), AppError> {
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
         mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let mut input = listen::dictation::spawn_dictation_key_reader(dictation_event_sender.clone())
+    let (voice_aux_sender, mut voice_aux_receiver) = mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
+    let mut input = listen::dictation::spawn_voice_key_reader(dictation_event_sender.clone())
         .map_err(AppError::InputAdapter)?;
 
     let dictation = DictationSession::from_environment(dictation_event_sender);
@@ -98,24 +112,37 @@ pub async fn run_voice() -> Result<(), AppError> {
         dictation.model_path(),
         dictation.model_is_available(),
     );
-    speak::emit_dictation(crate::protocol::DictationOutput::Ready);
 
     let mut runtime = VoiceRuntime::new(
         Controller::new(),
         TurnRuntime::new(client, CameraService::v4l(), main_event_sender),
         dictation,
+        voice_aux_sender,
     );
+    let mut partial_tick = tokio::time::interval(PARTIAL_TRANSCRIPTION_INTERVAL);
+    partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let event = tokio::select! {
             _ = tokio::signal::ctrl_c() => VoiceEvent::Dictation(DictationEvent::Input(DictationInput::Interrupt)),
             event = dictation_event_receiver.recv() => VoiceEvent::Dictation(event.unwrap_or(DictationEvent::Input(DictationInput::EndOfInput))),
             event = main_event_receiver.recv() => VoiceEvent::Main(event.unwrap_or(Event::Input(Input::Interrupt))),
+            event = voice_aux_receiver.recv() => match event {
+                Some(event) => VoiceEvent::Aux(event),
+                None => VoiceEvent::AuxChannelClosed,
+            },
+            _ = partial_tick.tick() => VoiceEvent::PartialTick,
         };
 
         let keep_running = match event {
             VoiceEvent::Dictation(event) => runtime.handle_dictation_event(event).await,
             VoiceEvent::Main(event) => runtime.handle_main_event(event).await,
+            VoiceEvent::Aux(event) => runtime.handle_aux_event(event).await,
+            VoiceEvent::PartialTick => {
+                runtime.request_partial_snapshot();
+                true
+            }
+            VoiceEvent::AuxChannelClosed => true,
         };
         if !keep_running {
             break;
@@ -133,6 +160,9 @@ pub async fn run_voice() -> Result<(), AppError> {
 enum VoiceEvent {
     Dictation(DictationEvent),
     Main(Event),
+    Aux(VoiceAuxEvent),
+    PartialTick,
+    AuxChannelClosed,
 }
 
 /// Applies facts at the main controller boundary for both line-input and voice
@@ -306,25 +336,136 @@ impl TurnRuntime {
     }
 }
 
-/// Coordinates two independent controllers for `--voice`.
+/// Coordinates button-controlled microphone, camera, and model lifecycles
+/// for `--voice`.
 ///
-/// `DictationSession` remains responsible for deciding whether a Whisper
-/// completion is current. The main `Controller` remains responsible for turn
-/// ownership, history, and accepted output. This small coordinator only
-/// defines the user-interface policy that a READY Enter/Esc cancels an
-/// outstanding answer before starting or returning to the next recording.
+/// The dictation controller still exclusively owns final recording and
+/// transcription. This coordinator owns only an unfinished draft: replaceable
+/// partial text, ordered camera requests, and the rule that all of it becomes
+/// one literal controller input after Enter is released.
 struct VoiceRuntime {
     controller: Controller,
     turns: TurnRuntime,
     dictation: DictationSession,
+    aux_sender: mpsc::Sender<VoiceAuxEvent>,
+    draft: Option<VoiceDraft>,
+    /// At most one camera request is dispatched at a time, in `P` press
+    /// order. The camera service has its own hardware gate too; this queue
+    /// preserves user-visible attachment order before work reaches that gate.
+    active_photo_capture: Option<(u64, u64)>,
+    live_transcription: Option<LiveTranscription>,
+    pending_snapshot: Option<(RecordingId, CapturedAudio)>,
+    next_draft_id: u64,
+    next_partial_sequence: u64,
+}
+
+struct VoiceDraft {
+    id: u64,
+    recording_id: Option<RecordingId>,
+    recording_started: bool,
+    held: bool,
+    released: bool,
+    snapshot_requested: bool,
+    cancellation: CancellationToken,
+    photos: BTreeMap<u64, DraftPhoto>,
+    next_photo_request: u64,
+    attached_photo_bytes: usize,
+    last_partial: Option<String>,
+    last_partial_error: Option<String>,
+    final_transcript: Option<String>,
+    submitted: bool,
+}
+
+impl VoiceDraft {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            recording_id: None,
+            recording_started: false,
+            held: true,
+            released: false,
+            snapshot_requested: false,
+            cancellation: CancellationToken::new(),
+            photos: BTreeMap::new(),
+            next_photo_request: 1,
+            attached_photo_bytes: 0,
+            last_partial: None,
+            last_partial_error: None,
+            final_transcript: None,
+            submitted: false,
+        }
+    }
+
+    fn pending_photo_count(&self) -> usize {
+        self.photos
+            .values()
+            .filter(|photo| matches!(photo, DraftPhoto::Queued | DraftPhoto::Capturing))
+            .count()
+    }
+
+    fn has_pending_photos(&self) -> bool {
+        self.photos
+            .values()
+            .any(|photo| matches!(photo, DraftPhoto::Queued | DraftPhoto::Capturing))
+    }
+
+    fn captured_photos(&self) -> Vec<Photo> {
+        self.photos
+            .values()
+            .filter_map(|photo| match photo {
+                DraftPhoto::Captured(photo) => Some(photo.clone()),
+                DraftPhoto::Queued | DraftPhoto::Capturing | DraftPhoto::Failed => None,
+            })
+            .collect()
+    }
+}
+
+enum DraftPhoto {
+    Queued,
+    Capturing,
+    Captured(Photo),
+    Failed,
+}
+
+struct LiveTranscription {
+    recording_id: RecordingId,
+    sequence: u64,
+    cancelled: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum VoiceAuxEvent {
+    PartialTranscript {
+        recording_id: RecordingId,
+        sequence: u64,
+        result: Result<String, String>,
+    },
+    PhotoCaptureFinished {
+        draft_id: u64,
+        request_id: u64,
+        result: Result<Photo, String>,
+    },
 }
 
 impl VoiceRuntime {
-    fn new(controller: Controller, turns: TurnRuntime, dictation: DictationSession) -> Self {
+    fn new(
+        controller: Controller,
+        turns: TurnRuntime,
+        dictation: DictationSession,
+        aux_sender: mpsc::Sender<VoiceAuxEvent>,
+    ) -> Self {
         Self {
             controller,
             turns,
             dictation,
+            aux_sender,
+            draft: None,
+            active_photo_capture: None,
+            live_transcription: None,
+            pending_snapshot: None,
+            next_draft_id: 1,
+            next_partial_sequence: 1,
         }
     }
 
@@ -333,47 +474,558 @@ impl VoiceRuntime {
             &mut self.controller,
             &mut self.turns,
             event,
-            OutputMode::Raw,
+            OutputMode::Voice,
         )
         .await
     }
 
     async fn handle_dictation_event(&mut self, event: DictationEvent) -> bool {
-        let cancel_main_answer = match &event {
-            DictationEvent::Input(DictationInput::Enter | DictationInput::Escape) => {
-                self.dictation.is_ready()
+        if let DictationEvent::RecordingSnapshot {
+            recording_id,
+            audio,
+        } = event
+        {
+            self.handle_recording_snapshot(recording_id, audio);
+            // Snapshots are intentionally not part of DictationSession's
+            // final lifecycle, so do not give them controller authority.
+            return true;
+        }
+        if let DictationEvent::RecordingSnapshotUnavailable { recording_id } = event {
+            if let Some(draft) = self.draft.as_mut()
+                && draft.recording_id == Some(recording_id)
+            {
+                draft.snapshot_requested = false;
             }
-            _ => false,
-        };
-        if cancel_main_answer && !self.handle_main_event(Event::Input(Input::Stop)).await {
-            return false;
+            return true;
+        }
+
+        match &event {
+            DictationEvent::RecordingSnapshot { .. } => {
+                unreachable!("recording snapshots return before dictation handling")
+            }
+            DictationEvent::RecordingSnapshotUnavailable { .. } => {
+                unreachable!("unavailable snapshots return before dictation handling")
+            }
+            DictationEvent::Input(DictationInput::HoldStart) => {
+                if !self.begin_draft().await {
+                    return false;
+                }
+            }
+            // `Enter` is not emitted by the hold-to-talk adapter. Retaining
+            // this narrow fallback keeps programmatic callers and the old
+            // dictation test seam usable without altering real key handling.
+            DictationEvent::Input(DictationInput::Enter) => {
+                if self.dictation.is_ready() {
+                    if !self.begin_draft().await {
+                        return false;
+                    }
+                } else {
+                    self.release_draft();
+                }
+            }
+            DictationEvent::Input(DictationInput::HoldEnd) => self.release_draft(),
+            DictationEvent::Input(DictationInput::Photo) => self.request_photo().await,
+            DictationEvent::Input(DictationInput::Escape) => {
+                self.cancel_draft();
+                if !self.handle_main_event(Event::Input(Input::Stop)).await {
+                    return false;
+                }
+                speak::voice_log("draft cancelled");
+            }
+            DictationEvent::Input(DictationInput::Interrupt | DictationInput::EndOfInput) => {
+                self.cancel_draft();
+            }
+            DictationEvent::RecordingStarted { recording_id } => {
+                if let Some(draft) = self.draft.as_mut()
+                    && draft.recording_id == Some(*recording_id)
+                {
+                    draft.recording_started = true;
+                }
+            }
+            DictationEvent::RecordingCancelled { recording_id }
+            | DictationEvent::RecordingFailed { recording_id, .. }
+            | DictationEvent::TranscriptionCancelled { recording_id }
+            | DictationEvent::TranscriptionFailed { recording_id, .. } => {
+                if self.draft_matches_recording(*recording_id) {
+                    self.cancel_draft();
+                }
+            }
+            DictationEvent::TranscriptReady { recording_id, text }
+                if text.trim().is_empty() && self.draft_matches_recording(*recording_id) =>
+            {
+                self.cancel_draft();
+            }
+            DictationEvent::RecordingLimitReached { recording_id }
+                if self.draft_matches_recording(*recording_id) =>
+            {
+                // The bounded capture owner ended this hold. Treat that as a
+                // release so its authoritative final transcript can submit.
+                self.release_draft();
+            }
+            DictationEvent::RecordingFinished { .. }
+            | DictationEvent::RecordingElapsed { .. }
+            | DictationEvent::RecordingLimitReached { .. }
+            | DictationEvent::TranscriptReady { .. } => {}
         }
 
         for action in self.dictation.handle(event).await {
-            match action {
-                DictationAction::Display(output) => speak::emit_dictation(output),
-                DictationAction::AcceptedTranscript { text } => {
-                    // This is intentionally a direct construction, not
-                    // `listen::parse_line`: spoken `/camera` or `/quit` text
-                    // is an ordinary question with no command authority.
-                    if !self.handle_main_event(Event::Input(Input::Ask(text))).await {
-                        return false;
-                    }
-                }
-                DictationAction::Exit => {
-                    // Dictation shutdown owns microphone/recognizer cleanup;
-                    // the main controller cancels its owned model turn using
-                    // its ordinary generation-safe exit path.
-                    let _ = self.handle_main_event(Event::Input(Input::Interrupt)).await;
-                    return false;
-                }
+            if !self.handle_dictation_action(action).await {
+                return false;
             }
         }
 
         true
     }
 
+    async fn handle_dictation_action(&mut self, action: DictationAction) -> bool {
+        match action {
+            DictationAction::RecordingRequested { recording_id } => {
+                if let Some(draft) = self.draft.as_mut()
+                    && draft.recording_id.is_none()
+                {
+                    draft.recording_id = Some(recording_id);
+                }
+            }
+            DictationAction::Display(output) => self.display_dictation_log(output),
+            DictationAction::AcceptedTranscript { recording_id, text } => {
+                let accepted = self.draft.as_ref().is_some_and(|draft| {
+                    draft.recording_id == Some(recording_id)
+                        && draft.released
+                        && !draft.cancellation.is_cancelled()
+                });
+                if !accepted {
+                    return true;
+                }
+
+                speak::voice_log(&format!("final transcript: {text}"));
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.final_transcript = Some(text);
+                }
+                return self.try_submit().await;
+            }
+            DictationAction::Exit => {
+                self.cancel_draft();
+                // Dictation shutdown owns microphone/recognizer cleanup; the
+                // main controller owns its model turn through its ordinary
+                // generation-safe exit path.
+                let _ = self.handle_main_event(Event::Input(Input::Interrupt)).await;
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn display_dictation_log(&self, output: DictationOutput) {
+        match output {
+            DictationOutput::Ready => {
+                speak::voice_log("ready — hold enter to start recording/transcription")
+            }
+            DictationOutput::Recording { .. } => {}
+            DictationOutput::Discarding => {
+                speak::voice_log("discarding recording and releasing microphone")
+            }
+            DictationOutput::Transcribing => speak::voice_log("finishing local transcription"),
+            // `AcceptedTranscript` below provides the exact, one-time final
+            // transcript log. Avoid printing it once here and once there.
+            DictationOutput::Transcript(_) => {}
+            DictationOutput::Diagnostic(message) => speak::voice_log(&message),
+        }
+    }
+
+    async fn begin_draft(&mut self) -> bool {
+        if !self.dictation.is_ready() {
+            return true;
+        }
+
+        // A new press starts a fresh draft. Any already accepted context
+        // remains in `controller`; only unfinished audio/photos are dropped.
+        self.cancel_draft();
+        if !self.handle_main_event(Event::Input(Input::Stop)).await {
+            return false;
+        }
+
+        let id = self.next_draft_id;
+        self.next_draft_id = self
+            .next_draft_id
+            .checked_add(1)
+            .expect("voice draft identifiers exhausted");
+        self.draft = Some(VoiceDraft::new(id));
+        speak::voice_product("i'm listening");
+        true
+    }
+
+    fn release_draft(&mut self) {
+        let should_announce = if let Some(draft) = self.draft.as_mut() {
+            if draft.held && !draft.released {
+                draft.held = false;
+                draft.released = true;
+                draft.snapshot_requested = false;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_announce {
+            self.cancel_live_transcription();
+            speak::voice_product("i'm thinking");
+        }
+    }
+
+    async fn request_photo(&mut self) {
+        let queued = {
+            let Some(draft) = self.draft.as_mut() else {
+                return;
+            };
+            if !draft.held || draft.released || draft.cancellation.is_cancelled() {
+                return;
+            }
+            if draft.pending_photo_count() >= MAX_QUEUED_PHOTO_CAPTURES {
+                speak::voice_log(&format!(
+                    "photo capture request rejected — {MAX_QUEUED_PHOTO_CAPTURES} captures are already waiting for the camera"
+                ));
+                return;
+            }
+
+            let request_id = draft.next_photo_request;
+            draft.next_photo_request = draft
+                .next_photo_request
+                .checked_add(1)
+                .expect("voice photo request identifiers exhausted");
+            draft.photos.insert(request_id, DraftPhoto::Queued);
+            true
+        };
+
+        if queued {
+            self.start_next_photo_capture();
+        }
+    }
+
+    fn start_next_photo_capture(&mut self) {
+        if self.active_photo_capture.is_some() {
+            return;
+        }
+        let request = self.draft.as_mut().and_then(|draft| {
+            if draft.cancellation.is_cancelled() {
+                return None;
+            }
+            let request_id = draft.photos.iter().find_map(|(request_id, photo)| {
+                matches!(photo, DraftPhoto::Queued).then_some(*request_id)
+            })?;
+            *draft
+                .photos
+                .get_mut(&request_id)
+                .expect("queued photo request was just found") = DraftPhoto::Capturing;
+            Some((draft.id, request_id, draft.cancellation.clone()))
+        });
+        let Some((draft_id, request_id, cancellation)) = request else {
+            return;
+        };
+
+        self.active_photo_capture = Some((draft_id, request_id));
+        let camera_service = self.turns.camera.clone();
+        let event_sender = self.aux_sender.clone();
+        tokio::spawn(async move {
+            let result = match camera_service.list().await {
+                Ok(cameras) => match select_camera(&cameras, None) {
+                    Ok(camera) => {
+                        match camera_service.capture(camera, cancellation.clone()).await {
+                            Ok(photo) => Ok(photo),
+                            Err(CameraRunError::Cancelled) => return,
+                            Err(CameraRunError::Failed(error)) => Err(error.to_string()),
+                        }
+                    }
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let _ = event_sender
+                .send(VoiceAuxEvent::PhotoCaptureFinished {
+                    draft_id,
+                    request_id,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    fn request_partial_snapshot(&mut self) {
+        let recording_id = self.draft.as_mut().and_then(|draft| {
+            if draft.held
+                && !draft.released
+                && draft.recording_started
+                && !draft.snapshot_requested
+                && self.live_transcription.is_none()
+                && self.pending_snapshot.is_none()
+            {
+                draft.snapshot_requested = true;
+                draft.recording_id
+            } else {
+                None
+            }
+        });
+        if let Some(recording_id) = recording_id {
+            self.dictation.request_snapshot(recording_id);
+        }
+    }
+
+    fn handle_recording_snapshot(&mut self, recording_id: RecordingId, audio: CapturedAudio) {
+        let current = self.draft.as_mut().is_some_and(|draft| {
+            if draft.recording_id == Some(recording_id) {
+                draft.snapshot_requested = false;
+                draft.held && !draft.released && !draft.cancellation.is_cancelled()
+            } else {
+                false
+            }
+        });
+        if !current {
+            return;
+        }
+
+        if self.live_transcription.is_some() {
+            // Keep only the newest full snapshot. Each result replaces prior
+            // partial text, so retaining every intermediate clip would waste
+            // CPU without adding information.
+            self.pending_snapshot = Some((recording_id, audio));
+            return;
+        }
+        self.start_partial_transcription(recording_id, audio);
+    }
+
+    fn start_partial_transcription(&mut self, recording_id: RecordingId, audio: CapturedAudio) {
+        let sequence = self.next_partial_sequence;
+        self.next_partial_sequence = self
+            .next_partial_sequence
+            .checked_add(1)
+            .expect("partial transcription identifiers exhausted");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let transcriber: Arc<dyn Transcriber> = self.dictation.transcriber();
+        let event_sender = self.aux_sender.clone();
+        let handle = tokio::spawn(async move {
+            let recognition_cancelled = worker_cancelled.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                transcriber.transcribe(audio, recognition_cancelled)
+            })
+            .await;
+            if worker_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            let result = match result {
+                Ok(Ok(text)) => Ok(text),
+                Ok(Err(TranscriptionError::Cancelled)) => return,
+                Ok(Err(TranscriptionError::Failed(message))) => Err(message),
+                Err(error) => Err(format!(
+                    "local partial transcription worker ended unexpectedly: {error}"
+                )),
+            };
+            let _ = event_sender
+                .send(VoiceAuxEvent::PartialTranscript {
+                    recording_id,
+                    sequence,
+                    result,
+                })
+                .await;
+        });
+        self.live_transcription = Some(LiveTranscription {
+            recording_id,
+            sequence,
+            cancelled,
+            handle,
+        });
+    }
+
+    async fn handle_aux_event(&mut self, event: VoiceAuxEvent) -> bool {
+        match event {
+            VoiceAuxEvent::PartialTranscript {
+                recording_id,
+                sequence,
+                result,
+            } => self.handle_partial_transcript(recording_id, sequence, result),
+            VoiceAuxEvent::PhotoCaptureFinished {
+                draft_id,
+                request_id,
+                result,
+            } => {
+                self.handle_photo_capture_finished(draft_id, request_id, result);
+                self.start_next_photo_capture();
+                self.try_submit().await
+            }
+        }
+    }
+
+    fn handle_partial_transcript(
+        &mut self,
+        recording_id: RecordingId,
+        sequence: u64,
+        result: Result<String, String>,
+    ) -> bool {
+        let Some(live) = self.live_transcription.take() else {
+            return true;
+        };
+        if live.recording_id != recording_id || live.sequence != sequence {
+            self.live_transcription = Some(live);
+            return true;
+        }
+        drop(live.handle);
+
+        let mut message = None;
+        if let Some(draft) = self.draft.as_mut()
+            && draft.recording_id == Some(recording_id)
+            && draft.held
+            && !draft.released
+            && !draft.cancellation.is_cancelled()
+        {
+            match result {
+                Ok(text) if draft.last_partial.as_deref() != Some(text.as_str()) => {
+                    draft.last_partial = Some(text.clone());
+                    draft.last_partial_error = None;
+                    message = Some(format!("transcript: {text}"));
+                }
+                Ok(_) => {}
+                Err(error) if draft.last_partial_error.as_deref() != Some(error.as_str()) => {
+                    draft.last_partial_error = Some(error.clone());
+                    message = Some(format!("partial transcription failed — {error}"));
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(message) = message {
+            speak::voice_log(&message);
+        }
+
+        if let Some((pending_id, audio)) = self.pending_snapshot.take() {
+            self.start_partial_transcription(pending_id, audio);
+        }
+        true
+    }
+
+    fn handle_photo_capture_finished(
+        &mut self,
+        draft_id: u64,
+        request_id: u64,
+        result: Result<Photo, String>,
+    ) {
+        let message = {
+            if self.active_photo_capture != Some((draft_id, request_id)) {
+                return;
+            }
+            self.active_photo_capture = None;
+            let Some(draft) = self.draft.as_mut() else {
+                return;
+            };
+            if draft.id != draft_id || draft.cancellation.is_cancelled() {
+                return;
+            }
+            let Some(slot) = draft.photos.get_mut(&request_id) else {
+                return;
+            };
+            if !matches!(slot, DraftPhoto::Capturing) {
+                return;
+            }
+
+            match result {
+                Ok(photo) => {
+                    let total = match draft.attached_photo_bytes.checked_add(photo.bytes().len()) {
+                        Some(total) => total,
+                        None => {
+                            *slot = DraftPhoto::Failed;
+                            MAX_DRAFT_PHOTO_BYTES + 1
+                        }
+                    };
+                    if total > MAX_DRAFT_PHOTO_BYTES {
+                        *slot = DraftPhoto::Failed;
+                        format!(
+                            "photo capture rejected — attached photos would exceed the {} MiB in-memory draft limit",
+                            MAX_DRAFT_PHOTO_BYTES / (1024 * 1024)
+                        )
+                    } else {
+                        draft.attached_photo_bytes = total;
+                        *slot = DraftPhoto::Captured(photo);
+                        let count = draft
+                            .photos
+                            .values()
+                            .filter(|photo| matches!(photo, DraftPhoto::Captured(_)))
+                            .count();
+                        format!("photo captured — {count} photos attached")
+                    }
+                }
+                Err(error) => {
+                    *slot = DraftPhoto::Failed;
+                    format!("photo capture failed — {error}")
+                }
+            }
+        };
+        speak::voice_log(&message);
+    }
+
+    async fn try_submit(&mut self) -> bool {
+        let submission = self.draft.as_mut().and_then(|draft| {
+            if !draft.released
+                || draft.final_transcript.is_none()
+                || draft.has_pending_photos()
+                || draft.submitted
+                || draft.cancellation.is_cancelled()
+            {
+                return None;
+            }
+            draft.submitted = true;
+            Some((
+                draft
+                    .final_transcript
+                    .clone()
+                    .expect("transcript was checked"),
+                draft.captured_photos(),
+            ))
+        });
+        let Some((transcript, photos)) = submission else {
+            return true;
+        };
+
+        speak::voice_log(&format!("sending {} photos", photos.len()));
+        let input = if photos.is_empty() {
+            Input::Ask(transcript)
+        } else {
+            Input::AskWithPhotos {
+                question: transcript,
+                photos,
+            }
+        };
+        self.draft = None;
+        self.handle_main_event(Event::Input(input)).await
+    }
+
+    fn draft_matches_recording(&self, recording_id: RecordingId) -> bool {
+        self.draft
+            .as_ref()
+            .is_some_and(|draft| draft.recording_id == Some(recording_id))
+    }
+
+    fn cancel_live_transcription(&mut self) {
+        self.pending_snapshot = None;
+        if let Some(live) = self.live_transcription.take() {
+            live.cancelled.store(true, Ordering::Release);
+            live.handle.abort();
+        }
+    }
+
+    fn cancel_draft(&mut self) {
+        self.cancel_live_transcription();
+        self.active_photo_capture = None;
+        if let Some(draft) = self.draft.take() {
+            draft.cancellation.cancel();
+        }
+    }
+
     async fn shutdown(&mut self) {
+        self.cancel_draft();
         self.dictation.shutdown().await;
         self.turns.shutdown().await;
     }
@@ -394,8 +1046,8 @@ async fn run_turn(
         ..
     } = request;
 
-    let (image, proposed_scene) = match visual {
-        VisualRequest::UseAccepted(scene) => (scene, None),
+    let (images, proposed_scene) = match visual {
+        VisualRequest::UseAccepted(photos) => (photos, None),
         VisualRequest::ProposeNew(path) => {
             let mut load_task = tokio::task::spawn_blocking(move || Photo::load(path));
             let photo = tokio::select! {
@@ -423,7 +1075,7 @@ async fn run_turn(
                 return TurnResult::Cancelled;
             }
 
-            (Some(photo.clone()), Some(photo))
+            (vec![photo.clone()], Some(photo))
         }
         VisualRequest::ProposeCamera(camera) => {
             if !send_camera_event(
@@ -472,14 +1124,16 @@ async fn run_turn(
                 return TurnResult::Cancelled;
             }
 
-            (Some(photo.clone()), Some(photo))
+            (vec![photo.clone()], Some(photo))
         }
     };
+
+    let image_bytes = images.iter().map(Photo::bytes).collect::<Vec<_>>();
 
     let answer = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return TurnResult::Cancelled,
-        answer = client.answer(&history, &question, image.as_ref().map(Photo::bytes)) => answer,
+        answer = client.answer(&history, &question, &image_bytes) => answer,
     };
 
     if cancellation.is_cancelled() {
@@ -693,6 +1347,15 @@ mod tests {
                 });
         }
 
+        fn snapshot(&self) {
+            let _ = self
+                .event_sender
+                .try_send(DictationEvent::RecordingSnapshot {
+                    recording_id: self.recording_id,
+                    audio: CapturedAudio::new(vec![0.1; 160]),
+                });
+        }
+
         fn wait(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             Box::pin(async {})
         }
@@ -751,6 +1414,7 @@ mod tests {
         runtime: VoiceRuntime,
         dictation_events: mpsc::Receiver<DictationEvent>,
         main_events: mpsc::Receiver<Event>,
+        aux_events: mpsc::Receiver<super::VoiceAuxEvent>,
         recorder: Arc<VoiceRecorder>,
         transcriber: Arc<VoiceTranscriber>,
     }
@@ -760,6 +1424,58 @@ mod tests {
             within_test_timeout(self.dictation_events.recv())
                 .await
                 .expect("synthetic dictation event")
+        }
+
+        async fn next_aux_event(&mut self) -> super::VoiceAuxEvent {
+            within_test_timeout(self.aux_events.recv())
+                .await
+                .expect("synthetic voice auxiliary event")
+        }
+
+        async fn start_hold(&mut self) -> RecordingId {
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                    .await
+            );
+            let recording_id = match self.next_dictation_event().await {
+                DictationEvent::RecordingStarted { recording_id } => recording_id,
+                event => panic!("expected synthetic recording start, got {event:?}"),
+            };
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::RecordingStarted { recording_id })
+                    .await
+            );
+            recording_id
+        }
+
+        async fn release_hold(&mut self, recording_id: RecordingId) -> String {
+            assert!(
+                self.runtime
+                    .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
+                    .await
+            );
+            let finished = self.next_dictation_event().await;
+            assert!(matches!(
+                &finished,
+                DictationEvent::RecordingFinished {
+                    recording_id: finished_id,
+                    ..
+                } if *finished_id == recording_id
+            ));
+            assert!(self.runtime.handle_dictation_event(finished).await);
+
+            let transcript = self.next_dictation_event().await;
+            let text = match &transcript {
+                DictationEvent::TranscriptReady {
+                    recording_id: transcript_id,
+                    text,
+                } if *transcript_id == recording_id => text.clone(),
+                event => panic!("expected synthetic transcript, got {event:?}"),
+            };
+            assert!(self.runtime.handle_dictation_event(transcript).await);
+            text
         }
 
         async fn submit_next_transcript(&mut self) -> (RecordingId, String) {
@@ -820,6 +1536,7 @@ mod tests {
     ) -> VoiceHarness {
         let (main_sender, main_events) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
         let (dictation_sender, dictation_events) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let (aux_sender, aux_events) = mpsc::channel(super::VOICE_AUX_CHANNEL_CAPACITY);
         let recorder = Arc::new(VoiceRecorder::default());
         let transcriber = Arc::new(VoiceTranscriber::new(transcripts));
         let dictation = DictationSession::with_services(
@@ -835,9 +1552,11 @@ mod tests {
                 Controller::new(),
                 TurnRuntime::new(client, camera, main_sender),
                 dictation,
+                aux_sender,
             ),
             dictation_events,
             main_events,
+            aux_events,
             recorder,
             transcriber,
         }
@@ -854,6 +1573,15 @@ mod tests {
         let image = DynamicImage::new_rgb8(1, 1);
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, ImageFormat::Jpeg).unwrap();
+        bytes.into_inner()
+    }
+
+    fn tiny_colored_jpeg(red: u8, green: u8, blue: u8) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([red, green, blue]));
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, ImageFormat::Jpeg)
+            .unwrap();
         bytes.into_inner()
     }
 
@@ -877,6 +1605,27 @@ mod tests {
             } else {
                 Ok(self.photo.clone())
             }
+        }
+    }
+
+    struct SequencedCameraBackend {
+        camera: CameraDescriptor,
+        photos: Mutex<VecDeque<Photo>>,
+        captures: Arc<AtomicUsize>,
+    }
+
+    impl CameraBackend for SequencedCameraBackend {
+        fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+            Ok(vec![self.camera.clone()])
+        }
+
+        fn capture(&self, _camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            self.photos
+                .lock()
+                .expect("synthetic camera sequence lock")
+                .pop_front()
+                .ok_or(CameraError::NoCameras)
         }
     }
 
@@ -1153,6 +1902,288 @@ mod tests {
         assert_eq!(captures.load(Ordering::SeqCst), 1);
         assert_eq!(controller.accepted_history().len(), 2);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hold_release_runs_live_partial_transcription_without_duplicate_draft_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "final spoken question"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "final answer"},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut harness = voice_harness(
+            &server,
+            [
+                "partial tree words".to_owned(),
+                "partial tree words".to_owned(),
+                "final spoken question".to_owned(),
+            ],
+            unused_camera_service(),
+        );
+        let recording_id = harness.start_hold().await;
+
+        // Repeated press does not allocate another recording while held.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+
+        for _ in 0..2 {
+            harness.runtime.request_partial_snapshot();
+            let snapshot = harness.next_dictation_event().await;
+            assert!(matches!(
+                &snapshot,
+                DictationEvent::RecordingSnapshot { recording_id: id, .. } if *id == recording_id
+            ));
+            assert!(harness.runtime.handle_dictation_event(snapshot).await);
+            let partial = harness.next_aux_event().await;
+            assert!(matches!(
+                &partial,
+                super::VoiceAuxEvent::PartialTranscript {
+                    recording_id: id,
+                    result: Ok(_),
+                    ..
+                } if *id == recording_id
+            ));
+            assert!(harness.runtime.handle_aux_event(partial).await);
+        }
+
+        // Each partial is a full replacement, never an append of the same
+        // words from the previous snapshot.
+        assert_eq!(
+            harness
+                .runtime
+                .draft
+                .as_ref()
+                .and_then(|draft| draft.last_partial.as_deref()),
+            Some("partial tree words")
+        );
+
+        assert_eq!(
+            harness.release_hold(recording_id).await,
+            "final spoken question"
+        );
+        harness.accept_next_answer().await;
+        assert_eq!(harness.recorder.finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_p_presses_submit_four_photos_in_press_order_with_one_request() {
+        let server = MockServer::start().await;
+        let camera = CameraDescriptor::new(CameraId::new(11), "Sequenced Camera");
+        let image_bytes = [
+            tiny_colored_jpeg(255, 0, 0),
+            tiny_colored_jpeg(0, 255, 0),
+            tiny_colored_jpeg(0, 0, 255),
+            tiny_colored_jpeg(255, 255, 0),
+        ];
+        let expected_images = image_bytes
+            .iter()
+            .map(|bytes| STANDARD.encode(bytes))
+            .collect::<Vec<_>>();
+        let photos = image_bytes
+            .iter()
+            .map(|bytes| {
+                Photo::from_camera_jpeg(
+                    CameraPhotoSource::new(camera.clone(), 1, 1, "MJPEG"),
+                    (*bytes).clone(),
+                )
+                .unwrap()
+            })
+            .collect::<VecDeque<_>>();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(SequencedCameraBackend {
+            camera,
+            photos: Mutex::new(photos),
+            captures: captures.clone(),
+        }));
+
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "compare the four views", "images": expected_images.clone()}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "four-view answer"},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut harness = voice_harness(
+            &server,
+            ["compare the four views".to_owned()],
+            camera_service,
+        );
+        let recording_id = harness.start_hold().await;
+        for _ in 0..4 {
+            assert!(
+                harness
+                    .runtime
+                    .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                    .await
+            );
+        }
+        for _ in 0..4 {
+            let completion = harness.next_aux_event().await;
+            assert!(matches!(
+                &completion,
+                super::VoiceAuxEvent::PhotoCaptureFinished { result: Ok(_), .. }
+            ));
+            assert!(harness.runtime.handle_aux_event(completion).await);
+        }
+        assert_eq!(captures.load(Ordering::SeqCst), 4);
+
+        assert_eq!(
+            harness.release_hold(recording_id).await,
+            "compare the four views"
+        );
+        harness.accept_next_answer().await;
+        assert_eq!(harness.runtime.controller.accepted_photos().len(), 4);
+        assert_eq!(
+            harness
+                .runtime
+                .controller
+                .accepted_photos()
+                .iter()
+                .map(|photo| STANDARD.encode(photo.bytes()))
+                .collect::<Vec<_>>(),
+            expected_images
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn escape_discards_photo_and_partial_draft_results_before_submission() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo: photo.clone(),
+            fail: false,
+            captures,
+        }));
+        let mut harness = voice_harness(
+            &server,
+            ["final text that must not submit".to_owned()],
+            camera_service,
+        );
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        let draft_id = harness.runtime.draft.as_ref().expect("active draft").id;
+
+        // Begin an actual live-recognition worker, then cancel before its
+        // completion is allowed to update or submit the draft.
+        harness.runtime.request_partial_snapshot();
+        let snapshot = harness.next_dictation_event().await;
+        assert!(harness.runtime.handle_dictation_event(snapshot).await);
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+
+        // Controlled late auxiliary completions cannot resurrect the draft.
+        assert!(
+            harness
+                .runtime
+                .handle_aux_event(super::VoiceAuxEvent::PartialTranscript {
+                    recording_id,
+                    sequence: 1,
+                    result: Ok("late partial".into()),
+                })
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_aux_event(super::VoiceAuxEvent::PhotoCaptureFinished {
+                    draft_id,
+                    request_id: 1,
+                    result: Ok(photo),
+                })
+                .await
+        );
+        assert!(harness.runtime.draft.is_none());
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn escape_during_final_transcription_keeps_late_text_out_of_the_controller() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(
+            &server,
+            ["late final transcript".to_owned()],
+            unused_camera_service(),
+        );
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
+                .await
+        );
+        let finished = harness.next_dictation_event().await;
+        assert!(matches!(
+            &finished,
+            DictationEvent::RecordingFinished { recording_id: id, .. } if *id == recording_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(finished).await);
+
+        // Deliver Escape before the queued native-recognizer completion. The
+        // controller must treat either completion shape as cleanup only.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        let late = harness.next_dictation_event().await;
+        assert!(matches!(
+            &late,
+            DictationEvent::TranscriptReady { recording_id: id, .. }
+                | DictationEvent::TranscriptionCancelled { recording_id: id }
+                if *id == recording_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(late).await);
+        assert!(harness.runtime.draft.is_none());
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

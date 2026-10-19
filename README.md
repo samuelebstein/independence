@@ -7,20 +7,21 @@ terminal prototype—not a finished camera device or general agent.
 It can:
 
 - take keyboard input as its `listen` capability;
-- send a text question, or one explicitly selected JPEG/PNG plus a question,
-  to a local Ollama model as `think`;
+- send a text question, or an ordered in-memory JPEG/PNG context plus a
+  question, to a local Ollama model as `think`;
 - list local Linux V4L2 cameras and explicitly capture one still image as
   `see` input;
-- retain the last successfully accepted photograph and conversation for
-  follow-up questions as `see` context; and
+- retain successfully accepted photographs, in attachment order, and
+  conversation for follow-up questions as `see` context; and
 - print an accepted answer as `speak`.
 
 It also has two explicit local microphone modes:
 
 - `--dictate` records one short clip, transcribes it with local Whisper, and
   displays the text only. It never contacts Ollama or invokes a command.
-- `--voice` uses that same bounded recording flow, displays an accepted
-  transcript, then sends it as literal question text to the existing local
+- `--voice` uses a real Enter press/release hold-to-talk flow, shows
+  replaceable local partial transcripts, can attach still photos with `P`, and
+  sends one literal question plus its ordered photos to the existing local
   Ollama/controller path. Spoken `/camera` and `/quit` text is never parsed as
   a terminal command.
 
@@ -163,14 +164,18 @@ OLLAMA_MODEL=qwen3-vl:4b-instruct \
 cargo run -- --voice
 ```
 
-| State | Control | Result |
+`--dictate` retains its original tap-Enter controls. `--voice` has separate,
+button-controlled behavior and requires a terminal that supports Kitty/CSI-u
+keyboard event reporting (including key release). It refuses to start rather
+than guessing Enter release with a timeout.
+
+| `--voice` state | Control | Result |
 | --- | --- | --- |
-| READY | Enter | Opens the selected microphone and begins one recording. In `--voice`, it first cancels an outstanding model answer. |
-| RECORDING | Enter | Stops and releases the microphone, then begins local transcription. |
-| RECORDING | Esc | Discards the clip and waits for microphone cleanup. |
-| RECORDING | 30 seconds | Automatically stops and begins transcription. |
-| TRANSCRIBING | Esc | Requests cooperative cancellation; no late text is displayed. |
-| READY in `--voice` | Esc | Cancels an outstanding model answer while preserving accepted conversation. |
+| READY | Hold Enter | Immediately prints `independence: i'm listening`, opens the microphone, and begins bounded capture. A repeated key-down is ignored. |
+| While Enter is held | `P` | Queues one immediate camera capture. Capture keeps the microphone running; successful stills remain only in memory and log their attachment count. |
+| While Enter is held | Release Enter | Immediately prints `independence: i'm thinking`, releases the microphone, finishes final local transcription and already requested captures, then makes one model request. |
+| While Enter is held | 30 seconds | Automatically finishes bounded capture; release is no longer needed. |
+| Any unfinished voice work | Esc | Cancels recording, local recognition, queued/active photo capture, and model inference; late work cannot submit or print. Accepted context remains. |
 | Any state | Ctrl+C | Cancels owned work, restores the terminal, and exits. |
 
 Repeated Enter presses outside READY are ignored. The raw-key reader is the
@@ -180,12 +185,22 @@ before resampling or Whisper inference begins. Audio lives only in bounded
 memory and is discarded after transcription or cancellation; Independence
 writes no recordings to disk.
 
-In `--voice`, Whisper has no command or camera authority. After
-`DictationController` accepts the current `RecordingId`, the runtime displays
-the text and constructs `Input::Ask(transcript)` directly. The main controller
-then gives its model turn a separate `TurnId`. A cancelled/stale recording
-never crosses that boundary, and a late model result cannot bypass the normal
-turn-ID acceptance rule.
+In `--voice`, Whisper has no command authority. While held, each complete
+partial replaces the prior partial in memory and appears as `[log] transcript:
+...`; it does not submit a turn. After `DictationController` accepts the final
+current `RecordingId`, the runtime logs the exact final transcript, waits for
+every requested photo, then constructs one `Input::Ask` or
+`Input::AskWithPhotos` directly. The main controller then gives its model turn
+a separate `TurnId`. A cancelled/stale recording, photo result, or model result
+cannot bypass those ownership checks.
+
+Pressing `P` chooses the only currently usable V4L2 camera, matching the
+existing no-guess policy. If none or more than one camera is available, the
+request logs a clear failure instead of choosing a device. Repeated presses are
+allowed: captures are dispatched in press order. There is no three-photo
+product limit; to keep unfinished drafts bounded, at most 32 captures may wait
+and successfully attached bytes may total 64 MiB. Both resource rejections are
+logged, and no image is written to disk.
 
 Try this manual sequence:
 
@@ -199,23 +214,24 @@ Try this manual sequence:
 
 For `--voice`, try this separate sequence:
 
-1. Start `cargo run -- --voice`, press Enter, ask “What is the primary gas in
-   Earth’s atmosphere?”, then press Enter. The transcript appears first, then
-   the local model's text answer.
-2. At READY, press Enter again, ask “Why does that matter for life?”, then
-   press Enter. This is a follow-up using the accepted conversation.
-3. While the second answer is still pending, press Enter to begin a third
-   recording. The old answer must not appear. Press Esc to discard that third
-   recording; the first accepted exchanges remain intact.
+1. Start `cargo run -- --voice`, hold Enter, ask “What is the primary gas in
+   Earth’s atmosphere?”, then release Enter. Partial `[log] transcript:` lines
+   may appear while held; the final transcript and one model answer follow.
+2. Hold Enter again, press `P` twice, describe what you want compared, then
+   release Enter. Two `photo captured` logs should precede one request with two
+   in-memory images in press order.
+3. While holding Enter, press Esc. Then repeat during final transcription and
+   while a model answer is pending. None of those unfinished results should
+   print or alter the previously accepted conversation.
 
 Current limits: English `base.en` recognition runs on CPU; no device list UI,
-voice activity detection, streaming partial text, saved audio, microphone
-permissions workflow, text-to-speech, decision-model routing, photo
-permission loop, autonomous camera request, or spoken reply exists. Voice
-questions cannot use typed `/look` or `/camera` commands; keep using the
-default keyboard mode for those. Whisper cancellation is cooperative: Esc
-prevents a result from being accepted, while the native recognizer exits at
-its next supported abort callback point.
+voice activity detection, saved audio, microphone permissions workflow,
+text-to-speech, decision-model routing, photo permission loop, autonomous
+camera decision, or spoken reply exists. Voice questions cannot use typed
+`/look` or `/camera` commands; keep using the default keyboard mode for those.
+Whisper cancellation is cooperative: Esc prevents a result from being
+accepted, while the native recognizer exits at its next supported abort
+callback point.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine
@@ -590,24 +606,28 @@ controller, command parser, or camera service in that mode.
 
 ### Integrated voice path
 
-`--voice` reuses the same microphone and transcription machinery, but adds one
-small, explicit bridge after a transcript has been accepted:
+`--voice` reuses the same microphone and final-transcription machinery, with a
+small coordinator for one unfinished hold-to-talk draft:
 
 ```mermaid
 flowchart TD
-    A["Whisper completion"] --> B["DictationController\nvalidates RecordingId"]
-    B --> C["DictationSession\nAcceptedTranscript { text }"]
-    C --> D["VoiceRuntime in app.rs"]
-    D --> E["Input::Ask(text)\ndirect construction"]
-    E --> F["existing Controller\nallocates TurnId"]
-    F --> G["existing TurnRuntime"]
-    G --> H["OllamaClient::answer"]
-    H --> I["TurnFinished"]
-    I --> F
-    F --> J["raw-mode-safe terminal answer"]
+    A["Enter press / release / P"] --> D["VoiceRuntime in app.rs\nunfinished draft"]
+    D --> B["DictationController\nvalidates RecordingId"]
+    B --> C["DictationSession\nAcceptedTranscript { recording_id, text }"]
+    D --> P["ordered in-memory photo captures"]
+    C --> E["VoiceRuntime waits for final text\nand requested captures"]
+    P --> E
+    E --> F["Input::Ask(text) or\nInput::AskWithPhotos direct construction"]
+    F --> G["existing Controller\nallocates TurnId"]
+    G --> H["existing TurnRuntime"]
+    H --> I["OllamaClient::answer"]
+    I --> K["TurnFinished"]
+    K --> G
+    G --> J["raw-mode-safe terminal answer"]
 ```
 
-The direct `Input::Ask(text)` construction is intentional:
+The direct `Input::Ask(text)` / `Input::AskWithPhotos` construction is
+intentional:
 
 ```text
 spoken "/camera 0 | take a photo"
@@ -628,7 +648,7 @@ terminal can show `READY` before the prior answer appears.
 
 ```text
 Controller (src/controller.rs)
-  owns: accepted history, accepted photo, active TurnId, pending camera request
+  owns: accepted history, ordered accepted photos, active TurnId, pending camera request
   decides: whether model/camera results can alter state or print
 
 DictationController (src/dictation/controller.rs)
@@ -642,6 +662,10 @@ TurnRuntime (src/app.rs)
 DictationSession (src/dictation/mod.rs)
   owns: one recording handle and one Whisper worker
   performs: microphone/recognizer lifecycle and cleanup
+
+VoiceRuntime (src/app.rs, --voice only)
+  owns: one unfinished draft, replaceable partial text, ordered P requests
+  decides: when final text plus all requested photos may form one controller input
 ```
 
 The controllers make decisions; runtimes perform I/O. Neither worker is allowed

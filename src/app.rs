@@ -4,21 +4,19 @@
 //! `see` and `think` run in a cancellable worker, and `speak` emits only
 //! controller-approved output.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc};
 
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     controller::Controller,
     dictation::{self, DictationAction, DictationSession},
     listen,
-    listen::vad::{VadMonitor, VadMonitorAction},
     protocol::{
-        CameraPreparation, DecisionId, DecisionRequest, DecisionResult, DictationEvent,
-        DictationInput, Effect, Event, Input, TurnFinished, TurnId, TurnRequest, TurnResult,
-        VisualRequest,
+        CameraPreparation, DictationEvent, DictationInput, Effect, Event, Input, TurnFinished,
+        TurnId, TurnRequest, TurnResult, VisualRequest,
     },
     see::{
         Photo, PhotoSource,
@@ -76,12 +74,11 @@ pub async fn run_dictation() -> Result<(), AppError> {
     dictation::run().await.map_err(AppError::Dictation)
 }
 
-/// Runs local dictation connected to the voice decision-and-answer controller.
+/// Runs local dictation connected to the existing text-question controller.
 ///
 /// This owns the raw-key input adapter, while `DictationSession` continues to
 /// own microphone and Whisper lifetimes. Only an accepted transcript crosses
-/// into the main controller, which decides whether it starts a question or
-/// replies to one still-current photo permission request.
+/// into the main controller as literal `Input::Ask` text.
 pub async fn run_voice() -> Result<(), AppError> {
     let client = OllamaClient::from_environment()?;
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -133,69 +130,6 @@ pub async fn run_voice() -> Result<(), AppError> {
     Ok(())
 }
 
-/// Runs continuous local acoustic activity diagnostics only.
-///
-/// This intentionally constructs no Whisper transcriber, Ollama client,
-/// application controller, camera service, or permission workflow. It owns the
-/// one raw-key reader while active and leaves the monitor's microphone stream
-/// under explicit M mute/unmute control.
-pub async fn run_vad_monitor() -> Result<(), AppError> {
-    let (key_sender, mut key_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let (monitor_sender, mut monitor_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let mut monitor = VadMonitor::from_environment(monitor_sender).map_err(AppError::VadMonitor)?;
-    let mut input = listen::dictation::spawn_microphone_key_reader(key_sender)
-        .map_err(AppError::InputAdapter)?;
-
-    let microphone_label = monitor.microphone_label();
-    let microphone_for_display = match &microphone_label {
-        Ok(label) => Ok(label.as_str()),
-        Err(message) => Err(message.as_str()),
-    };
-    speak::vad_monitor_welcome(microphone_for_display, &monitor.settings_summary());
-
-    let mut keep_running = apply_vad_monitor_actions(monitor.start());
-    let mut health_tick = tokio::time::interval(Duration::from_millis(100));
-    health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    while keep_running {
-        let actions = tokio::select! {
-            _ = tokio::signal::ctrl_c() => monitor.handle_key(DictationInput::Interrupt),
-            input = key_receiver.recv() => monitor.handle_key(input.unwrap_or(DictationInput::EndOfInput)),
-            event = monitor_receiver.recv() => match event {
-                Some(event) => monitor.handle_event(event),
-                None => {
-                    keep_running = false;
-                    monitor.worker_channel_closed()
-                }
-            },
-            _ = health_tick.tick() => monitor.poll(),
-        };
-        if !apply_vad_monitor_actions(actions) {
-            keep_running = false;
-        }
-    }
-
-    // The raw reader owns raw mode, so stop it before terminal settings are
-    // restored. The monitor then drops CPAL's stream, clears queued samples,
-    // asks its one worker to exit, and awaits that cleanup.
-    input.shutdown();
-    // The worker may be delivering a final bounded status. Closing its
-    // receiver makes that send fail promptly before shutdown waits for it.
-    drop(monitor_receiver);
-    monitor.shutdown().await;
-    Ok(())
-}
-
-fn apply_vad_monitor_actions(actions: Vec<VadMonitorAction>) -> bool {
-    for action in actions {
-        match action {
-            VadMonitorAction::Display(output) => speak::emit_vad_monitor(output),
-            VadMonitorAction::Exit => return false,
-        }
-    }
-    true
-}
-
 enum VoiceEvent {
     Dictation(DictationEvent),
     Main(Event),
@@ -213,9 +147,6 @@ async fn apply_main_event(
     if let Event::TurnFinished(finished) = &event {
         runtime.retire(finished.id).await;
     }
-    if let Event::DecisionFinished { id, .. } = &event {
-        runtime.retire_decision(*id).await;
-    }
 
     for effect in controller.handle(event) {
         if !runtime.apply(effect, output_mode).await {
@@ -230,17 +161,10 @@ struct TurnRuntime {
     camera: CameraService,
     event_sender: mpsc::Sender<Event>,
     active: Option<RunningTurn>,
-    active_decision: Option<RunningDecision>,
 }
 
 struct RunningTurn {
     id: TurnId,
-    cancellation: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-struct RunningDecision {
-    id: DecisionId,
     cancellation: CancellationToken,
     handle: JoinHandle<()>,
 }
@@ -252,18 +176,15 @@ impl TurnRuntime {
             camera,
             event_sender,
             active: None,
-            active_decision: None,
         }
     }
 
     async fn apply(&mut self, effect: Effect, output_mode: OutputMode) -> bool {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
-            Effect::StartDecision(request) => self.start_decision(request).await,
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
-            Effect::CancelDecision(id) => self.cancel_decision(id).await,
             Effect::Display(output) => output_mode.emit(output),
             Effect::Exit => {
                 self.shutdown().await;
@@ -315,32 +236,6 @@ impl TurnRuntime {
         });
     }
 
-    async fn start_decision(&mut self, request: DecisionRequest) {
-        // Only one structured decision may be eligible at a time. The
-        // controller also authorizes results by ID, so a late task is inert.
-        self.stop_active_decision().await;
-
-        let id = request.id();
-        let cancellation = CancellationToken::new();
-        let worker_cancellation = cancellation.clone();
-        let client = self.client.clone();
-        let event_sender = self.event_sender.clone();
-        let handle = tokio::spawn(async move {
-            let result = run_decision(client, request, worker_cancellation.clone()).await;
-            if !worker_cancellation.is_cancelled() && !matches!(result, DecisionResult::Cancelled) {
-                let _ = event_sender
-                    .send(Event::DecisionFinished { id, result })
-                    .await;
-            }
-        });
-
-        self.active_decision = Some(RunningDecision {
-            id,
-            cancellation,
-            handle,
-        });
-    }
-
     fn list_cameras(&self) {
         let camera = self.camera.clone();
         let event_sender = self.event_sender.clone();
@@ -376,34 +271,12 @@ impl TurnRuntime {
         self.stop_active_turn().await;
     }
 
-    async fn cancel_decision(&mut self, id: DecisionId) {
-        if self.active_decision.as_ref().map(|active| active.id) != Some(id) {
-            return;
-        }
-
-        self.stop_active_decision().await;
-    }
-
     async fn stop_active_turn(&mut self) {
         let RunningTurn {
             cancellation,
             handle,
             ..
         } = match self.active.take() {
-            Some(active) => active,
-            None => return,
-        };
-        cancellation.cancel();
-        handle.abort();
-        let _ = handle.await;
-    }
-
-    async fn stop_active_decision(&mut self) {
-        let RunningDecision {
-            cancellation,
-            handle,
-            ..
-        } = match self.active_decision.take() {
             Some(active) => active,
             None => return,
         };
@@ -424,24 +297,8 @@ impl TurnRuntime {
         let _ = handle.await;
     }
 
-    async fn retire_decision(&mut self, id: DecisionId) {
-        let Some(active) = self.active_decision.as_ref() else {
-            return;
-        };
-        if active.id != id {
-            return;
-        }
-
-        let RunningDecision { handle, .. } = self
-            .active_decision
-            .take()
-            .expect("active decision was checked above");
-        let _ = handle.await;
-    }
-
     async fn shutdown(&mut self) {
         self.stop_active_turn().await;
-        self.stop_active_decision().await;
         // A capture cancelled earlier may already be detached from its outer
         // async task. It still owns this gate until V4L2 has released its
         // buffers and device handle, so wait before process shutdown.
@@ -482,20 +339,13 @@ impl VoiceRuntime {
     }
 
     async fn handle_dictation_event(&mut self, event: DictationEvent) -> bool {
-        let cancel_main_work = match &event {
-            // While a permission question is waiting, Enter begins the one
-            // recording that supplies its reply. It must preserve the pending
-            // original question and selected camera. In every other READY
-            // state, Enter starts a new question and invalidates old work.
-            DictationEvent::Input(DictationInput::Enter) => {
-                self.dictation.is_ready() && !self.controller.awaits_photo_permission()
+        let cancel_main_answer = match &event {
+            DictationEvent::Input(DictationInput::Enter | DictationInput::Escape) => {
+                self.dictation.is_ready()
             }
-            // Esc in READY explicitly abandons a pending permission request
-            // (or cancels a current model/decision task).
-            DictationEvent::Input(DictationInput::Escape) => self.dictation.is_ready(),
             _ => false,
         };
-        if cancel_main_work && !self.handle_main_event(Event::Input(Input::Stop)).await {
+        if cancel_main_answer && !self.handle_main_event(Event::Input(Input::Stop)).await {
             return false;
         }
 
@@ -503,11 +353,10 @@ impl VoiceRuntime {
             match action {
                 DictationAction::Display(output) => speak::emit_dictation(output),
                 DictationAction::AcceptedTranscript { text } => {
-                    // The controller decides whether this accepted transcript
-                    // begins a new question or replies to a still-current
-                    // permission request. It is never parsed as a terminal
-                    // command.
-                    if !self.handle_main_event(Event::VoiceTranscript(text)).await {
+                    // This is intentionally a direct construction, not
+                    // `listen::parse_line`: spoken `/camera` or `/quit` text
+                    // is an ordinary question with no command authority.
+                    if !self.handle_main_event(Event::Input(Input::Ask(text))).await {
                         return false;
                     }
                 }
@@ -648,58 +497,6 @@ async fn run_turn(
     }
 }
 
-async fn run_decision(
-    client: Arc<OllamaClient>,
-    request: DecisionRequest,
-    cancellation: CancellationToken,
-) -> DecisionResult {
-    let result = match request {
-        DecisionRequest::ChoosePhoto {
-            question,
-            history,
-            scene,
-            ..
-        } => {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return DecisionResult::Cancelled,
-                result = client.decide_photo(&history, &question, scene.as_ref().map(Photo::bytes)) => {
-                    result.map(DecisionResult::Photo)
-                }
-            }
-        }
-        DecisionRequest::InterpretPermission {
-            proposed_action,
-            selected_camera,
-            permission_question,
-            reply,
-            ..
-        } => {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return DecisionResult::Cancelled,
-                result = client.interpret_permission(
-                    &proposed_action,
-                    &selected_camera,
-                    &permission_question,
-                    &reply,
-                ) => result.map(DecisionResult::Permission),
-            }
-        }
-    };
-
-    if cancellation.is_cancelled() {
-        return DecisionResult::Cancelled;
-    }
-
-    match result {
-        Ok(result) => result,
-        Err(error) => DecisionResult::Failed {
-            message: error.to_string(),
-        },
-    }
-}
-
 async fn send_camera_event(
     event_sender: &mpsc::Sender<Event>,
     cancellation: &CancellationToken,
@@ -722,9 +519,6 @@ pub enum AppError {
 
     #[error("could not run local dictation: {0}")]
     Dictation(#[from] dictation::DictationError),
-
-    #[error("could not start local VAD monitor: {0}")]
-    VadMonitor(String),
 }
 
 #[cfg(test)]
@@ -750,7 +544,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use wiremock::{
-        Mock, MockServer, Request as WiremockRequest, Respond, ResponseTemplate,
+        Mock, MockServer, ResponseTemplate,
         matchers::{body_json, method, path},
     };
 
@@ -762,9 +556,8 @@ mod tests {
             transcribe::{Transcriber, TranscriptionError},
         },
         protocol::{
-            CapturedAudio, DecisionId, DecisionResult, DictationEvent, DictationInput, Effect,
-            Event, Input, PhotoDecision, RecordingId, TurnFinished, TurnId, TurnRequest,
-            TurnResult, VisualRequest,
+            CapturedAudio, DictationEvent, DictationInput, Effect, Event, Input, RecordingId,
+            TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
         },
         see::{
             MAX_PHOTO_BYTES, Photo, PhotoSource,
@@ -788,39 +581,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), future)
             .await
             .expect("worker test exceeded its three-second timeout")
-    }
-
-    fn ollama_response(content: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "message": {"role": "assistant", "content": content},
-            "done": true,
-            "done_reason": "stop"
-        }))
-    }
-
-    /// Makes a deterministic sequence of model outcomes available to one
-    /// integration test without a live model or timing guesses.
-    #[derive(Clone)]
-    struct SequentialResponder {
-        responses: Arc<Mutex<VecDeque<ResponseTemplate>>>,
-    }
-
-    impl SequentialResponder {
-        fn new(responses: impl IntoIterator<Item = ResponseTemplate>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-            }
-        }
-    }
-
-    impl Respond for SequentialResponder {
-        fn respond(&self, _request: &WiremockRequest) -> ResponseTemplate {
-            self.responses
-                .lock()
-                .expect("mock response queue lock")
-                .pop_front()
-                .unwrap_or_else(|| ResponseTemplate::new(500))
-        }
     }
 
     fn request_for_photo(path: PathBuf) -> TurnRequest {
@@ -1044,18 +804,11 @@ mod tests {
             (recording_id, text)
         }
 
-        async fn next_main_event(&mut self) -> Event {
-            within_test_timeout(self.main_events.recv())
-                .await
-                .expect("mock Ollama or camera event")
-        }
-
         async fn accept_next_answer(&mut self) {
-            let event = self.next_main_event().await;
-            assert!(matches!(
-                event,
-                Event::TurnFinished(_) | Event::DecisionFinished { .. }
-            ));
+            let event = within_test_timeout(self.main_events.recv())
+                .await
+                .expect("mock Ollama completion");
+            assert!(matches!(event, Event::TurnFinished(_)));
             assert!(self.runtime.handle_main_event(event).await);
         }
     }
@@ -1408,9 +1161,19 @@ mod tests {
         let question = "What makes a fern different from a moss?";
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ollama_response(
-                r#"{"decision":"respond","answer":"Ferns make spores and have vascular tissue."}"#,
-            ))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": question}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Ferns make spores and have vascular tissue."},
+                "done": true,
+                "done_reason": "stop"
+            })))
             .mount(&server)
             .await;
 
@@ -1430,14 +1193,7 @@ mod tests {
 
         assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 1);
         assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body["format"].is_object());
-        assert_eq!(
-            body["messages"].as_array().unwrap().last().unwrap()["content"],
-            question
-        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1445,9 +1201,38 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ollama_response(
-                r#"{"decision":"respond","answer":"It is a partnership between a fungus and a photosynthetic partner."}"#,
-            ))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "What is lichen?"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "It is a partnership between a fungus and a photosynthetic partner."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "What is lichen?"},
+                    {"role": "assistant", "content": "It is a partnership between a fungus and a photosynthetic partner."},
+                    {"role": "user", "content": "What should I look for on tree bark?"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Look for leaflike, crusty, or branching patches."},
+                "done": true,
+                "done_reason": "stop"
+            })))
             .mount(&server)
             .await;
 
@@ -1465,18 +1250,7 @@ mod tests {
         harness.accept_next_answer().await;
 
         assert_eq!(harness.runtime.controller.accepted_history().len(), 2);
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2);
-        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert_eq!(second["messages"][1]["content"], "What is lichen?");
-        assert_eq!(
-            second["messages"][2]["content"],
-            "It is a partnership between a fungus and a photosynthetic partner."
-        );
-        assert_eq!(
-            second["messages"][3]["content"],
-            "What should I look for on tree bark?"
-        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1485,9 +1259,19 @@ mod tests {
         let question = "/camera 7 | take a photo";
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ollama_response(
-                r#"{"decision":"respond","answer":"I will treat that as words, not an action."}"#,
-            ))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": question}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "I will treat that as words, not an action."},
+                "done": true,
+                "done_reason": "stop"
+            })))
             .mount(&server)
             .await;
 
@@ -1505,193 +1289,6 @@ mod tests {
 
         assert_eq!(captures.load(Ordering::SeqCst), 0);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn approved_voice_photo_permission_captures_once_and_many_follow_ups_reuse_the_scene() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .respond_with(SequentialResponder::new([
-                ollama_response(
-                    r#"{"decision":"request_photo","needed_visual_evidence":"the object's broad shape and surface details"}"#,
-                ),
-                ollama_response(r#"{"decision":"yes"}"#),
-                ollama_response("The object has a broad green leaf and a visible central vein."),
-                ollama_response(
-                    r#"{"decision":"respond","answer":"The photo shows a broad green leaf and a central vein."}"#,
-                ),
-                ollama_response(
-                    r#"{"decision":"respond","answer":"The visible leaf edge and central vein are the clearest features."}"#,
-                ),
-                ollama_response(
-                    r#"{"decision":"respond","answer":"The far side of the object remains outside this still image."}"#,
-                ),
-            ]))
-            .mount(&server)
-            .await;
-
-        let (camera, photo) = fake_camera();
-        let image_base64 = STANDARD.encode(photo.bytes());
-        let captures = Arc::new(AtomicUsize::new(0));
-        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
-            camera: camera.clone(),
-            photo,
-            fail: false,
-            captures: captures.clone(),
-        }));
-        let original_question = "What visible features should I notice?";
-        let reply = "I am comfortable with that one photo now.";
-        let follow_ups = [
-            (
-                "What was in the photo?",
-                "The photo shows a broad green leaf and a central vein.",
-            ),
-            (
-                "Which visible feature should I inspect first?",
-                "The visible leaf edge and central vein are the clearest features.",
-            ),
-            (
-                "What remains uncertain from this view?",
-                "The far side of the object remains outside this still image.",
-            ),
-        ];
-        let mut harness = voice_harness(
-            &server,
-            std::iter::once(original_question.to_owned())
-                .chain(std::iter::once(reply.to_owned()))
-                .chain(
-                    follow_ups
-                        .iter()
-                        .map(|(question, _)| (*question).to_owned()),
-                ),
-            camera_service,
-        );
-
-        harness.submit_next_transcript().await;
-        let photo_decision = harness.next_main_event().await;
-        assert!(matches!(
-            &photo_decision,
-            Event::DecisionFinished {
-                result:
-                    DecisionResult::Photo(PhotoDecision::RequestPhoto {
-                        needed_visual_evidence,
-                    }),
-                ..
-            } if needed_visual_evidence == "the object's broad shape and surface details"
-        ));
-        assert!(harness.runtime.handle_main_event(photo_decision).await);
-
-        let prepared = harness.next_main_event().await;
-        assert!(matches!(
-            &prepared,
-            Event::CameraPrepared {
-                result: Ok(selected),
-                ..
-            } if selected == &camera
-        ));
-        assert!(harness.runtime.handle_main_event(prepared).await);
-        assert!(harness.runtime.controller.awaits_photo_permission());
-        assert_eq!(captures.load(Ordering::SeqCst), 0);
-
-        harness.submit_next_transcript().await;
-        let permission_decision = harness.next_main_event().await;
-        assert!(matches!(
-            &permission_decision,
-            Event::DecisionFinished {
-                result: DecisionResult::Permission(crate::protocol::PermissionDecision::Yes),
-                ..
-            }
-        ));
-        assert!(harness.runtime.handle_main_event(permission_decision).await);
-
-        let started = harness.next_main_event().await;
-        assert!(matches!(
-            &started,
-            Event::CameraCaptureStarted { camera: started_camera, .. } if started_camera == &camera
-        ));
-        assert!(harness.runtime.handle_main_event(started).await);
-        let ready = harness.next_main_event().await;
-        assert!(matches!(
-            &ready,
-            Event::CameraCaptureReady { source, .. } if source.camera() == &camera
-        ));
-        assert!(harness.runtime.handle_main_event(ready).await);
-        let answer = harness.next_main_event().await;
-        assert!(matches!(&answer, Event::TurnFinished(_)));
-        assert!(harness.runtime.handle_main_event(answer).await);
-
-        assert_eq!(captures.load(Ordering::SeqCst), 1);
-        assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
-        assert_eq!(
-            harness.runtime.controller.accepted_history()[0].user,
-            original_question
-        );
-        assert!(matches!(
-            harness.runtime.controller.accepted_scene().unwrap().source(),
-            PhotoSource::Camera(source) if source.camera() == &camera
-        ));
-
-        for (question, expected_answer) in follow_ups {
-            let (_, transcript) = harness.submit_next_transcript().await;
-            assert_eq!(transcript, question);
-            let decision = harness.next_main_event().await;
-            assert!(matches!(
-                &decision,
-                Event::DecisionFinished {
-                    result: DecisionResult::Photo(PhotoDecision::Answer { answer }),
-                    ..
-                } if answer == expected_answer
-            ));
-            assert!(harness.runtime.handle_main_event(decision).await);
-            assert_eq!(captures.load(Ordering::SeqCst), 1);
-            assert!(matches!(
-                harness.runtime.controller.accepted_scene().unwrap().source(),
-                PhotoSource::Camera(source) if source.camera() == &camera
-            ));
-        }
-
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 3 + follow_ups.len());
-        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        let third: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
-        assert!(first["format"].is_object());
-        assert_eq!(
-            first["messages"].as_array().unwrap().last().unwrap()["content"],
-            original_question
-        );
-        assert!(second["format"].is_object());
-        let permission_context: serde_json::Value = serde_json::from_str(
-            second["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_str()
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(permission_context["reply"], reply);
-        assert_eq!(permission_context["selected_camera"]["id"], "7");
-        assert!(third.get("format").is_none());
-        assert_eq!(
-            third["messages"].as_array().unwrap().last().unwrap()["content"],
-            original_question
-        );
-        assert_eq!(
-            third["messages"].as_array().unwrap().last().unwrap()["images"],
-            json!([image_base64.clone()])
-        );
-        for (index, (question, _)) in follow_ups.iter().enumerate() {
-            let body: serde_json::Value =
-                serde_json::from_slice(&requests[3 + index].body).unwrap();
-            let messages = body["messages"].as_array().unwrap();
-            assert!(body["format"].is_object());
-            assert_eq!(messages.last().unwrap()["content"], *question);
-            assert_eq!(messages.last().unwrap()["images"], json!([image_base64]));
-            assert_eq!(messages.len(), 4 + index * 2);
-        }
-        assert_eq!(
-            harness.runtime.controller.accepted_history().len(),
-            1 + follow_ups.len()
-        );
     }
 
     #[tokio::test]
@@ -1795,9 +1392,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ollama_response(
-                r#"{"decision":"respond","answer":"old answer"}"#,
-            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "old answer"},
+                "done": true,
+                "done_reason": "stop"
+            })))
             .mount(&server)
             .await;
         let mut harness = voice_harness(
@@ -1806,9 +1405,9 @@ mod tests {
             unused_camera_service(),
         );
         harness.submit_next_transcript().await;
-        assert!(harness.runtime.controller.has_active_decision());
+        assert!(harness.runtime.controller.has_active_turn());
 
-        // READY Enter cancels the old decision before it opens the next
+        // READY Enter cancels the old model turn before it opens the next
         // recording. A controlled late completion cannot restore history.
         assert!(
             harness
@@ -1816,16 +1415,17 @@ mod tests {
                 .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
                 .await
         );
-        assert!(!harness.runtime.controller.has_active_decision());
+        assert!(!harness.runtime.controller.has_active_turn());
         assert!(
             harness
                 .runtime
-                .handle_main_event(Event::DecisionFinished {
-                    id: DecisionId::new(1),
-                    result: DecisionResult::Photo(PhotoDecision::Answer {
+                .handle_main_event(Event::TurnFinished(TurnFinished {
+                    id: TurnId::new(1),
+                    result: TurnResult::Answer {
                         answer: "late old answer".into(),
-                    }),
-                })
+                        proposed_scene: None,
+                    },
+                }))
                 .await
         );
         assert!(harness.runtime.controller.accepted_history().is_empty());
@@ -1842,9 +1442,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .respond_with(ollama_response(
-                r#"{"decision":"respond","answer":"answer that should be cancelled"}"#,
-            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "answer that should be cancelled"},
+                "done": true,
+                "done_reason": "stop"
+            })))
             .mount(&server)
             .await;
         let mut harness = voice_harness(
@@ -1853,7 +1455,7 @@ mod tests {
             unused_camera_service(),
         );
         harness.submit_next_transcript().await;
-        assert!(harness.runtime.controller.has_active_decision());
+        assert!(harness.runtime.controller.has_active_turn());
 
         assert!(
             harness
@@ -1861,16 +1463,17 @@ mod tests {
                 .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
                 .await
         );
-        assert!(!harness.runtime.controller.has_active_decision());
+        assert!(!harness.runtime.controller.has_active_turn());
         assert!(
             harness
                 .runtime
-                .handle_main_event(Event::DecisionFinished {
-                    id: DecisionId::new(1),
-                    result: DecisionResult::Photo(PhotoDecision::Answer {
+                .handle_main_event(Event::TurnFinished(TurnFinished {
+                    id: TurnId::new(1),
+                    result: TurnResult::Answer {
                         answer: "late cancelled answer".into(),
-                    }),
-                })
+                        proposed_scene: None,
+                    },
+                }))
                 .await
         );
         assert!(harness.runtime.controller.accepted_history().is_empty());

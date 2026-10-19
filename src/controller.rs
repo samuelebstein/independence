@@ -27,7 +27,10 @@ pub struct Controller {
 
 #[derive(Debug, Default)]
 struct Session {
-    scene: Option<Photo>,
+    /// The accepted visual context, in the exact order it should reach the
+    /// model. `/look` and `/camera` replace this vector; button-captured
+    /// voice photos are appended only after their answer is accepted.
+    photos: Vec<Photo>,
     history: Vec<ConversationTurn>,
 }
 
@@ -35,7 +38,19 @@ struct Session {
 struct ActiveTurn {
     id: TurnId,
     question: String,
-    replaces_scene: bool,
+    scene_commit: SceneCommit,
+}
+
+/// The only ways a successful answer may affect accepted image context.
+///
+/// A worker cannot mutate session state. For an appended voice batch, the
+/// photos are already validated before the turn starts, so the controller can
+/// retain the exact proposed vector here until it accepts the answer.
+#[derive(Debug)]
+enum SceneCommit {
+    Unchanged,
+    ReplaceWithWorkerPhoto,
+    AppendKnown(Vec<Photo>),
 }
 
 #[derive(Debug)]
@@ -70,7 +85,12 @@ impl Controller {
     }
 
     pub fn accepted_scene(&self) -> Option<&Photo> {
-        self.session.scene.as_ref()
+        self.session.photos.last()
+    }
+
+    /// All accepted photos in the order follow-up model requests use them.
+    pub fn accepted_photos(&self) -> &[Photo] {
+        &self.session.photos
     }
 
     pub fn accepted_history(&self) -> &[ConversationTurn] {
@@ -85,12 +105,31 @@ impl Controller {
         match input {
             Input::Ask(question) => self.start_turn(
                 question,
-                VisualRequest::UseAccepted(self.session.scene.clone()),
-                false,
+                VisualRequest::UseAccepted(self.session.photos.clone()),
+                SceneCommit::Unchanged,
             ),
-            Input::Look { path, question } => {
-                self.start_turn(question, VisualRequest::ProposeNew(path), true)
+            Input::AskWithPhotos { question, photos } => {
+                if photos.is_empty() {
+                    return self.start_turn(
+                        question,
+                        VisualRequest::UseAccepted(self.session.photos.clone()),
+                        SceneCommit::Unchanged,
+                    );
+                }
+
+                let mut accepted_and_new = self.session.photos.clone();
+                accepted_and_new.extend(photos);
+                self.start_turn(
+                    question,
+                    VisualRequest::UseAccepted(accepted_and_new.clone()),
+                    SceneCommit::AppendKnown(accepted_and_new),
+                )
             }
+            Input::Look { path, question } => self.start_turn(
+                question,
+                VisualRequest::ProposeNew(path),
+                SceneCommit::ReplaceWithWorkerPhoto,
+            ),
             Input::Cameras => vec![Effect::ListCameras],
             Input::Camera {
                 requested,
@@ -127,13 +166,15 @@ impl Controller {
         &mut self,
         question: String,
         visual: VisualRequest,
-        replaces_scene: bool,
+        scene_commit: SceneCommit,
     ) -> Vec<Effect> {
         // A newer valid question makes an outstanding no-stream camera
         // preflight stale before it can supersede anything.
         self.pending_camera = None;
 
-        if !replaces_scene && self.session.history.len() >= MAX_HISTORY_TURNS {
+        if !matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto)
+            && self.session.history.len() >= MAX_HISTORY_TURNS
+        {
             return vec![Effect::Display(Output::Diagnostic(format!(
                 "this session has reached {MAX_HISTORY_TURNS} accepted exchanges; use /reset or /look to start a new scene"
             )))];
@@ -148,7 +189,7 @@ impl Controller {
 
         // A new photograph begins a prospective new scene, so it must not
         // inherit conversations that describe the old scene.
-        let history = if replaces_scene {
+        let history = if matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto) {
             Vec::new()
         } else {
             self.session.history.clone()
@@ -157,7 +198,7 @@ impl Controller {
         self.active = Some(ActiveTurn {
             id,
             question: question.clone(),
-            replaces_scene,
+            scene_commit,
         });
         effects.push(Effect::StartTurn(TurnRequest {
             id,
@@ -216,9 +257,11 @@ impl Controller {
             .take()
             .expect("pending camera request was checked above");
         match result {
-            Ok(camera) => {
-                self.start_turn(pending.question, VisualRequest::ProposeCamera(camera), true)
-            }
+            Ok(camera) => self.start_turn(
+                pending.question,
+                VisualRequest::ProposeCamera(camera),
+                SceneCommit::ReplaceWithWorkerPhoto,
+            ),
             Err(message) => vec![Effect::Display(Output::Diagnostic(format!(
                 "could not prepare camera: {message}"
             )))],
@@ -292,15 +335,20 @@ impl Controller {
             ))];
         }
 
-        match (active.replaces_scene, proposed_scene) {
-            (true, Some(scene)) => {
+        match (active.scene_commit, proposed_scene) {
+            (SceneCommit::ReplaceWithWorkerPhoto, Some(scene)) => {
                 // This is the single point where a proposed photo replaces the
                 // accepted scene. Failed/cancelled photo turns never reach it.
-                self.session.scene = Some(scene);
+                self.session.photos = vec![scene];
                 self.session.history.clear();
             }
-            (false, None) => {}
-            (true, None) | (false, Some(_)) => {
+            (SceneCommit::AppendKnown(photos), None) => {
+                self.session.photos = photos;
+            }
+            (SceneCommit::Unchanged, None) => {}
+            (SceneCommit::ReplaceWithWorkerPhoto, None)
+            | (SceneCommit::AppendKnown(_), Some(_))
+            | (SceneCommit::Unchanged, Some(_)) => {
                 return vec![Effect::Display(Output::Diagnostic(
                     "worker returned an inconsistent scene result; no answer was accepted".into(),
                 ))];
@@ -546,8 +594,67 @@ mod tests {
         assert_eq!(follow_up.history[0].assistant, "a test tree");
         assert!(matches!(
             follow_up.visual,
-            VisualRequest::UseAccepted(Some(ref photo)) if photo.path() == Some(PathBuf::from("tree.png").as_path())
+            VisualRequest::UseAccepted(ref photos)
+                if photos.len() == 1
+                    && photos[0].path() == Some(PathBuf::from("tree.png").as_path())
         ));
+    }
+
+    #[test]
+    fn voice_photos_append_in_order_only_after_the_answer_is_accepted() {
+        let mut controller = Controller::new();
+        let existing = Photo::test_photo("existing.png");
+        let first = start_look(&mut controller, "existing.png", "what is this?");
+        successful_answer(
+            &mut controller,
+            first.id,
+            "an existing scene",
+            Some(existing),
+        );
+
+        let attached_first = Photo::test_photo("attached-first.png");
+        let attached_second = Photo::test_photo("attached-second.png");
+        let request = controller
+            .handle(Event::Input(Input::AskWithPhotos {
+                question: "compare these".into(),
+                photos: vec![attached_first, attached_second],
+            }))
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .expect("voice photos should start one turn");
+
+        assert_eq!(request.history.len(), 1);
+        assert!(matches!(
+            request.visual,
+            VisualRequest::UseAccepted(ref photos)
+                if photos
+                    .iter()
+                    .map(|photo| photo.path().map(|path| path.to_path_buf()))
+                    .collect::<Vec<_>>() == vec![
+                    Some(PathBuf::from("existing.png")),
+                    Some(PathBuf::from("attached-first.png")),
+                    Some(PathBuf::from("attached-second.png")),
+                ]
+        ));
+        assert_eq!(controller.accepted_photos().len(), 1);
+
+        successful_answer(&mut controller, request.id, "a comparison", None);
+        assert_eq!(controller.accepted_history().len(), 2);
+        assert_eq!(
+            controller
+                .accepted_photos()
+                .iter()
+                .map(|photo| photo.path().map(|path| path.to_path_buf()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(PathBuf::from("existing.png")),
+                Some(PathBuf::from("attached-first.png")),
+                Some(PathBuf::from("attached-second.png")),
+            ]
+        );
     }
 
     #[test]

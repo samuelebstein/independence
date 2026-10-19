@@ -55,21 +55,24 @@ Both become the same base64 image field in the existing Ollama request.
 
 ## Follow one dictation recording or spoken question
 
-Both `--dictate` and `--voice` select the raw-key listener instead of the
-normal line reader. They share the local recording/transcription path:
+Both `--dictate` and `--voice` select a raw-key listener instead of the normal
+line reader. `--dictate` retains a tap-to-start/tap-to-finish interaction.
+`--voice` uses a terminal that can report real press and release events, so it
+does not guess when Enter was released:
 
 ```text
-raw Enter key
-  -> listen::dictation sends DictationInput::Enter
+hold-to-talk Enter press
+  -> listen::dictation sends DictationInput::HoldStart
   -> DictationController allocates a RecordingId and requests capture
   -> CPAL opens the selected microphone only for that recording
   -> callback downmixes to bounded mono f32 samples
-  -> Enter (or 30 seconds) drops the stream and releases the microphone
+  -> periodic bounded snapshots run display-only local recognition
+  -> real Enter release (or 30 seconds) drops the stream and releases the microphone
   -> Rubato resamples the retained clip to 16 kHz
   -> whisper-rs runs whisper.cpp on a blocking worker
   -> worker sends TranscriptReady { recording_id, text }
   -> DictationController checks the current RecordingId
-  -> DictationSession returns AcceptedTranscript { text }
+  -> DictationSession returns AcceptedTranscript { recording_id, text }
 ```
 
 `--dictate` stops there: its terminal loop displays the transcript and never
@@ -77,11 +80,14 @@ constructs an Ollama client, an application `Controller`, or a camera service.
 A transcript that looks like `/camera`, `/quit`, or any other command remains
 displayed data.
 
-`--voice` has one narrow, explicit extra arrow:
+`--voice` keeps an unfinished draft around that final lifecycle:
 
 ```text
-accepted DictationSession transcript
-  -> VoiceRuntime constructs Input::Ask(text) directly
+P press while Enter is held
+  -> VoiceRuntime queues one in-memory V4L2 capture in press order
+  -> each completed full partial replaces, rather than appends to, draft text
+accepted final DictationSession transcript + all requested capture completions
+  -> VoiceRuntime constructs one Input::Ask(text) or Input::AskWithPhotos
   -> existing Controller assigns a new TurnId and starts the normal Ollama turn
   -> existing controller accepts the result by TurnId before raw-mode-safe output
 ```
@@ -96,16 +102,17 @@ internal cancelling states. The extra cancelling states solve a real ownership
 problem: pressing Esc must not say READY while CPAL still owns a device or
 while native recognition might still return text. Once a cancel changes the
 active phase, a completion with that ID is either used only for cleanup or
-ignored; it cannot display or submit a stale transcript. In voice mode, Enter
-at READY first stops any active model turn before it starts the next recording;
-Esc at READY stops that model turn without clearing accepted history.
+ignored; it cannot display or submit a stale transcript. In voice mode, a new
+Enter press at READY first stops any active model turn before it starts the
+next draft; Esc cancels the microphone, partial/final transcription, photo
+work, and inference without clearing accepted history.
 
 ## Why the controller owns state
 
-The model worker gets an owned snapshot of history, question, and photograph.
+The model worker gets an owned snapshot of history, question, and photographs.
 It cannot print and it cannot mutate the session. The controller stores:
 
-- the accepted `Photo`, if any;
+- ordered accepted `Photo` values, if any;
 - accepted user/assistant exchanges only; and
 - at most one active `TurnId`.
 
@@ -141,12 +148,15 @@ process exit.
 
 Dictation and voice input need individual keys rather than submitted lines, so
 they do not start the normal reader. `listen::dictation` enables Crossterm raw
-mode and owns one separate polling thread. It maps only `KeyEventKind::Press`:
-Enter, Esc, and Ctrl+C. Repeat and release events are ignored, so holding Enter
-cannot queue a second recording. Its short poll interval lets shutdown join the
-thread before the raw-mode guard restores normal terminal settings. `--voice`
-uses raw-mode-safe output for model answers too; ordinary `println!` is not
-assumed to behave correctly while raw mode is active.
+mode and owns one separate polling thread. `--dictate` maps press events only.
+`--voice` first negotiates keyboard enhancement reporting, then maps Enter
+press to `HoldStart`, Enter release to `HoldEnd`, and distinct `P` presses to
+photo requests; repeats are ignored. If the terminal cannot report event
+types, voice mode fails rather than using a release timeout. Its short poll
+interval lets shutdown join the thread before the raw-mode guard restores
+normal terminal settings. `--voice` uses raw-mode-safe output for model
+answers too; ordinary `println!` is not assumed to behave correctly while raw
+mode is active.
 
 ### Ownership snapshots and `Arc`
 
@@ -215,8 +225,8 @@ the actual device rate instead of merely relabeling samples. `whisper-rs`
 builds on whisper.cpp and performs the English CPU transcription. Our code
 chooses explicit limits, manages stream/task lifetimes, and decides whether a
 result is still current. `--dictate` displays accepted text only; `--voice`
-hands the already accepted text directly to `Input::Ask`, without interpreting
-it as an application command.
+hands the already accepted final text directly to `Input::Ask` or
+`Input::AskWithPhotos`, without interpreting it as an application command.
 
 ## Useful experiments
 
@@ -287,14 +297,13 @@ For the integrated bridge, use a running local Ollama server and launch:
 cargo run -- --voice
 ```
 
-Press Enter, ask “What is the primary gas in Earth's atmosphere?”, and press
-Enter again. The accepted transcript should appear before the text answer.
-Repeat with “Why does that matter for life?” to observe that the normal
-controller receives the accepted history. While that second answer is pending,
-press Enter to begin another recording: the old answer must become ineligible.
-Press Esc to discard this new recording. `cargo run -- --dictate` remains the
-separate transcript-only check; it should display speech but never contact
-Ollama.
+Hold Enter, ask “What is the primary gas in Earth's atmosphere?”, and release
+it. Partial log lines may appear before the final transcript and text answer.
+Repeat while pressing `P` twice before release to attach two stills in press
+order. While an answer is pending, hold Enter again: the old answer must become
+ineligible. Press Esc during a held draft, final recognition, or inference to
+discard that work. `cargo run -- --dictate` remains the separate transcript-only
+check; it should display speech but never contact Ollama.
 
 ## What tests establish—and what they cannot
 
@@ -314,9 +323,10 @@ exercise for that.
 Dictation tests use synthetic PCM for conversion/resampling and fake recorder
 and transcriber boundaries for lifecycle events. Voice-bridge tests use those
 same fakes plus a local mock Ollama server; they cover accepted versus
-cancelled/stale/empty transcripts, duplicate completions, follow-up history,
-literal slash-looking text, and old-answer invalidation when another recording
-starts. They do not prove that the physical microphone works, that
+cancelled/stale/empty transcripts, real hold/release transitions, replaceable
+partial text, ordered multi-photo submission, late photo/partial results,
+follow-up history, literal slash-looking text, and old-answer invalidation when
+another recording starts. They do not prove that the physical microphone works, that
 ALSA/PipeWire picks the desired device, that Whisper recognizes a particular
 voice, or that a real local model answers quickly. Those are the separate
 manual checks above; no model weight, microphone, Ollama server, or camera is

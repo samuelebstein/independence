@@ -106,6 +106,47 @@ pub fn emit_raw(output: Output) {
     }
 }
 
+/// Emits output for button-controlled voice mode. Product-facing text and
+/// diagnostics deliberately use distinct prefixes so terminal output can turn
+/// into speaker output later without carrying debugging chatter with it.
+pub fn emit_voice(output: Output) {
+    match output {
+        Output::Answer(answer) => voice_product(&answer),
+        Output::Diagnostic(message) => voice_log(&message),
+        Output::Cameras(cameras) => {
+            if cameras.is_empty() {
+                voice_log("no usable V4L2 cameras found");
+            } else {
+                voice_log("usable cameras:");
+                for camera in cameras {
+                    voice_log(&format!(
+                        "{}  {}  (/dev/video{})",
+                        camera.id(),
+                        camera.name(),
+                        camera.id()
+                    ));
+                }
+            }
+        }
+        Output::Help => {
+            for line in HELP.lines() {
+                voice_log(line);
+            }
+        }
+    }
+}
+
+/// Product-facing terminal text. This is the single path intended to become
+/// speaker output later; it contains no implementation diagnostics.
+pub fn voice_product(message: &str) {
+    raw_prefixed_lines("independence: ", message);
+}
+
+/// Diagnostic terminal text for button-controlled voice mode.
+pub fn voice_log(message: &str) {
+    raw_prefixed_lines("[log] ", message);
+}
+
 /// Displays the non-sensitive setup information before dictation enters READY.
 pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
     dictation_line("Independence dictation — local transcription only");
@@ -128,25 +169,25 @@ pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, mode
 
 /// Displays the setup information for integrated voice questions.
 pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
-    dictation_line("Independence voice — local transcription and local Ollama");
+    voice_product("hold down enter to start recording/transcription");
+    voice_log("local transcription and local Ollama");
     match microphone {
-        Ok(microphone) => dictation_line(&format!("Microphone: {microphone}")),
-        Err(message) => dictation_line(&format!("Microphone: unavailable ({message})")),
+        Ok(microphone) => voice_log(&format!("microphone: {microphone}")),
+        Err(message) => voice_log(&format!("microphone: unavailable ({message})")),
     }
     let availability = if model_available {
         "available"
     } else {
         "missing; recording will not start"
     };
-    dictation_line(&format!(
+    voice_log(&format!(
         "Whisper model: {} ({availability})",
         model_path.display()
     ));
-    dictation_line("Enter starts/stops recording; Esc cancels; Ctrl+C exits.");
-    dictation_line(
-        "Accepted transcripts are displayed, then sent as literal questions to local Ollama.",
+    voice_log(
+        "release enter to submit; P captures a photo while enter is held; Esc cancels; Ctrl+C exits",
     );
-    dictation_line("Spoken text such as /camera or /quit cannot execute a terminal command.");
+    voice_log("transcripts are literal question text and cannot execute terminal commands");
 }
 
 /// Emits raw-mode-safe dictation UI. Ordinary `println!` is not used here:
@@ -186,7 +227,7 @@ fn raw_prefixed_lines(prefix: &str, text: &str) {
         Some(first) => {
             dictation_line(&format!("{prefix}{first}"));
             for line in lines {
-                dictation_line(line);
+                dictation_line(&format!("{prefix}{line}"));
             }
         }
         None => dictation_line(prefix.trim_end()),

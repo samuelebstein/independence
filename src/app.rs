@@ -42,16 +42,25 @@ const MAX_QUEUED_PHOTO_CAPTURES: usize = 32;
 const MAX_DRAFT_PHOTO_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
-enum OutputMode {
+enum OutputMode<'a> {
     Line,
-    Voice,
+    Voice(&'a speak::SpeechHandle),
 }
 
-impl OutputMode {
-    fn emit(self, output: crate::protocol::Output) {
+impl OutputMode<'_> {
+    fn emit(self, output: crate::protocol::Output, speech_owner: speak::SpeechOwner) {
         match self {
             Self::Line => speak::emit(output),
-            Self::Voice => speak::emit_voice(output),
+            Self::Voice(speech) => match output {
+                crate::protocol::Output::Answer(answer) => {
+                    // The same authorized text is logged before it is sent to
+                    // the asynchronous worker. The worker cannot create or
+                    // print dialogue on its own.
+                    speak::independence_says(&answer);
+                    let _ = speech.say(speech_owner, answer);
+                }
+                output => speak::emit(output),
+            },
         }
     }
 }
@@ -93,11 +102,66 @@ pub async fn run_dictation() -> Result<(), AppError> {
 /// own microphone and Whisper lifetimes. Only an accepted transcript crosses
 /// into the main controller as literal `Input::Ask` text.
 pub async fn run_voice() -> Result<(), AppError> {
+    run_voice_with_output(None).await
+}
+
+/// Lists local audio output devices without creating a Piper worker, opening
+/// an output stream, or touching microphone/model/camera capabilities.
+pub fn list_audio_outputs() -> Result<(), AppError> {
+    speak::list_audio_outputs().map_err(AppError::AudioOutput)
+}
+
+/// Deliberately exercises exactly one local synthesis/playback request. This
+/// is separate from `--voice` so someone can verify the engine, model, and
+/// selected speakers before involving a microphone or Ollama.
+pub async fn run_speech_test(audio_output_id: Option<String>) -> Result<(), AppError> {
+    const TEST_SENTENCE: &str = "Hello, Steve. I'm here to help.";
+    const TEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+    let (event_sender, mut event_receiver) = mpsc::channel(4);
+    let mut speech = speak::SpeechService::with_output_id(audio_output_id, event_sender)
+        .map_err(AppError::Speech)?;
+    speak::independence_says(TEST_SENTENCE);
+    let Some(utterance_id) = speech
+        .handle()
+        .say(speak::SpeechOwner::System, TEST_SENTENCE)
+    else {
+        speech.shutdown();
+        return Err(AppError::SpeechTestUnavailable);
+    };
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, event_receiver.recv()).await;
+    speech.shutdown();
+    match result {
+        Ok(Some(event)) if event.utterance_id == utterance_id => match event.outcome {
+            speak::SpeechOutcome::Played => {
+                speak::process(
+                    "speech_test_completed",
+                    "local Piper synthesis and playback completed",
+                );
+                Ok(())
+            }
+            outcome => Err(AppError::SpeechTestFailed(outcome)),
+        },
+        Ok(Some(_)) => Err(AppError::SpeechTestUnexpectedEvent),
+        Ok(None) => Err(AppError::SpeechTestUnavailable),
+        Err(_) => Err(AppError::SpeechTestTimedOut),
+    }
+}
+
+/// The button-controlled voice prototype with an optional exact CPAL
+/// audio-output device identifier from the command line. `None` keeps the
+/// configured/default output selection behavior.
+pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<(), AppError> {
     let client = OllamaClient::from_environment()?;
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
         mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (voice_aux_sender, mut voice_aux_receiver) = mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
+    let (speech_event_sender, mut speech_event_receiver) =
+        mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
+    let speech = speak::SpeechService::with_output_id(audio_output_id, speech_event_sender)
+        .map_err(AppError::Speech)?;
     let mut input = listen::dictation::spawn_voice_key_reader(dictation_event_sender.clone())
         .map_err(AppError::InputAdapter)?;
 
@@ -118,6 +182,7 @@ pub async fn run_voice() -> Result<(), AppError> {
         TurnRuntime::new(client, CameraService::v4l(), main_event_sender),
         dictation,
         voice_aux_sender,
+        speech,
     );
     let mut partial_tick = tokio::time::interval(PARTIAL_TRANSCRIPTION_INTERVAL);
     partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -131,6 +196,10 @@ pub async fn run_voice() -> Result<(), AppError> {
                 Some(event) => VoiceEvent::Aux(event),
                 None => VoiceEvent::AuxChannelClosed,
             },
+            event = speech_event_receiver.recv() => match event {
+                Some(event) => VoiceEvent::Speech(event),
+                None => VoiceEvent::SpeechChannelClosed,
+            },
             _ = partial_tick.tick() => VoiceEvent::PartialTick,
         };
 
@@ -138,11 +207,13 @@ pub async fn run_voice() -> Result<(), AppError> {
             VoiceEvent::Dictation(event) => runtime.handle_dictation_event(event).await,
             VoiceEvent::Main(event) => runtime.handle_main_event(event).await,
             VoiceEvent::Aux(event) => runtime.handle_aux_event(event).await,
+            VoiceEvent::Speech(event) => runtime.handle_speech_event(event).await,
             VoiceEvent::PartialTick => {
                 runtime.request_partial_snapshot();
                 true
             }
             VoiceEvent::AuxChannelClosed => true,
+            VoiceEvent::SpeechChannelClosed => true,
         };
         if !keep_running {
             break;
@@ -161,8 +232,10 @@ enum VoiceEvent {
     Dictation(DictationEvent),
     Main(Event),
     Aux(VoiceAuxEvent),
+    Speech(speak::SpeechEvent),
     PartialTick,
     AuxChannelClosed,
+    SpeechChannelClosed,
 }
 
 /// Applies facts at the main controller boundary for both line-input and voice
@@ -172,14 +245,18 @@ async fn apply_main_event(
     controller: &mut Controller,
     runtime: &mut TurnRuntime,
     event: Event,
-    output_mode: OutputMode,
+    output_mode: OutputMode<'_>,
 ) -> bool {
+    let speech_owner = match &event {
+        Event::TurnFinished(finished) => speak::SpeechOwner::Turn(finished.id),
+        _ => speak::SpeechOwner::System,
+    };
     if let Event::TurnFinished(finished) = &event {
         runtime.retire(finished.id).await;
     }
 
     for effect in controller.handle(event) {
-        if !runtime.apply(effect, output_mode).await {
+        if !runtime.apply(effect, output_mode, speech_owner).await {
             return false;
         }
     }
@@ -209,13 +286,18 @@ impl TurnRuntime {
         }
     }
 
-    async fn apply(&mut self, effect: Effect, output_mode: OutputMode) -> bool {
+    async fn apply(
+        &mut self,
+        effect: Effect,
+        output_mode: OutputMode<'_>,
+        speech_owner: speak::SpeechOwner,
+    ) -> bool {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
-            Effect::Display(output) => output_mode.emit(output),
+            Effect::Display(output) => output_mode.emit(output, speech_owner),
             Effect::Exit => {
                 self.shutdown().await;
                 return false;
@@ -348,7 +430,12 @@ struct VoiceRuntime {
     turns: TurnRuntime,
     dictation: DictationSession,
     aux_sender: mpsc::Sender<VoiceAuxEvent>,
+    speech: speak::SpeechService,
     draft: Option<VoiceDraft>,
+    /// Capture starts only after this exact listening cue completed or failed.
+    /// A release/Escape clears it first, so a late speech event cannot activate
+    /// the microphone after the user changed their mind.
+    pending_listening_cue: Option<PendingListeningCue>,
     /// At most one camera request is dispatched at a time, in `P` press
     /// order. The camera service has its own hardware gate too; this queue
     /// preserves user-visible attachment order before work reaches that gate.
@@ -374,6 +461,12 @@ struct VoiceDraft {
     last_partial_error: Option<String>,
     final_transcript: Option<String>,
     submitted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingListeningCue {
+    draft_id: u64,
+    utterance_id: speak::UtteranceId,
 }
 
 impl VoiceDraft {
@@ -454,13 +547,16 @@ impl VoiceRuntime {
         turns: TurnRuntime,
         dictation: DictationSession,
         aux_sender: mpsc::Sender<VoiceAuxEvent>,
+        speech: speak::SpeechService,
     ) -> Self {
         Self {
             controller,
             turns,
             dictation,
             aux_sender,
+            speech,
             draft: None,
+            pending_listening_cue: None,
             active_photo_capture: None,
             live_transcription: None,
             pending_snapshot: None,
@@ -470,11 +566,12 @@ impl VoiceRuntime {
     }
 
     async fn handle_main_event(&mut self, event: Event) -> bool {
+        let speech = self.speech.handle();
         apply_main_event(
             &mut self.controller,
             &mut self.turns,
             event,
-            OutputMode::Voice,
+            OutputMode::Voice(&speech),
         )
         .await
     }
@@ -507,18 +604,16 @@ impl VoiceRuntime {
                 unreachable!("unavailable snapshots return before dictation handling")
             }
             DictationEvent::Input(DictationInput::HoldStart) => {
-                if !self.begin_draft().await {
-                    return false;
-                }
+                // Capture is deliberately delayed until the listening cue has
+                // played. The cue completion comes back as `SpeechEvent`.
+                return self.begin_draft().await;
             }
             // `Enter` is not emitted by the hold-to-talk adapter. Retaining
             // this narrow fallback keeps programmatic callers and the old
             // dictation test seam usable without altering real key handling.
             DictationEvent::Input(DictationInput::Enter) => {
                 if self.dictation.is_ready() {
-                    if !self.begin_draft().await {
-                        return false;
-                    }
+                    return self.begin_draft().await;
                 } else {
                     self.release_draft();
                 }
@@ -527,6 +622,7 @@ impl VoiceRuntime {
             DictationEvent::Input(DictationInput::Photo) => self.request_photo().await,
             DictationEvent::Input(DictationInput::Escape) => {
                 self.cancel_draft();
+                self.speech.handle().cancel_all("escape");
                 if !self.handle_main_event(Event::Input(Input::Stop)).await {
                     return false;
                 }
@@ -534,12 +630,17 @@ impl VoiceRuntime {
             }
             DictationEvent::Input(DictationInput::Interrupt | DictationInput::EndOfInput) => {
                 self.cancel_draft();
+                self.speech.handle().cancel_all("input_ended");
             }
             DictationEvent::RecordingStarted { recording_id } => {
                 if let Some(draft) = self.draft.as_mut()
                     && draft.recording_id == Some(*recording_id)
                 {
                     draft.recording_started = true;
+                    speak::process(
+                        "microphone_capture_started",
+                        format!("draft_id={} recording_id={recording_id:?}", draft.id),
+                    );
                 }
             }
             DictationEvent::RecordingCancelled { recording_id }
@@ -548,12 +649,14 @@ impl VoiceRuntime {
             | DictationEvent::TranscriptionFailed { recording_id, .. } => {
                 if self.draft_matches_recording(*recording_id) {
                     self.cancel_draft();
+                    self.speech.handle().cancel_all("dictation_failed");
                 }
             }
             DictationEvent::TranscriptReady { recording_id, text }
                 if text.trim().is_empty() && self.draft_matches_recording(*recording_id) =>
             {
                 self.cancel_draft();
+                self.speech.handle().cancel_all("empty_transcript");
             }
             DictationEvent::RecordingLimitReached { recording_id }
                 if self.draft_matches_recording(*recording_id) =>
@@ -597,7 +700,7 @@ impl VoiceRuntime {
                     return true;
                 }
 
-                speak::voice_log(&format!("final transcript: {text}"));
+                speak::user_transcript("final", &text);
                 if let Some(draft) = self.draft.as_mut() {
                     draft.final_transcript = Some(text);
                 }
@@ -605,6 +708,7 @@ impl VoiceRuntime {
             }
             DictationAction::Exit => {
                 self.cancel_draft();
+                self.speech.handle().cancel_all("dictation_exit");
                 // Dictation shutdown owns microphone/recognizer cleanup; the
                 // main controller owns its model turn through its ordinary
                 // generation-safe exit path.
@@ -616,7 +720,7 @@ impl VoiceRuntime {
         true
     }
 
-    fn display_dictation_log(&self, output: DictationOutput) {
+    fn display_dictation_log(&mut self, output: DictationOutput) {
         match output {
             DictationOutput::Ready => {
                 speak::voice_log("ready — hold enter to start recording/transcription")
@@ -625,7 +729,15 @@ impl VoiceRuntime {
             DictationOutput::Discarding => {
                 speak::voice_log("discarding recording and releasing microphone")
             }
-            DictationOutput::Transcribing => speak::voice_log("finishing local transcription"),
+            DictationOutput::Transcribing => {
+                // Dictation emits this only after the CPAL recording owner has
+                // produced `RecordingFinished`, which means its stream is
+                // already released. Speaking now avoids recording our cue.
+                speak::voice_log("microphone released; finishing local transcription");
+                if let Some(draft) = self.draft.as_ref() {
+                    let _ = self.say(speak::SpeechOwner::Draft(draft.id), "i'm thinking");
+                }
+            }
             // `AcceptedTranscript` below provides the exact, one-time final
             // transcript log. Avoid printing it once here and once there.
             DictationOutput::Transcript(_) => {}
@@ -641,6 +753,7 @@ impl VoiceRuntime {
         // A new press starts a fresh draft. Any already accepted context
         // remains in `controller`; only unfinished audio/photos are dropped.
         self.cancel_draft();
+        self.speech.handle().cancel_all("new_recording");
         if !self.handle_main_event(Event::Input(Input::Stop)).await {
             return false;
         }
@@ -651,11 +764,120 @@ impl VoiceRuntime {
             .checked_add(1)
             .expect("voice draft identifiers exhausted");
         self.draft = Some(VoiceDraft::new(id));
-        speak::voice_product("i'm listening");
+
+        match self.say(speak::SpeechOwner::Draft(id), "i'm listening") {
+            Some(utterance_id) => {
+                self.pending_listening_cue = Some(PendingListeningCue {
+                    draft_id: id,
+                    utterance_id,
+                });
+            }
+            None => {
+                // Queue failure is explicit and privacy-safe. There will be
+                // no later cue event, so capture may start without a cue.
+                speak::warning(
+                    "listening_cue_unavailable",
+                    "starting microphone capture without the listening cue",
+                );
+                return self.start_capture_after_cue(id).await;
+            }
+        }
+        true
+    }
+
+    /// Logs and queues an already-authorized spoken utterance. The controller
+    /// remains the only source of model answers; this helper is used only for
+    /// fixed interaction cues owned by this runtime.
+    fn say(&self, owner: speak::SpeechOwner, text: &'static str) -> Option<speak::UtteranceId> {
+        speak::independence_says(text);
+        self.speech.handle().say(owner, text)
+    }
+
+    /// Handles a worker fact, rather than allowing the speech worker to
+    /// manipulate microphone state directly. Only the exact listening cue for
+    /// the currently-held draft may open capture.
+    async fn handle_speech_event(&mut self, event: speak::SpeechEvent) -> bool {
+        let Some(pending) = self.pending_listening_cue else {
+            return true;
+        };
+        if pending.utterance_id != event.utterance_id
+            || pending.draft_id
+                != match event.owner {
+                    speak::SpeechOwner::Draft(draft_id) => draft_id,
+                    speak::SpeechOwner::Turn(_) | speak::SpeechOwner::System => return true,
+                }
+        {
+            return true;
+        }
+
+        // Clear before any await. A release or Escape that races with this
+        // event therefore cannot leave a second path able to open capture.
+        self.pending_listening_cue = None;
+        match event.outcome {
+            speak::SpeechOutcome::Played => {
+                speak::process("listening_cue_completed", "opening microphone capture");
+                self.start_capture_after_cue(pending.draft_id).await
+            }
+            speak::SpeechOutcome::SynthesisFailed | speak::SpeechOutcome::PlaybackFailed => {
+                // Spoken output is optional: a missing Piper install or output
+                // device does not make the established voice input unusable.
+                speak::warning(
+                    "listening_cue_failed",
+                    "starting microphone capture without the listening cue",
+                );
+                self.start_capture_after_cue(pending.draft_id).await
+            }
+            speak::SpeechOutcome::Cancelled => {
+                // Cancellation is intentional (new press, release, Escape,
+                // or shutdown). It must never open the microphone later.
+                speak::process(
+                    "listening_cue_cancelled",
+                    "microphone capture was not started",
+                );
+                true
+            }
+        }
+    }
+
+    /// Starts the pre-existing DictationSession only after the cue boundary.
+    /// This explicitly reuses its recording-ID lifecycle instead of inventing
+    /// another microphone owner for speech output.
+    async fn start_capture_after_cue(&mut self, draft_id: u64) -> bool {
+        let current = self.draft.as_ref().is_some_and(|draft| {
+            draft.id == draft_id
+                && draft.held
+                && !draft.released
+                && !draft.cancellation.is_cancelled()
+                && draft.recording_id.is_none()
+        });
+        if !current {
+            return true;
+        }
+
+        for action in self
+            .dictation
+            .handle(DictationEvent::Input(DictationInput::HoldStart))
+            .await
+        {
+            if !self.handle_dictation_action(action).await {
+                return false;
+            }
+        }
         true
     }
 
     fn release_draft(&mut self) {
+        if self.pending_listening_cue.take().is_some() {
+            // The person released during the cue. There is no recording to
+            // finish, and the late completion must not open a microphone.
+            self.cancel_draft();
+            self.speech
+                .handle()
+                .cancel_all("enter_released_during_listening_cue");
+            speak::voice_log("Enter released during listening cue; no microphone capture started");
+            return;
+        }
+
         let should_announce = if let Some(draft) = self.draft.as_mut() {
             if draft.held && !draft.released {
                 draft.held = false;
@@ -671,7 +893,9 @@ impl VoiceRuntime {
 
         if should_announce {
             self.cancel_live_transcription();
-            speak::voice_product("i'm thinking");
+            // The thinking cue is deliberately delayed until DictationOutput::
+            // Transcribing, after the microphone has actually been released.
+            speak::voice_log("recording released; waiting for microphone cleanup");
         }
     }
 
@@ -680,7 +904,14 @@ impl VoiceRuntime {
             let Some(draft) = self.draft.as_mut() else {
                 return;
             };
-            if !draft.held || draft.released || draft.cancellation.is_cancelled() {
+            // `P` is meaningful only while actual capture is open. In
+            // particular, it cannot activate a camera while the listening cue
+            // is still playing before microphone capture begins.
+            if !draft.held
+                || !draft.recording_started
+                || draft.released
+                || draft.cancellation.is_cancelled()
+            {
                 return;
             }
             if draft.pending_photo_count() >= MAX_QUEUED_PHOTO_CAPTURES {
@@ -876,7 +1107,8 @@ impl VoiceRuntime {
         }
         drop(live.handle);
 
-        let mut message = None;
+        let mut partial = None;
+        let mut failure = None;
         if let Some(draft) = self.draft.as_mut()
             && draft.recording_id == Some(recording_id)
             && draft.held
@@ -887,18 +1119,21 @@ impl VoiceRuntime {
                 Ok(text) if draft.last_partial.as_deref() != Some(text.as_str()) => {
                     draft.last_partial = Some(text.clone());
                     draft.last_partial_error = None;
-                    message = Some(format!("transcript: {text}"));
+                    partial = Some(text);
                 }
                 Ok(_) => {}
                 Err(error) if draft.last_partial_error.as_deref() != Some(error.as_str()) => {
                     draft.last_partial_error = Some(error.clone());
-                    message = Some(format!("partial transcription failed — {error}"));
+                    failure = Some(error);
                 }
                 Err(_) => {}
             }
         }
-        if let Some(message) = message {
-            speak::voice_log(&message);
+        if let Some(text) = partial {
+            speak::user_transcript("partial", &text);
+        }
+        if let Some(error) = failure {
+            speak::warning("partial_transcription_failed", error);
         }
 
         if let Some((pending_id, audio)) = self.pending_snapshot.take() {
@@ -989,7 +1224,7 @@ impl VoiceRuntime {
             return true;
         };
 
-        speak::voice_log(&format!("sending {} photos", photos.len()));
+        speak::voice_submission(&transcript, photos.len());
         let input = if photos.is_empty() {
             Input::Ask(transcript)
         } else {
@@ -1018,6 +1253,7 @@ impl VoiceRuntime {
 
     fn cancel_draft(&mut self) {
         self.cancel_live_transcription();
+        self.pending_listening_cue = None;
         self.active_photo_capture = None;
         if let Some(draft) = self.draft.take() {
             draft.cancellation.cancel();
@@ -1025,9 +1261,11 @@ impl VoiceRuntime {
     }
 
     async fn shutdown(&mut self) {
+        self.speech.handle().cancel_all("voice_shutdown");
         self.cancel_draft();
         self.dictation.shutdown().await;
         self.turns.shutdown().await;
+        self.speech.shutdown();
     }
 }
 
@@ -1171,6 +1409,24 @@ pub enum AppError {
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
 
+    #[error("could not start the local speech worker: {0}")]
+    Speech(#[source] io::Error),
+
+    #[error("could not inspect local audio output devices: {0}")]
+    AudioOutput(#[source] speak::playback::PlaybackError),
+
+    #[error("the local speech worker could not queue the test sentence")]
+    SpeechTestUnavailable,
+
+    #[error("the local speech test timed out before playback completed")]
+    SpeechTestTimedOut,
+
+    #[error("the local speech test received an unexpected worker completion")]
+    SpeechTestUnexpectedEvent,
+
+    #[error("the local speech test did not complete successfully: {0:?}")]
+    SpeechTestFailed(speak::SpeechOutcome),
+
     #[error("could not run local dictation: {0}")]
     Dictation(#[from] dictation::DictationError),
 }
@@ -1224,6 +1480,7 @@ mod tests {
     };
 
     use super::{TurnRuntime, VoiceRuntime, run_turn};
+    use crate::speak::{SpeechEvent, SpeechOutcome, SpeechOwner, SpeechService};
 
     fn client(server: &MockServer) -> Arc<OllamaClient> {
         Arc::new(
@@ -1438,6 +1695,19 @@ mod tests {
                     .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
                     .await
             );
+            let cue = self
+                .runtime
+                .pending_listening_cue
+                .expect("holding Enter should queue a listening cue");
+            assert!(
+                self.runtime
+                    .handle_speech_event(SpeechEvent {
+                        utterance_id: cue.utterance_id,
+                        owner: SpeechOwner::Draft(cue.draft_id),
+                        outcome: SpeechOutcome::Played,
+                    })
+                    .await
+            );
             let recording_id = match self.next_dictation_event().await {
                 DictationEvent::RecordingStarted { recording_id } => recording_id,
                 event => panic!("expected synthetic recording start, got {event:?}"),
@@ -1479,44 +1749,8 @@ mod tests {
         }
 
         async fn submit_next_transcript(&mut self) -> (RecordingId, String) {
-            assert!(
-                self.runtime
-                    .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
-                    .await
-            );
-            let recording_id = match self.next_dictation_event().await {
-                DictationEvent::RecordingStarted { recording_id } => recording_id,
-                event => panic!("expected synthetic recording start, got {event:?}"),
-            };
-            assert!(
-                self.runtime
-                    .handle_dictation_event(DictationEvent::RecordingStarted { recording_id })
-                    .await
-            );
-            assert!(
-                self.runtime
-                    .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
-                    .await
-            );
-            let finished = self.next_dictation_event().await;
-            assert!(matches!(
-                &finished,
-                DictationEvent::RecordingFinished {
-                    recording_id: finished_id,
-                    ..
-                } if *finished_id == recording_id
-            ));
-            assert!(self.runtime.handle_dictation_event(finished).await);
-
-            let transcript = self.next_dictation_event().await;
-            let text = match &transcript {
-                DictationEvent::TranscriptReady {
-                    recording_id: transcript_id,
-                    text,
-                } if *transcript_id == recording_id => text.clone(),
-                event => panic!("expected synthetic transcript, got {event:?}"),
-            };
-            assert!(self.runtime.handle_dictation_event(transcript).await);
+            let recording_id = self.start_hold().await;
+            let text = self.release_hold(recording_id).await;
             (recording_id, text)
         }
 
@@ -1553,6 +1787,7 @@ mod tests {
                 TurnRuntime::new(client, camera, main_sender),
                 dictation,
                 aux_sender,
+                SpeechService::test_stub(),
             ),
             dictation_events,
             main_events,
@@ -1944,6 +2179,15 @@ mod tests {
                 .await
         );
         assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+        assert!(
+            harness
+                .runtime
+                .draft
+                .as_ref()
+                .and_then(|draft| draft.final_transcript.as_ref())
+                .is_none()
+        );
+        assert!(harness.runtime.controller.accepted_history().is_empty());
 
         for _ in 0..2 {
             harness.runtime.request_partial_snapshot();
@@ -1984,6 +2228,163 @@ mod tests {
         assert_eq!(harness.recorder.finishes.load(Ordering::SeqCst), 1);
         assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 3);
         assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn microphone_stays_closed_until_the_listening_cue_completes() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        let cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("hold should queue a listening cue");
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
+        assert!(harness.dictation_events.try_recv().is_err());
+
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: cue.utterance_id,
+                    owner: SpeechOwner::Draft(cue.draft_id),
+                    outcome: SpeechOutcome::Played,
+                })
+                .await
+        );
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn release_or_escape_during_listening_cue_cannot_open_a_late_microphone() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        let released_cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("hold should queue a listening cue");
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: released_cue.utterance_id,
+                    owner: SpeechOwner::Draft(released_cue.draft_id),
+                    outcome: SpeechOutcome::Played,
+                })
+                .await
+        );
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        let escaped_cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("second hold should queue a listening cue");
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: escaped_cue.utterance_id,
+                    owner: SpeechOwner::Draft(escaped_cue.draft_id),
+                    outcome: SpeechOutcome::Played,
+                })
+                .await
+        );
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
+        assert!(harness.runtime.draft.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_listening_cue_leaves_voice_input_usable_without_speaking() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        let cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("hold should queue a listening cue");
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: cue.utterance_id,
+                    owner: SpeechOwner::Draft(cue.draft_id),
+                    outcome: SpeechOutcome::PlaybackFailed,
+                })
+                .await
+        );
+
+        assert!(matches!(
+            harness.next_dictation_event().await,
+            DictationEvent::RecordingStarted { .. }
+        ));
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn p_during_the_listening_cue_does_not_activate_a_camera() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: false,
+            captures: captures.clone(),
+        }));
+        let mut harness = voice_harness(&server, ["unused".to_owned()], camera_service);
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .await
+        );
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(captures.load(Ordering::SeqCst), 0);
+        assert!(harness.runtime.active_photo_capture.is_none());
     }
 
     #[tokio::test]
@@ -2327,24 +2728,7 @@ mod tests {
         let server = MockServer::start().await;
         let mut harness = voice_harness(&server, [String::new()], unused_camera_service());
 
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
-                .await
-        );
-        let cancelled_id = match harness.next_dictation_event().await {
-            DictationEvent::RecordingStarted { recording_id } => recording_id,
-            event => panic!("expected synthetic recording start, got {event:?}"),
-        };
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::RecordingStarted {
-                    recording_id: cancelled_id,
-                })
-                .await
-        );
+        let cancelled_id = harness.start_hold().await;
         assert!(
             harness
                 .runtime
@@ -2369,29 +2753,12 @@ mod tests {
 
         // Put a new recording into TRANSCRIBING, then deliver a completion
         // from the old recording before the new recognizer's empty result.
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
-                .await
-        );
-        let current_id = match harness.next_dictation_event().await {
-            DictationEvent::RecordingStarted { recording_id } => recording_id,
-            event => panic!("expected synthetic recording start, got {event:?}"),
-        };
+        let current_id = harness.start_hold().await;
         assert_ne!(current_id, cancelled_id);
         assert!(
             harness
                 .runtime
-                .handle_dictation_event(DictationEvent::RecordingStarted {
-                    recording_id: current_id,
-                })
-                .await
-        );
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
                 .await
         );
         let finished = harness.next_dictation_event().await;
@@ -2438,14 +2805,9 @@ mod tests {
         harness.submit_next_transcript().await;
         assert!(harness.runtime.controller.has_active_turn());
 
-        // READY Enter cancels the old model turn before it opens the next
+        // A new Enter hold cancels the old model turn before it opens the next
         // recording. A controlled late completion cannot restore history.
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::Enter))
-                .await
-        );
+        let _next_recording = harness.start_hold().await;
         assert!(!harness.runtime.controller.has_active_turn());
         assert!(
             harness

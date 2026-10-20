@@ -13,7 +13,10 @@ It can:
   `see` input;
 - retain successfully accepted photographs, in attachment order, and
   conversation for follow-up questions as `see` context; and
-- print an accepted answer as `speak`.
+- emit timestamped terminal logs for accepted dialogue and process state as
+  `speak`; and
+- in button-controlled `--voice` mode, optionally synthesize that same
+  authorized dialogue locally and play it through a selected output device.
 
 It also has two explicit local microphone modes:
 
@@ -22,11 +25,12 @@ It also has two explicit local microphone modes:
 - `--voice` uses a real Enter press/release hold-to-talk flow, shows
   replaceable local partial transcripts, can attach still photos with `P`, and
   sends one literal question plus its ordered photos to the existing local
-  Ollama/controller path. Spoken `/camera` and `/quit` text is never parsed as
-  a terminal command.
+  Ollama/controller path. When local Piper and a voice model are configured,
+  it also speaks authorized cues and accepted answers. Spoken `/camera` and
+  `/quit` text is never parsed as a terminal command.
 
-The default observation mode (`cargo run`) does not access a microphone. No
-current mode persists a conversation, streams tokens, calls tools
+The default observation mode (`cargo run`) does not access a microphone or
+speaker. No current mode persists a conversation, streams tokens, calls tools
 autonomously, or uses a cloud model.
 
 ## Start here
@@ -123,6 +127,100 @@ Ollama. The default path is exactly `local-data/whisper/ggml-base.en.bin`.
 To keep a model elsewhere, set `INDEPENDENCE_WHISPER_MODEL` only for the launch
 command. The application does not download model weights automatically.
 
+### Local HAL speech output setup
+
+Speech output is a separate, entirely local capability. Independence invokes
+the established [Piper command-line engine](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/CLI.md)
+without a shell, receives one in-memory WAV result, and uses Rodio/CPAL to play
+it. It does not send dialogue text to a cloud speech service.
+
+The initial voice is the [`campwill/HAL-9000-Piper-TTS` model](https://huggingface.co/campwill/HAL-9000-Piper-TTS).
+The model repository declares **Apache-2.0**. The independently installed
+Piper engine (`piper-tts` 1.8.0) is **GPL-3.0-or-later**; review both upstream
+licenses before redistributing either component. Neither engine nor model is
+vendored into this Rust package.
+
+On a Linux Mint installation without `pip`, first run this in your own
+terminal from any directory:
+
+```bash
+sudo apt-get install python3-pip
+```
+
+It asks APT to install a system-wide Python packaging tool, needs your sudo
+password, and may use the network. Independence never runs it. Then, from any
+directory, install the Piper CLI into your user Python environment:
+
+```bash
+python3 -m pip install --user 'piper-tts==1.8.0'
+```
+
+On current Linux Mint releases, the distro Python may reject that command with
+an `externally-managed-environment` (PEP 668) error. The clean alternative is
+to install `python3-venv` with APT and put Piper in a dedicated virtual
+environment. If you deliberately want the smaller user-only setup used for
+this prototype, this explicit form still writes only under `~/.local` and does
+not replace APT-managed packages:
+
+```bash
+python3 -m pip install --user --break-system-packages 'piper-tts==1.8.0'
+```
+
+Both forms use the network and change only your user-level Python package
+area. If the resulting `piper` command is not on `PATH`, set
+`INDEPENDENCE_PIPER_COMMAND` to its full executable path for a launch.
+
+From this repository root, download the explicit HAL model pair into the
+ignored `local-data/` directory:
+
+```bash
+mkdir -p local-data/piper/hal
+curl -fL -o local-data/piper/hal/hal.onnx \
+  https://huggingface.co/campwill/HAL-9000-Piper-TTS/resolve/main/hal.onnx
+curl -fL -o local-data/piper/hal/hal.onnx.json \
+  https://huggingface.co/campwill/HAL-9000-Piper-TTS/resolve/main/hal.onnx.json
+```
+
+These commands use the network and write about one voice model plus its small
+configuration file under `local-data/`; they do not modify source code, start
+Ollama, or save conversations. The defaults are exactly
+`local-data/piper/hal/hal.onnx` and `local-data/piper/hal/hal.onnx.json`.
+Override them for one launch with `INDEPENDENCE_TTS_MODEL` and
+`INDEPENDENCE_TTS_CONFIG`.
+
+Before using a microphone, list output devices without opening a playback
+stream:
+
+```bash
+cargo run -- --audio-devices
+```
+
+Then deliberately synthesize and play the fixed sentence “Hello, Steve. I'm
+here to help.” through the current system-default output:
+
+```bash
+cargo run -- --speak-test
+```
+
+To select a headset or other device, copy its exact logged `id` (rather than a
+possibly duplicated human-readable label) into either command below:
+
+```bash
+cargo run -- --speak-test --audio-output 'Exact output device id'
+cargo run -- --voice --audio-output 'Exact output device id'
+```
+
+Alternatively, `INDEPENDENCE_AUDIO_OUTPUT='Exact output device id'` selects
+that device for a `--voice` launch. With no override, Rodio opens the current
+system-default output device and logs its actual name. If Piper, its files, or
+an output device is unavailable, Independence logs the exact local failure and
+continues with terminal text; it never falls back to cloud speech.
+
+The Piper CLI loads its ONNX voice for each uncached utterance. This focused
+prototype caches the generated WAVs for `i'm listening` and `i'm thinking`,
+but intentionally does not add a long-running Piper server yet. That keeps the
+first local speech integration small and makes its process lifecycle explicit.
+
 ### Launch and controls
 
 From the repository root, after the model file exists, start transcript-only
@@ -171,28 +269,40 @@ than guessing Enter release with a timeout.
 
 | `--voice` state | Control | Result |
 | --- | --- | --- |
-| READY | Hold Enter | Immediately prints `independence: i'm listening`, opens the microphone, and begins bounded capture. A repeated key-down is ignored. |
-| While Enter is held | `P` | Queues one immediate camera capture. Capture keeps the microphone running; successful stills remain only in memory and log their attachment count. |
-| While Enter is held | Release Enter | Immediately prints `independence: i'm thinking`, releases the microphone, finishes final local transcription and already requested captures, then makes one model request. |
+| READY | Hold Enter | Logs and queues `i'm listening`. Keep Enter held and begin speaking only after the cue completes; then the microphone opens and bounded capture begins. If speech output fails, the microphone opens with a clear warning instead. A repeated key-down is ignored. |
+| While capture is active and Enter is held | `P` | Queues one immediate camera capture. Capture keeps the microphone running; successful stills remain only in memory and log their attachment count. `P` during the listening cue does nothing. |
+| While Enter is held after capture began | Release Enter | Stops/releases the microphone. Only after that release is confirmed does Independence log and queue `i'm thinking`, then finish local transcription and already requested captures before making one model request. |
 | While Enter is held | 30 seconds | Automatically finishes bounded capture; release is no longer needed. |
-| Any unfinished voice work | Esc | Cancels recording, local recognition, queued/active photo capture, and model inference; late work cannot submit or print. Accepted context remains. |
+| Any unfinished voice work | Esc | Cancels recording, local recognition, queued/active photo capture, model inference, pending synthesis, and active playback. Late work cannot submit, print, or play. Accepted context remains. |
 | Any state | Ctrl+C | Cancels owned work, restores the terminal, and exits. |
 
-Repeated Enter presses outside READY are ignored. The raw-key reader is the
+Repeated Enter presses outside READY are ignored. A new Enter press cancels
+any old answer/speech before it starts a fresh draft. The raw-key reader is the
 only terminal input owner in either microphone mode; the normal line reader is
-not running. The microphone stream is opened only after Enter and is dropped
-before resampling or Whisper inference begins. Audio lives only in bounded
-memory and is discarded after transcription or cancellation; Independence
-writes no recordings to disk.
+not running. In `--voice`, the microphone stream is intentionally opened only
+after the listening cue finishes; releasing Enter or pressing Esc during that
+cue cancels it and never opens capture later. The stream is dropped before
+resampling or Whisper inference begins. Audio lives only in bounded memory and
+is discarded after transcription or cancellation; Independence writes no
+recordings to disk.
 
 In `--voice`, Whisper has no command authority. While held, each complete
-partial replaces the prior partial in memory and appears as `[log] transcript:
-...`; it does not submit a turn. After `DictationController` accepts the final
-current `RecordingId`, the runtime logs the exact final transcript, waits for
-every requested photo, then constructs one `Input::Ask` or
+partial replaces the prior partial in memory and appears as a timestamped
+`INFO dialogue` log with `transcript="partial"`; it does not submit a turn.
+After `DictationController` accepts the final current `RecordingId`, the
+runtime logs the exact final transcript, waits for every requested photo, then constructs one `Input::Ask` or
 `Input::AskWithPhotos` directly. The main controller then gives its model turn
 a separate `TurnId`. A cancelled/stale recording, photo result, or model result
 cannot bypass those ownership checks.
+
+All application terminal output is emitted as timestamped `tracing` logs on
+stdout. Dialogue has `target=dialogue`, a `role`, and quoted text; worker state
+has `target=process` or `target=speech`. Final recognized speech is logged as
+`transcript="final"`, provisional snapshots as `"partial"`, and a submitted
+voice question as `"submitted"`. Raw audio samples and image payload bytes are
+never logged. Logging an answer means it was authorized; separate speech logs
+show whether synthesis and playback actually started, completed, were
+cancelled, or failed.
 
 Pressing `P` chooses the only currently usable V4L2 camera, matching the
 existing no-guess policy. If none or more than one camera is available, the
@@ -215,8 +325,9 @@ Try this manual sequence:
 For `--voice`, try this separate sequence:
 
 1. Start `cargo run -- --voice`, hold Enter, ask “What is the primary gas in
-   Earth’s atmosphere?”, then release Enter. Partial `[log] transcript:` lines
-   may appear while held; the final transcript and one model answer follow.
+   Earth’s atmosphere?”, then release Enter. Wait for the `i'm listening` cue
+   before talking. Timestamped partial-transcript logs may appear while held;
+   the final transcript, `i'm thinking` cue, and one model answer follow.
 2. Hold Enter again, press `P` twice, describe what you want compared, then
    release Enter. Two `photo captured` logs should precede one request with two
    in-memory images in press order.
@@ -224,12 +335,12 @@ For `--voice`, try this separate sequence:
    while a model answer is pending. None of those unfinished results should
    print or alter the previously accepted conversation.
 
-Current limits: English `base.en` recognition runs on CPU; no device list UI,
-voice activity detection, saved audio, microphone permissions workflow,
-text-to-speech, decision-model routing, photo permission loop, autonomous
-camera decision, or spoken reply exists. Voice questions cannot use typed
-`/look` or `/camera` commands; keep using the default keyboard mode for those.
-Whisper cancellation is cooperative: Esc prevents a result from being
+Current limits: English `base.en` recognition runs on CPU; there is no input
+device list UI, voice activity detection, saved audio, microphone permissions
+workflow, decision-model routing, photo permission loop, autonomous camera
+decision, TTS streaming, or echo cancellation. Voice questions cannot use
+typed `/look` or `/camera` commands; keep using the default keyboard mode for
+those. Whisper cancellation is cooperative: Esc prevents a result from being
 accepted, while the native recognizer exits at its next supported abort
 callback point.
 
@@ -421,7 +532,11 @@ src/
   see/           bounded, validated file-photo and camera-image handling
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
   think/         Ollama /api/chat client and teacher prompt
-  speak/         terminal answers, diagnostics, and help
+  speak/
+    mod.rs        timestamped terminal logger and dialogue boundary
+    tts.rs        local Piper CLI adapter; text in, in-memory WAV out
+    playback.rs   Rodio output-device discovery and WAV playback
+    worker.rs     one ordered, bounded synthesis/playback worker
 ```
 
 The controller holds the only accepted scene and conversation. Each model turn
@@ -438,9 +553,10 @@ application code.
 ## Current limits
 
 - Default observation mode uses keyboard input only. `--dictate` is
-  transcript-only; `--voice` can submit one accepted spoken question at a time,
-  but neither has wake words, text-to-speech, decision routing, or camera
-  permission handling.
+  transcript-only; `--voice` can submit one accepted spoken question at a time
+  and has local complete-utterance speech output when Piper is installed, but
+  it has no wake words, decision routing, camera permission handling, TTS
+  streaming, or echo cancellation.
 - One explicit JPEG/PNG or one explicit camera still at a time; no live view,
   continuous vision, background capture, or autonomous camera use.
 - Camera support is Linux V4L2 single-plane MJPEG/YUYV only; unusual drivers or
@@ -463,7 +579,7 @@ application code.
 
 This is a map of what exists **now**. It shows three ways into the same local
 learning system: typed questions, transcript-only dictation, and integrated
-voice questions.
+button-controlled voice questions with optional local Piper/HAL playback.
 
 ```text
                          cargo run
@@ -502,7 +618,7 @@ flowchart TD
 | --- | --- | --- |
 | `cargo run` | Typed questions, `/look`, `/camera`, accepted photo follow-ups | Use microphone input |
 | `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
-| `cargo run -- --voice` | Record → local Whisper → display transcript → local Ollama text answer | Parse spoken commands or autonomously use a camera |
+| `cargo run -- --voice` | cue → hold-to-record → local Whisper → local Ollama → timestamped answer log → optional local Piper/HAL playback | Parse spoken commands, autonomously use a camera, or perform echo cancellation |
 
 ### Typed question path
 
@@ -611,7 +727,8 @@ small coordinator for one unfinished hold-to-talk draft:
 
 ```mermaid
 flowchart TD
-    A["Enter press / release / P"] --> D["VoiceRuntime in app.rs\nunfinished draft"]
+    A["Enter press / release / P"] --> Q["SpeechService queue\n'i'm listening'"]
+    Q --> D["VoiceRuntime in app.rs\nopens capture only after cue completion"]
     D --> B["DictationController\nvalidates RecordingId"]
     B --> C["DictationSession\nAcceptedTranscript { recording_id, text }"]
     D --> P["ordered in-memory photo captures"]
@@ -623,7 +740,10 @@ flowchart TD
     H --> I["OllamaClient::answer"]
     I --> K["TurnFinished"]
     K --> G
-    G --> J["raw-mode-safe terminal answer"]
+    G --> J["speak::independence_says\ntimestamped dialogue log"]
+    J --> W["SpeechService ordered queue"]
+    W --> T["Piper CLI -> in-memory WAV"]
+    T --> R["Rodio -> selected output device"]
 ```
 
 The direct `Input::Ask(text)` / `Input::AskWithPhotos` construction is
@@ -641,8 +761,9 @@ literal question sent to Ollama
 ```
 
 While Ollama is thinking, dictation is already back at READY. Pressing Enter
-starts another recording and cancels the old model turn first. This is why the
-terminal can show `READY` before the prior answer appears.
+stops/cancels an old model turn and any old speech first, then queues a new
+listening cue. The microphone never opens until that cue completes. This is why
+the terminal can show `READY` before the prior answer appears.
 
 ### State ownership at a glance
 
@@ -666,6 +787,10 @@ DictationSession (src/dictation/mod.rs)
 VoiceRuntime (src/app.rs, --voice only)
   owns: one unfinished draft, replaceable partial text, ordered P requests
   decides: when final text plus all requested photos may form one controller input
+
+SpeechService (src/speak/worker.rs, --voice only)
+  owns: one bounded ordered synthesis/playback queue and a cancellation generation
+  performs: local Piper synthesis and Rodio playback for already-authorized text
 ```
 
 The controllers make decisions; runtimes perform I/O. Neither worker is allowed
@@ -699,11 +824,15 @@ src/
     teacher.txt            editable model teaching instructions
 
   speak/
-    mod.rs                 normal and raw-mode-safe terminal output
+    mod.rs                 tracing logger and authorized dialogue boundary
+    tts.rs                 Piper CLI adapter (text -> in-memory WAV)
+    playback.rs            generic output listing/selection and Rodio playback
+    worker.rs              ordered cancellable speech worker
 ```
 
 ### Deliberately not present yet
 
 There is currently no decision model, photo-permission state, autonomous
-camera call, microphone transcription in normal typed mode, TTS, wake word,
-continuous vision, persistent memory, cloud fallback, or agent/tool framework.
+camera call, microphone transcription in normal typed mode, wake word,
+continuous vision, persistent memory, cloud fallback, agent/tool framework,
+speech streaming, TTS-driven turn-taking, or echo cancellation.

@@ -14,7 +14,7 @@ keyboard line
   -> think encodes its bytes and POSTs /api/chat to Ollama
   -> worker returns TurnFinished
   -> controller either accepts it or ignores it by turn ID
-  -> speak prints only an accepted answer
+  -> speak logs only an accepted answer (and --voice may queue it for local audio)
 ```
 
 The arrow labels are deliberately different:
@@ -62,8 +62,9 @@ does not guess when Enter was released:
 
 ```text
 hold-to-talk Enter press
-  -> listen::dictation sends DictationInput::HoldStart
-  -> DictationController allocates a RecordingId and requests capture
+  -> VoiceRuntime queues the fixed "i'm listening" cue to SpeechService
+  -> after that exact cue plays (or audio fails visibly), VoiceRuntime asks
+     DictationController to allocate a RecordingId and request capture
   -> CPAL opens the selected microphone only for that recording
   -> callback downmixes to bounded mono f32 samples
   -> periodic bounded snapshots run display-only local recognition
@@ -103,9 +104,49 @@ problem: pressing Esc must not say READY while CPAL still owns a device or
 while native recognition might still return text. Once a cancel changes the
 active phase, a completion with that ID is either used only for cleanup or
 ignored; it cannot display or submit a stale transcript. In voice mode, a new
-Enter press at READY first stops any active model turn before it starts the
-next draft; Esc cancels the microphone, partial/final transcription, photo
-work, and inference without clearing accepted history.
+Enter press at READY first stops any active model turn and speech playback,
+then queues a new listening cue. Capture begins only when that particular cue
+has completed. Releasing Enter or pressing Esc while it is still playing clears
+the draft first, so its late completion cannot open the microphone. Esc also
+cancels the microphone, partial/final transcription, photo work, synthesis,
+playback, and inference without clearing accepted history.
+
+## Local speech output is a separate worker
+
+The speech implementation is intentionally downstream from the controller. A
+model worker still returns text; it does not know about speakers. The
+controller first authorizes `Output::Answer`, then `OutputMode::Voice` in
+[`src/app.rs`](src/app.rs) performs two explicit actions with that exact text:
+
+```text
+accepted Output::Answer(text)
+  -> speak::independence_says(text)       timestamped terminal log now
+  -> SpeechHandle::say(TurnId, text)      bounded async queue
+  -> PiperCli::synthesize(text)           local subprocess, WAV stays in memory
+  -> RodioPlayback::play(WAV)              selected output device
+```
+
+[`src/speak/worker.rs`](src/speak/worker.rs) owns one ordered queue (capacity
+8), so an acknowledgement or answer cannot overlap or overtake an earlier
+utterance. Its requests carry both an utterance ID and the current cancellation
+generation. Escape and a new Enter press increment that generation before they
+cancel the unfinished interaction; the worker then kills an in-progress Piper
+child or stops the current Rodio player at its next check, and stale generated
+audio is never started later.
+
+There are two fixed cues: `i'm listening` before capture begins and `i'm
+thinking` only after CPAL has released the microphone. The worker caches their
+generated WAV bytes after the first successful synthesis, so repeating a
+normal control does not repeatedly invoke Piper for those short phrases. Piper
+itself is used through its documented CLI rather than reimplemented in Rust;
+Rodio provides output-device access and WAV decoding/playback. Our code owns
+queue ordering, cancellation identity, privacy limits, and the rule that the
+microphone must wait for the listening cue.
+
+This is **not echo cancellation**. Speaker audio can reach a nearby
+microphone; use a selectable headset when that matters. If Piper or an output
+device is unavailable, the text log remains authoritative and recording starts
+with a visible warning instead of pretending audio played.
 
 ## Why the controller owns state
 
@@ -155,8 +196,9 @@ photo requests; repeats are ignored. If the terminal cannot report event
 types, voice mode fails rather than using a release timeout. Its short poll
 interval lets shutdown join the thread before the raw-mode guard restores
 normal terminal settings. `--voice` uses raw-mode-safe output for model
-answers too; ordinary `println!` is not assumed to behave correctly while raw
-mode is active.
+answers too; the shared `tracing` writer flushes timestamped logs to stdout
+with CRLF handling instead of assuming ordinary `println!` behaves correctly
+while raw mode is active.
 
 ### Ownership snapshots and `Arc`
 
@@ -201,6 +243,12 @@ to claim that foreign native computation died instantly. The outer task waits
 for Whisper to reach a supported abort callback point, then drops the audio
 and ignores any obsolete result. This is why dictation does not accept a new
 recording while a cancelled worker is still cleaning up.
+
+Speech has a related but separate limit. Piper runs as an app-owned local child
+process. A cancellation-generation change makes the worker kill that child if
+it is still synthesizing; it polls Rodio playback about every 10 ms and stops a
+stale player there. That is a bounded application-owned cleanup strategy, not
+a claim that an operating-system audio driver halts at an exact instant.
 
 ### Serde and reqwest versus our code
 
@@ -297,13 +345,28 @@ For the integrated bridge, use a running local Ollama server and launch:
 cargo run -- --voice
 ```
 
-Hold Enter, ask “What is the primary gas in Earth's atmosphere?”, and release
-it. Partial log lines may appear before the final transcript and text answer.
-Repeat while pressing `P` twice before release to attach two stills in press
-order. While an answer is pending, hold Enter again: the old answer must become
-ineligible. Press Esc during a held draft, final recognition, or inference to
-discard that work. `cargo run -- --dictate` remains the separate transcript-only
-check; it should display speech but never contact Ollama.
+After completing the separate Piper/HAL setup in `README.md`, first run:
+
+```bash
+cargo run -- --audio-devices
+cargo run -- --speak-test
+```
+
+The first command only lists outputs. The second deliberately speaks one fixed
+sentence through the system-default device. It is the real speaker check and
+does not open a microphone, contact Ollama, or capture a photo. If the log
+names a different desired output, rerun it with `--audio-output 'Exact id'`.
+
+For `--voice`, hold Enter and wait for `i'm listening` before asking “What is
+the primary gas in Earth's atmosphere?”; then release Enter. The microphone is
+not open during that cue. Partial log lines may appear before the final
+transcript, `i'm thinking`, and the text answer. Repeat while pressing `P`
+twice after capture begins and before release to attach two stills in press
+order. While an answer is pending, hold Enter again: its old model result and
+old speech must become ineligible. Press Esc during the listening cue, a held
+draft, final recognition, synthesis/playback, or inference to discard that
+work. `cargo run -- --dictate` remains the separate transcript-only check; it
+should display speech but never contact Ollama or speakers.
 
 ## What tests establish—and what they cannot
 
@@ -331,3 +394,11 @@ ALSA/PipeWire picks the desired device, that Whisper recognizes a particular
 voice, or that a real local model answers quickly. Those are the separate
 manual checks above; no model weight, microphone, Ollama server, or camera is
 required for the ordinary suite.
+
+Speech-worker tests use fake synthesizers and fake players. They verify queue
+order, fixed-cue caching, synthesis/playback failure reporting, and generation
+cancellation without Piper, a model file, or a real speaker. Voice-runtime
+tests separately verify that recording does not open before the listening cue,
+that a late cue after release/Escape cannot reopen it, and that `P` during the
+cue cannot activate a camera. They do not prove that a physical speaker works;
+only `cargo run -- --speak-test` can do that on the selected machine.

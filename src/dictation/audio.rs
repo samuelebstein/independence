@@ -25,6 +25,7 @@ use rubato::{Fft, FixedSync, Resampler, audioadapter_buffers::owned::Interleaved
 use tokio::{sync::mpsc::Sender as EventSender, task::JoinHandle};
 
 use crate::protocol::{CapturedAudio, DictationEvent, RecordingId};
+use crate::telemetry::{self, Interaction};
 
 use super::controller::MAX_RECORDING_DURATION;
 
@@ -73,6 +74,7 @@ pub trait Recorder: Send + Sync {
         &self,
         recording_id: RecordingId,
         event_sender: EventSender<DictationEvent>,
+        interaction: Option<Interaction>,
     ) -> Result<Box<dyn RecordingHandle>, String>;
 }
 
@@ -152,8 +154,27 @@ impl CpalRecorder {
         recording_id: RecordingId,
         event_sender: EventSender<DictationEvent>,
         commands: Receiver<CaptureCommand>,
+        interaction: Option<Interaction>,
     ) {
-        let outcome = self.capture(recording_id, &event_sender, &commands);
+        let started = Instant::now();
+        let outcome = self.capture(recording_id, &event_sender, &commands, interaction.as_ref());
+        if let Some(interaction) = &interaction {
+            let outcome_label = match &outcome {
+                Ok(CaptureOutcome::Audio(_)) => "completed",
+                Ok(CaptureOutcome::Cancelled) => "cancelled",
+                Err(_) => "device_failure",
+            };
+            interaction.event(
+                "microphone.capture.lifecycle",
+                outcome_label,
+                telemetry::fields([(
+                    "capture_lifecycle_duration_ms",
+                    serde_json::json!(
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                    ),
+                )]),
+            );
+        }
         let event = match outcome {
             Ok(CaptureOutcome::Audio(audio)) => DictationEvent::RecordingFinished {
                 recording_id,
@@ -173,6 +194,7 @@ impl CpalRecorder {
         recording_id: RecordingId,
         event_sender: &EventSender<DictationEvent>,
         commands: &Receiver<CaptureCommand>,
+        interaction: Option<&Interaction>,
     ) -> Result<CaptureOutcome, String> {
         if command_requests_cancel(commands) {
             return Ok(CaptureOutcome::Cancelled);
@@ -215,6 +237,21 @@ impl CpalRecorder {
         stream
             .play()
             .map_err(|error| format!("could not start microphone capture: {error}"))?;
+        if let Some(interaction) = interaction {
+            interaction.mark("microphone.recording_started");
+            interaction.event(
+                "microphone.capture.format",
+                "started",
+                telemetry::fields([
+                    ("sample_rate_hz", serde_json::json!(sample_rate)),
+                    ("channels", serde_json::json!(channels)),
+                    (
+                        "sample_format",
+                        serde_json::json!(sample_format.to_string()),
+                    ),
+                ]),
+            );
+        }
         if event_sender
             .blocking_send(DictationEvent::RecordingStarted { recording_id })
             .is_err()
@@ -232,18 +269,76 @@ impl CpalRecorder {
             captured.as_ref(),
             sample_rate,
             started,
-        )?;
+        );
 
         // Dropping CPAL's stream ends its callback and releases the device
         // before we inspect samples, resample, or invoke whisper.cpp.
         drop(stream);
+        let recording_duration = started.elapsed();
+        if let Some(interaction) = interaction {
+            interaction.mark("microphone.released");
+            let outcome = match &finish_reason {
+                Ok(FinishReason::Finished) => "completed",
+                Ok(FinishReason::Cancelled) => "cancelled",
+                Err(_) => "device_failure",
+            };
+            interaction.event(
+                "microphone.recording",
+                outcome,
+                telemetry::fields([(
+                    "recording_duration_ms",
+                    serde_json::json!(
+                        u64::try_from(recording_duration.as_millis()).unwrap_or(u64::MAX)
+                    ),
+                )]),
+            );
+        }
+
+        let finish_reason = finish_reason?;
 
         if finish_reason == FinishReason::Cancelled {
             return Ok(CaptureOutcome::Cancelled);
         }
 
         let samples = captured.take()?;
-        let audio = prepare_for_whisper(samples, sample_rate)?;
+        let input_samples = samples.len();
+        let preparation = interaction.map(|interaction| {
+            interaction.stage(
+                "audio.prepare_resample",
+                telemetry::fields([
+                    ("source_sample_rate_hz", serde_json::json!(sample_rate)),
+                    ("input_samples", serde_json::json!(input_samples)),
+                ]),
+            )
+        });
+        let audio = match prepare_for_whisper(samples, sample_rate) {
+            Ok(audio) => audio,
+            Err(error) => {
+                if let Some(stage) = preparation {
+                    stage.finish("failed", telemetry::Fields::new());
+                }
+                return Err(error);
+            }
+        };
+        if let Some(stage) = preparation {
+            stage.finish(
+                "completed",
+                telemetry::fields([
+                    (
+                        "whisper_sample_rate_hz",
+                        serde_json::json!(WHISPER_SAMPLE_RATE),
+                    ),
+                    ("output_samples", serde_json::json!(audio.samples().len())),
+                    (
+                        "audio_duration_ms",
+                        serde_json::json!(
+                            (audio.samples().len() as u64).saturating_mul(1_000)
+                                / u64::from(WHISPER_SAMPLE_RATE)
+                        ),
+                    ),
+                ]),
+            );
+        }
         Ok(CaptureOutcome::Audio(audio))
     }
 }
@@ -258,11 +353,12 @@ impl Recorder for CpalRecorder {
         &self,
         recording_id: RecordingId,
         event_sender: EventSender<DictationEvent>,
+        interaction: Option<Interaction>,
     ) -> Result<Box<dyn RecordingHandle>, String> {
         let (command_sender, command_receiver) = mpsc::channel();
         let recorder = self.clone();
         let task = tokio::task::spawn_blocking(move || {
-            recorder.run_capture(recording_id, event_sender, command_receiver);
+            recorder.run_capture(recording_id, event_sender, command_receiver, interaction);
         });
         Ok(Box::new(CpalRecordingHandle {
             command_sender,

@@ -10,12 +10,14 @@ mod controller;
 pub(crate) mod transcribe;
 
 use std::{
+    collections::HashMap,
     io,
     path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use thiserror::Error;
@@ -28,12 +30,13 @@ use crate::{
         RecordingId,
     },
     speak,
+    telemetry::{self, Interaction},
 };
 
 use self::{
     audio::{CpalRecorder, Recorder, RecordingHandle},
     controller::DictationController,
-    transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
+    transcribe::{Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber},
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -67,11 +70,18 @@ pub(crate) struct DictationSession {
 
 impl DictationSession {
     pub(crate) fn from_environment(event_sender: mpsc::Sender<DictationEvent>) -> Self {
-        Self::with_services(
-            Arc::new(CpalRecorder::from_environment()),
-            Arc::new(WhisperTranscriber::from_environment()),
-            event_sender,
-        )
+        let recorder = Arc::new(CpalRecorder::from_environment());
+        let transcriber = Arc::new(WhisperTranscriber::from_environment());
+        telemetry::run_event(
+            "whisper.model.configuration",
+            if transcriber.model_is_available() {
+                "available"
+            } else {
+                "missing"
+            },
+            telemetry::Fields::new(),
+        );
+        Self::with_services(recorder, transcriber, event_sender)
     }
 
     pub(crate) fn with_services(
@@ -102,6 +112,13 @@ impl DictationSession {
 
     pub(crate) fn is_ready(&self) -> bool {
         self.controller.is_ready()
+    }
+
+    /// Attaches the next button-controlled microphone lifecycle to the
+    /// already-created voice interaction. Standalone dictation deliberately
+    /// leaves this unset because its transcript stops at the terminal.
+    pub(crate) fn set_pending_interaction(&mut self, interaction: Interaction) {
+        self.runtime.set_pending_interaction(interaction);
     }
 
     /// Requests one best-effort snapshot of the current capture. A snapshot
@@ -219,6 +236,8 @@ struct DictationRuntime {
     event_sender: mpsc::Sender<DictationEvent>,
     active_recording: Option<RunningRecording>,
     active_transcription: Option<RunningTranscription>,
+    pending_interaction: Option<Interaction>,
+    recording_interactions: HashMap<RecordingId, Interaction>,
 }
 
 struct RunningRecording {
@@ -244,6 +263,14 @@ impl DictationRuntime {
             event_sender,
             active_recording: None,
             active_transcription: None,
+            pending_interaction: None,
+            recording_interactions: HashMap::new(),
+        }
+    }
+
+    fn set_pending_interaction(&mut self, interaction: Interaction) {
+        if let Some(previous) = self.pending_interaction.replace(interaction) {
+            previous.complete("superseded_before_recording", telemetry::Fields::new());
         }
     }
 
@@ -323,8 +350,19 @@ impl DictationRuntime {
             return;
         }
 
-        match self.recorder.start(recording_id, self.event_sender.clone()) {
+        let interaction = self.pending_interaction.take();
+        let scheduled = Instant::now();
+        match self
+            .recorder
+            .start(recording_id, self.event_sender.clone(), interaction.clone())
+        {
             Ok(handle) => {
+                if let Some(interaction) = interaction {
+                    interaction.bind_recording(recording_id);
+                    interaction.queue_wait("microphone", scheduled.elapsed(), 0, 1);
+                    self.recording_interactions
+                        .insert(recording_id, interaction);
+                }
                 self.active_recording = Some(RunningRecording {
                     id: recording_id,
                     handle,
@@ -361,11 +399,27 @@ impl DictationRuntime {
         let worker_cancelled = cancelled.clone();
         let transcriber = self.transcriber.clone();
         let event_sender = self.event_sender.clone();
+        let interaction = self.recording_interactions.get(&recording_id).cloned();
+        let enqueued = Instant::now();
+        let in_flight = interaction
+            .as_ref()
+            .map(|interaction| interaction.in_flight_guard("whisper"));
         let completion = tokio::spawn(async move {
+            let _in_flight = in_flight;
             let task_cancelled = worker_cancelled.clone();
-            let result =
-                tokio::task::spawn_blocking(move || transcriber.transcribe(audio, task_cancelled))
-                    .await;
+            let worker_interaction = interaction.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if let Some(interaction) = &worker_interaction {
+                    interaction.queue_wait("whisper", enqueued.elapsed(), 0, 1);
+                }
+                transcriber.transcribe(
+                    audio,
+                    task_cancelled,
+                    TranscriptionKind::Final,
+                    worker_interaction.as_ref(),
+                )
+            })
+            .await;
 
             let event = if worker_cancelled.load(Ordering::Acquire) {
                 DictationEvent::TranscriptionCancelled { recording_id }
@@ -398,10 +452,13 @@ impl DictationRuntime {
 
     async fn retire_completed_worker(&mut self, event: &DictationEvent) {
         match event {
-            DictationEvent::RecordingFinished { recording_id, .. }
-            | DictationEvent::RecordingCancelled { recording_id }
+            DictationEvent::RecordingFinished { recording_id, .. } => {
+                self.retire_recording(*recording_id).await;
+            }
+            DictationEvent::RecordingCancelled { recording_id }
             | DictationEvent::RecordingFailed { recording_id, .. } => {
                 self.retire_recording(*recording_id).await;
+                self.recording_interactions.remove(recording_id);
             }
             DictationEvent::TranscriptReady { recording_id, .. }
             | DictationEvent::TranscriptionCancelled { recording_id }
@@ -443,6 +500,7 @@ impl DictationRuntime {
             .take()
             .expect("active transcription was checked above");
         let _ = transcription.completion.await;
+        self.recording_interactions.remove(&recording_id);
     }
 
     async fn shutdown(&mut self) {
@@ -458,6 +516,7 @@ impl DictationRuntime {
             // immediate process interruption.
             let _ = transcription.completion.await;
         }
+        self.recording_interactions.clear();
     }
 }
 
@@ -505,6 +564,7 @@ mod tests {
             &self,
             _recording_id: RecordingId,
             _event_sender: mpsc::Sender<DictationEvent>,
+            _interaction: Option<crate::telemetry::Interaction>,
         ) -> Result<Box<dyn RecordingHandle>, String> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FakeRecordingHandle {
@@ -544,6 +604,7 @@ mod tests {
             &self,
             _recording_id: RecordingId,
             _event_sender: mpsc::Sender<DictationEvent>,
+            _interaction: Option<crate::telemetry::Interaction>,
         ) -> Result<Box<dyn RecordingHandle>, String> {
             Err("synthetic microphone disconnected".into())
         }
@@ -580,6 +641,8 @@ mod tests {
             &self,
             _audio: CapturedAudio,
             cancelled: Arc<AtomicBool>,
+            _kind: crate::dictation::transcribe::TranscriptionKind,
+            _interaction: Option<&crate::telemetry::Interaction>,
         ) -> Result<String, TranscriptionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if cancelled.load(Ordering::Acquire) {

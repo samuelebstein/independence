@@ -1,6 +1,11 @@
 #[tokio::main]
 async fn main() {
+    // Initialize providers before installing the tracing subscriber so every
+    // later `tracing` span can receive a real OpenTelemetry context. Nothing
+    // is exported unless the user configured an OTLP endpoint.
+    let mut telemetry = independence::telemetry::initialize();
     independence::speak::init_logging();
+    telemetry.report_startup();
 
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match arguments.as_slice() {
@@ -32,9 +37,16 @@ async fn main() {
         _ => usage_and_exit(),
     };
 
-    if let Err(error) = result {
-        independence::speak::application_error(error);
-        std::process::exit(1);
+    let exit_code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            independence::speak::application_error(error);
+            1
+        }
+    };
+    telemetry.shutdown();
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 }
 

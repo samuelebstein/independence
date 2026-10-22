@@ -11,6 +11,8 @@ use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::telemetry::{self, Interaction, OllamaMetricData};
+
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 // The Instruct tag is the non-thinking Qwen3-VL variant. It remains a vision
 // model, but avoids spending a large part of a short interaction on a hidden
@@ -85,9 +87,63 @@ pub struct OllamaClient {
     config: OllamaConfig,
 }
 
+/// A complete non-streaming Ollama answer plus optional server-reported
+/// execution statistics. These fields are absent on older servers and that is
+/// intentionally represented as `None`, never as zero.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OllamaAnswer {
+    pub text: String,
+    pub statistics: OllamaStatistics,
+}
+
+/// Optional timings/counts supplied by Ollama's `/api/chat` response.
+///
+/// Durations are stored exactly as Ollama reports them: nanoseconds. Callers
+/// use the explicit conversion helpers when rendering or recording metrics.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OllamaStatistics {
+    pub model: Option<String>,
+    pub total_duration_ns: Option<u64>,
+    pub load_duration_ns: Option<u64>,
+    pub prompt_eval_count: Option<u64>,
+    pub prompt_eval_cached_count: Option<u64>,
+    pub prompt_eval_duration_ns: Option<u64>,
+    pub eval_count: Option<u64>,
+    pub eval_duration_ns: Option<u64>,
+    pub done_reason: Option<String>,
+}
+
+impl OllamaStatistics {
+    pub fn nanoseconds_to_seconds(value: Option<u64>) -> Option<f64> {
+        value.map(|nanoseconds| Duration::from_nanos(nanoseconds).as_secs_f64())
+    }
+
+    pub fn nanoseconds_to_milliseconds(value: Option<u64>) -> Option<u64> {
+        value.map(|nanoseconds| nanoseconds / 1_000_000)
+    }
+
+    /// Generation speed is meaningful only when Ollama supplied a positive
+    /// generation duration and a token count. It is unavailable for a zero
+    /// duration rather than being rendered as infinity or zero.
+    pub fn generation_tokens_per_second(&self) -> Option<f64> {
+        let count = self.eval_count?;
+        let seconds = Self::nanoseconds_to_seconds(self.eval_duration_ns)?;
+        (seconds > 0.0).then_some(count as f64 / seconds)
+    }
+}
+
 impl OllamaClient {
     pub fn from_environment() -> Result<Self, ThinkError> {
-        Self::new(OllamaConfig::from_environment()?)
+        let client = Self::new(OllamaConfig::from_environment()?)?;
+        telemetry::run_event(
+            "ollama.client.initialization",
+            "configured",
+            telemetry::fields([
+                ("model", serde_json::json!(client.model())),
+                ("stream", serde_json::json!(false)),
+            ]),
+        );
+        Ok(client)
     }
 
     pub fn new(config: OllamaConfig) -> Result<Self, ThinkError> {
@@ -104,32 +160,178 @@ impl OllamaClient {
         Ok(Self { http, config })
     }
 
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
     /// Requests one complete, non-streaming answer from Ollama.
+    ///
+    /// This convenience form preserves the transport boundary for callers
+    /// that do not own an interaction timeline (including HTTP unit tests).
     pub async fn answer(
         &self,
         history: &[ConversationTurn],
         question: &str,
         images: &[&[u8]],
-    ) -> Result<String, ThinkError> {
-        let request = ChatRequest::new(&self.config.model, history, question, images);
+    ) -> Result<OllamaAnswer, ThinkError> {
+        self.answer_with_telemetry(history, question, images, None)
+            .await
+    }
+
+    /// Same request with optional privacy-preserving timing/correlation.
+    /// Text stays inside `ChatRequest` and never enters telemetry attributes.
+    pub async fn answer_with_telemetry(
+        &self,
+        history: &[ConversationTurn],
+        question: &str,
+        images: &[&[u8]],
+        interaction: Option<&Interaction>,
+    ) -> Result<OllamaAnswer, ThinkError> {
+        let image_bytes = images.iter().map(|bytes| bytes.len()).sum::<usize>();
+        if let Some(interaction) = interaction {
+            interaction.unavailable(
+                "ollama.first_token_latency",
+                "current /api/chat request uses stream=false",
+            );
+            interaction.unavailable(
+                "ollama.server_queue_depth",
+                "the current Ollama API response does not expose server queue depth",
+            );
+            interaction.unavailable("ollama.server_version", "not probed on the request path");
+            interaction.set_input(telemetry::fields([
+                ("model", serde_json::json!(self.config.model)),
+                ("request_type", serde_json::json!("chat")),
+                ("gen_ai.provider.name", serde_json::json!("ollama")),
+                ("gen_ai.operation.name", serde_json::json!("chat")),
+                ("gen_ai.request.model", serde_json::json!(self.config.model)),
+                ("accepted_history_turns", serde_json::json!(history.len())),
+                ("image_count", serde_json::json!(images.len())),
+                ("total_image_bytes", serde_json::json!(image_bytes)),
+                ("stream", serde_json::json!(false)),
+            ]));
+        }
+
+        // Base64 encoding happens locally before HTTP dispatch. Keep its
+        // timing distinct from the request-shaping step and from Ollama's
+        // response time; neither is evidence of a server queue.
+        let image_encoding = interaction.and_then(|interaction| {
+            (!images.is_empty()).then(|| {
+                interaction.stage(
+                    "ollama.image.encode",
+                    telemetry::fields([
+                        ("image_count", serde_json::json!(images.len())),
+                        ("total_image_bytes", serde_json::json!(image_bytes)),
+                    ]),
+                )
+            })
+        });
+        let encoded_images = images
+            .iter()
+            .map(|bytes| STANDARD.encode(bytes))
+            .collect::<Vec<_>>();
+        if let Some(stage) = image_encoding {
+            let encoded_bytes = encoded_images.iter().map(String::len).sum::<usize>();
+            stage.finish(
+                "completed",
+                telemetry::fields([("encoded_image_bytes", serde_json::json!(encoded_bytes))]),
+            );
+        }
+
+        let preparation = interaction.map(|interaction| {
+            interaction.stage(
+                "ollama.request.prepare",
+                telemetry::fields([
+                    ("history_turns", serde_json::json!(history.len())),
+                    ("image_count", serde_json::json!(images.len())),
+                    ("total_image_bytes", serde_json::json!(image_bytes)),
+                ]),
+            )
+        });
+        let request = ChatRequest::new(&self.config.model, history, question, &encoded_images);
+        if let Some(stage) = preparation {
+            stage.finish("completed", telemetry::Fields::new());
+        }
         let endpoint = self.config.chat_url()?;
 
+        let mut exchange = interaction.map(|interaction| {
+            interaction.stage(
+                "ollama.http.exchange",
+                telemetry::fields([
+                    ("http.request.method", serde_json::json!("POST")),
+                    (
+                        "server.address",
+                        serde_json::json!(endpoint.host_str().unwrap_or("loopback")),
+                    ),
+                    (
+                        "server.port",
+                        serde_json::json!(endpoint.port_or_known_default()),
+                    ),
+                ]),
+            )
+        });
         let response = self
             .http
             .post(endpoint.clone())
             .json(&request)
             .send()
             .await
-            .map_err(|source| ThinkError::Request { endpoint, source })?;
+            .map_err(|source| {
+                if let Some(stage) = exchange.take() {
+                    stage.finish("connection_failure", telemetry::Fields::new());
+                }
+                ThinkError::Request { endpoint, source }
+            })?;
 
-        if !response.status().is_success() {
-            return Err(http_error(response.status(), response).await);
+        let status = response.status();
+        if !status.is_success() {
+            if let Some(stage) = exchange.take() {
+                stage.finish(
+                    "http_error",
+                    telemetry::fields([(
+                        "http.response.status_code",
+                        serde_json::json!(status.as_u16()),
+                    )]),
+                );
+            }
+            return Err(http_error(status, response).await);
+        }
+        if let Some(stage) = exchange.take() {
+            stage.finish(
+                "completed",
+                telemetry::fields([(
+                    "http.response.status_code",
+                    serde_json::json!(status.as_u16()),
+                )]),
+            );
         }
 
-        let response = response
-            .json::<ChatResponse>()
-            .await
-            .map_err(ThinkError::InvalidResponse)?;
+        let mut decoding = interaction.map(|interaction| {
+            interaction.stage("ollama.response.decode", telemetry::Fields::new())
+        });
+        let response = response.json::<ChatResponse>().await.map_err(|error| {
+            if let Some(stage) = decoding.take() {
+                stage.finish("decode_failure", telemetry::Fields::new());
+            }
+            ThinkError::InvalidResponse(error)
+        })?;
+        if let Some(stage) = decoding.take() {
+            stage.finish("completed", telemetry::Fields::new());
+        }
+
+        let statistics = response.statistics();
+        if let Some(interaction) = interaction {
+            interaction.set_ollama(statistics.telemetry_fields());
+            interaction.record_ollama_statistics(OllamaMetricData {
+                model: &self.config.model,
+                total_duration_ns: statistics.total_duration_ns,
+                load_duration_ns: statistics.load_duration_ns,
+                prompt_eval_duration_ns: statistics.prompt_eval_duration_ns,
+                eval_duration_ns: statistics.eval_duration_ns,
+                prompt_eval_count: statistics.prompt_eval_count,
+                prompt_eval_cached_count: statistics.prompt_eval_cached_count,
+                eval_count: statistics.eval_count,
+            });
+        }
 
         if response.done != Some(true) || response.done_reason.as_deref() == Some("length") {
             return Err(ThinkError::IncompleteResponse);
@@ -144,7 +346,59 @@ impl OllamaClient {
             return Err(ThinkError::EmptyAnswer);
         }
 
-        Ok(answer)
+        Ok(OllamaAnswer {
+            text: answer,
+            statistics,
+        })
+    }
+}
+
+impl OllamaStatistics {
+    fn telemetry_fields(&self) -> telemetry::Fields {
+        telemetry::fields([
+            ("response_model", serde_json::json!(self.model)),
+            ("gen_ai.response.model", serde_json::json!(self.model)),
+            (
+                "ollama_total_duration_ms",
+                serde_json::json!(Self::nanoseconds_to_milliseconds(self.total_duration_ns)),
+            ),
+            (
+                "ollama_reported_load_duration_ms",
+                serde_json::json!(Self::nanoseconds_to_milliseconds(self.load_duration_ns)),
+            ),
+            (
+                "prompt_eval_count",
+                serde_json::json!(self.prompt_eval_count),
+            ),
+            (
+                "gen_ai.usage.input_tokens",
+                serde_json::json!(self.prompt_eval_count),
+            ),
+            (
+                "prompt_eval_cached_count",
+                serde_json::json!(self.prompt_eval_cached_count),
+            ),
+            (
+                "prompt_eval_duration_ms",
+                serde_json::json!(Self::nanoseconds_to_milliseconds(
+                    self.prompt_eval_duration_ns
+                )),
+            ),
+            ("eval_count", serde_json::json!(self.eval_count)),
+            (
+                "gen_ai.usage.output_tokens",
+                serde_json::json!(self.eval_count),
+            ),
+            (
+                "eval_duration_ms",
+                serde_json::json!(Self::nanoseconds_to_milliseconds(self.eval_duration_ns)),
+            ),
+            (
+                "generation_tokens_per_second",
+                serde_json::json!(self.generation_tokens_per_second()),
+            ),
+            ("done_reason", serde_json::json!(self.done_reason)),
+        ])
     }
 }
 
@@ -178,7 +432,12 @@ struct ChatRequest {
 }
 
 impl ChatRequest {
-    fn new(model: &str, history: &[ConversationTurn], question: &str, images: &[&[u8]]) -> Self {
+    fn new(
+        model: &str,
+        history: &[ConversationTurn],
+        question: &str,
+        encoded_images: &[String],
+    ) -> Self {
         let mut messages = Vec::with_capacity(2 + history.len() * 2);
         messages.push(ChatMessage::system(TEACHER_INSTRUCTIONS));
 
@@ -187,7 +446,7 @@ impl ChatRequest {
             messages.push(ChatMessage::assistant(&turn.assistant));
         }
 
-        messages.push(ChatMessage::user(question, images));
+        messages.push(ChatMessage::user(question, encoded_images));
 
         Self {
             model: model.to_owned(),
@@ -214,11 +473,11 @@ impl ChatMessage {
         }
     }
 
-    fn user(content: &str, images: &[&[u8]]) -> Self {
+    fn user(content: &str, images: &[String]) -> Self {
         Self {
             role: "user",
             content: content.to_owned(),
-            images: images.iter().map(|bytes| STANDARD.encode(bytes)).collect(),
+            images: images.to_vec(),
         }
     }
 
@@ -233,9 +492,33 @@ impl ChatMessage {
 
 #[derive(Deserialize)]
 struct ChatResponse {
+    model: Option<String>,
     message: Option<ResponseMessage>,
     done: Option<bool>,
     done_reason: Option<String>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_cached_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+}
+
+impl ChatResponse {
+    fn statistics(&self) -> OllamaStatistics {
+        OllamaStatistics {
+            model: self.model.clone(),
+            total_duration_ns: self.total_duration,
+            load_duration_ns: self.load_duration,
+            prompt_eval_count: self.prompt_eval_count,
+            prompt_eval_cached_count: self.prompt_eval_cached_count,
+            prompt_eval_duration_ns: self.prompt_eval_duration,
+            eval_count: self.eval_count,
+            eval_duration_ns: self.eval_duration,
+            done_reason: self.done_reason.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -288,6 +571,27 @@ pub enum ThinkError {
     EmptyAnswer,
 }
 
+impl ThinkError {
+    /// A bounded, content-free classification for telemetry. Detailed server
+    /// diagnostics remain in the human-readable terminal log.
+    pub fn classification(&self) -> &'static str {
+        match self {
+            Self::Request { source, .. } if source.is_timeout() => "timeout",
+            Self::Request { .. } => "connection_failure",
+            Self::Http { .. } => "http_error",
+            Self::InvalidResponse(_) => "decode_failure",
+            Self::IncompleteResponse => "incomplete_response",
+            Self::EmptyAnswer => "empty_answer",
+            Self::BuildClient(_)
+            | Self::InvalidEndpoint(_)
+            | Self::UnsupportedScheme(_)
+            | Self::NonLoopbackEndpoint(_)
+            | Self::EndpointHasPath(_)
+            | Self::EmptyModel => "configuration",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{future::Future, time::Duration};
@@ -298,7 +602,9 @@ mod tests {
         matchers::{body_json, method, path},
     };
 
-    use super::{ConversationTurn, OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS};
+    use super::{
+        ConversationTurn, OllamaClient, OllamaConfig, OllamaStatistics, TEACHER_INSTRUCTIONS,
+    };
 
     fn client(server: &MockServer) -> OllamaClient {
         let config = OllamaConfig::new(&server.uri(), "test-model").unwrap();
@@ -329,9 +635,17 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(expected))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "test-model",
                 "message": {"role": "assistant", "content": "It helps limit water loss and damage."},
                 "done": true,
-                "done_reason": "stop"
+                "done_reason": "stop",
+                "total_duration": 3_250_000_000u64,
+                "load_duration": 1_000_000_000u64,
+                "prompt_eval_count": 42,
+                "prompt_eval_cached_count": 12,
+                "prompt_eval_duration": 500_000_000u64,
+                "eval_count": 10,
+                "eval_duration": 2_000_000_000u64
             })))
             .mount(&server)
             .await;
@@ -347,7 +661,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer, "It helps limit water loss and damage.");
+        assert_eq!(answer.text, "It helps limit water loss and damage.");
+        assert_eq!(answer.statistics.model.as_deref(), Some("test-model"));
+        assert_eq!(answer.statistics.total_duration_ns, Some(3_250_000_000));
+        assert_eq!(answer.statistics.prompt_eval_cached_count, Some(12));
+        assert_eq!(answer.statistics.generation_tokens_per_second(), Some(5.0));
     }
 
     #[tokio::test]
@@ -428,7 +746,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(answer, "A test image.");
+        assert_eq!(answer.text, "A test image.");
     }
 
     #[tokio::test]
@@ -460,6 +778,23 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer, "They differ.");
+        assert_eq!(answer.text, "They differ.");
+    }
+
+    #[test]
+    fn ollama_statistic_conversions_keep_missing_and_zero_values_honest() {
+        assert_eq!(OllamaStatistics::nanoseconds_to_seconds(None), None);
+        assert_eq!(
+            OllamaStatistics::nanoseconds_to_milliseconds(Some(2_999_999)),
+            Some(2)
+        );
+        let missing = OllamaStatistics::default();
+        assert_eq!(missing.generation_tokens_per_second(), None);
+        let zero_duration = OllamaStatistics {
+            eval_count: Some(12),
+            eval_duration_ns: Some(0),
+            ..OllamaStatistics::default()
+        };
+        assert_eq!(zero_duration.generation_tokens_per_second(), None);
     }
 }

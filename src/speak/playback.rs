@@ -12,7 +12,7 @@ use std::{
 };
 
 use rodio::cpal::traits::DeviceTrait;
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, cpal::traits::HostTrait};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source, cpal::traits::HostTrait};
 use thiserror::Error;
 
 /// One output device suitable for presenting to a person. The name is an OS
@@ -105,6 +105,15 @@ pub trait Playback {
         request: PlaybackRequest,
         current_generation: &AtomicU64,
     ) -> Result<PlaybackResult, PlaybackError>;
+}
+
+/// Reads duration from an in-memory WAV using Rodio's established decoder.
+/// It is used only for telemetry after synthesis; `None` means the generated
+/// bytes were not decodable enough to expose a duration.
+pub(crate) fn wav_duration(wav: &[u8]) -> Option<Duration> {
+    Decoder::try_from(Cursor::new(wav.to_vec()))
+        .ok()?
+        .total_duration()
 }
 
 /// A Rodio stream remains alive for the lifetime of this player. A fresh sink

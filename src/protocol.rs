@@ -18,6 +18,11 @@ impl TurnId {
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
+
+    /// A stable process-local value for correlation records.
+    pub(crate) const fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// A unique identifier for a camera-command preflight.
@@ -43,6 +48,11 @@ pub struct RecordingId(u64);
 impl RecordingId {
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    /// A stable process-local value for correlation records.
+    pub(crate) const fn value(self) -> u64 {
+        self.0
     }
 }
 

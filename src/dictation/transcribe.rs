@@ -13,6 +13,7 @@ use std::{
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::protocol::CapturedAudio;
+use crate::telemetry::{self, Interaction};
 
 /// Returns a stable pointer to the cancellation flag for whisper.cpp's native
 /// abort callback. The caller keeps the `Arc` alive for the whole synchronous
@@ -63,7 +64,34 @@ pub trait Transcriber: Send + Sync {
         &self,
         audio: CapturedAudio,
         cancelled: Arc<AtomicBool>,
+        kind: TranscriptionKind,
+        interaction: Option<&Interaction>,
     ) -> Result<String, TranscriptionError>;
+}
+
+/// The UI purpose of a recognizer call. Both paths use the same local
+/// Whisper model, but partial previews must remain distinguishable from the
+/// final submission in telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptionKind {
+    Partial,
+    Final,
+}
+
+impl TranscriptionKind {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Partial => "whisper.partial.recognition",
+            Self::Final => "whisper.final.recognition",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Partial => "partial",
+            Self::Final => "final",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -98,7 +126,11 @@ impl WhisperTranscriber {
         }
     }
 
-    fn context(&self, cancelled: &AtomicBool) -> Result<Arc<WhisperContext>, TranscriptionError> {
+    fn context(
+        &self,
+        cancelled: &AtomicBool,
+        interaction: Option<&Interaction>,
+    ) -> Result<Arc<WhisperContext>, TranscriptionError> {
         if cancelled.load(Ordering::Acquire) {
             return Err(TranscriptionError::Cancelled);
         }
@@ -110,30 +142,59 @@ impl WhisperTranscriber {
             return Ok(context.clone());
         }
 
+        let mut loading = interaction
+            .map(|interaction| interaction.stage("whisper.context.load", telemetry::Fields::new()));
+
         if !self.model_path.is_file() {
+            if let Some(stage) = loading.take() {
+                stage.finish(
+                    "failed",
+                    telemetry::fields([("failure_class", serde_json::json!("model_file_missing"))]),
+                );
+            }
             return Err(TranscriptionError::Failed(format!(
                 "Whisper model file is missing: {}; set INDEPENDENCE_WHISPER_MODEL to a local ggml base.en model",
                 self.model_path.display()
             )));
         }
         if cancelled.load(Ordering::Acquire) {
+            if let Some(stage) = loading.take() {
+                stage.finish("cancelled", telemetry::Fields::new());
+            }
             return Err(TranscriptionError::Cancelled);
         }
 
         let context =
             WhisperContext::new_with_params(&self.model_path, WhisperContextParameters::default())
                 .map_err(|error| {
+                    if let Some(stage) = loading.take() {
+                        stage.finish(
+                            "failed",
+                            telemetry::fields([(
+                                "failure_class",
+                                serde_json::json!("model_context_failure"),
+                            )]),
+                        );
+                    }
                     TranscriptionError::Failed(format!(
                         "could not load local Whisper model {}: {error}",
                         self.model_path.display()
                     ))
                 })?;
         if cancelled.load(Ordering::Acquire) {
+            // Model construction completed, but it must not be retained for
+            // this cancelled interaction as a successful context-load stage.
+            if let Some(stage) = loading.take() {
+                stage.finish("cancelled", telemetry::Fields::new());
+            }
             return Err(TranscriptionError::Cancelled);
         }
 
         let context = Arc::new(context);
         *slot = Some(context.clone());
+        if let Some(stage) = loading.take() {
+            stage.finish("completed", telemetry::Fields::new());
+        }
         Ok(context)
     }
 }
@@ -151,58 +212,93 @@ impl Transcriber for WhisperTranscriber {
         &self,
         audio: CapturedAudio,
         cancelled: Arc<AtomicBool>,
+        kind: TranscriptionKind,
+        interaction: Option<&Interaction>,
     ) -> Result<String, TranscriptionError> {
-        let context = self.context(&cancelled)?;
-        if cancelled.load(Ordering::Acquire) {
-            return Err(TranscriptionError::Cancelled);
-        }
-
-        let mut state = context.create_state().map_err(|error| {
-            TranscriptionError::Failed(format!("could not create local recognition state: {error}"))
-        })?;
-        let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        parameters.set_language(Some("en"));
-        parameters.set_translate(false);
-        parameters.set_no_context(true);
-        parameters.set_no_timestamps(true);
-        parameters.set_print_progress(false);
-        parameters.set_print_realtime(false);
-        parameters.set_print_timestamps(false);
-        let threads = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get().min(4) as i32)
-            .unwrap_or(1);
-        parameters.set_n_threads(threads);
-
-        install_cancellation_callback(&mut parameters, &cancelled);
-        state.full(parameters, audio.samples()).map_err(|error| {
+        let audio_samples = audio.samples().len();
+        let recognition = interaction.map(|interaction| {
+            interaction.stage(
+                kind.operation(),
+                telemetry::fields([
+                    ("transcription_kind", serde_json::json!(kind.label())),
+                    ("input_samples", serde_json::json!(audio_samples)),
+                    (
+                        "input_audio_duration_ms",
+                        serde_json::json!((audio_samples as u64).saturating_mul(1_000) / 16_000),
+                    ),
+                ]),
+            )
+        });
+        let result = (|| {
+            let context = self.context(&cancelled, interaction)?;
             if cancelled.load(Ordering::Acquire) {
-                TranscriptionError::Cancelled
-            } else {
-                TranscriptionError::Failed(format!("local transcription failed: {error}"))
+                return Err(TranscriptionError::Cancelled);
             }
-        })?;
 
-        if cancelled.load(Ordering::Acquire) {
-            return Err(TranscriptionError::Cancelled);
-        }
-
-        let mut text = String::new();
-        for segment in state.as_iter() {
-            let segment = segment.to_str().map_err(|error| {
+            let mut state = context.create_state().map_err(|error| {
                 TranscriptionError::Failed(format!(
-                    "local transcription returned invalid text: {error}"
+                    "could not create local recognition state: {error}"
                 ))
             })?;
-            text.push_str(segment);
-        }
-        let text = text.trim().to_owned();
-        if text.is_empty() {
-            return Err(TranscriptionError::Failed(
-                "local transcription returned no text".into(),
-            ));
-        }
+            let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            parameters.set_language(Some("en"));
+            parameters.set_translate(false);
+            parameters.set_no_context(true);
+            parameters.set_no_timestamps(true);
+            parameters.set_print_progress(false);
+            parameters.set_print_realtime(false);
+            parameters.set_print_timestamps(false);
+            let threads = std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().min(4) as i32)
+                .unwrap_or(1);
+            parameters.set_n_threads(threads);
 
-        Ok(text)
+            install_cancellation_callback(&mut parameters, &cancelled);
+            state.full(parameters, audio.samples()).map_err(|error| {
+                if cancelled.load(Ordering::Acquire) {
+                    TranscriptionError::Cancelled
+                } else {
+                    TranscriptionError::Failed(format!("local transcription failed: {error}"))
+                }
+            })?;
+
+            if cancelled.load(Ordering::Acquire) {
+                return Err(TranscriptionError::Cancelled);
+            }
+
+            let mut text = String::new();
+            for segment in state.as_iter() {
+                let segment = segment.to_str().map_err(|error| {
+                    TranscriptionError::Failed(format!(
+                        "local transcription returned invalid text: {error}"
+                    ))
+                })?;
+                text.push_str(segment);
+            }
+            let text = text.trim().to_owned();
+            if text.is_empty() {
+                return Err(TranscriptionError::Failed(
+                    "local transcription returned no text".into(),
+                ));
+            }
+
+            Ok(text)
+        })();
+        if let Some(stage) = recognition {
+            let (outcome, fields) = match &result {
+                Ok(_) => ("completed", telemetry::Fields::new()),
+                Err(TranscriptionError::Cancelled) => ("cancelled", telemetry::Fields::new()),
+                Err(TranscriptionError::Failed(_)) => (
+                    "failed",
+                    telemetry::fields([(
+                        "failure_class",
+                        serde_json::json!("recognition_failure"),
+                    )]),
+                ),
+            };
+            stage.finish(outcome, fields);
+        }
+        result
     }
 }
 
@@ -219,8 +315,8 @@ mod tests {
     use crate::protocol::CapturedAudio;
 
     use super::{
-        Transcriber, TranscriptionError, WhisperTranscriber, cancellation_callback_data,
-        transcription_cancelled_callback,
+        Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber,
+        cancellation_callback_data, transcription_cancelled_callback,
     };
 
     #[test]
@@ -243,6 +339,8 @@ mod tests {
             transcriber.transcribe(
                 CapturedAudio::new(vec![0.1; 160]),
                 Arc::new(AtomicBool::new(false)),
+                TranscriptionKind::Final,
+                None,
             ),
             Err(TranscriptionError::Failed(message)) if message.contains("missing")
         ));
@@ -255,6 +353,8 @@ mod tests {
             transcriber.transcribe(
                 CapturedAudio::new(vec![0.1; 160]),
                 Arc::new(AtomicBool::new(true)),
+                TranscriptionKind::Final,
+                None,
             ),
             Err(TranscriptionError::Cancelled)
         ));
@@ -278,6 +378,8 @@ mod tests {
             let result = transcriber.transcribe(
                 CapturedAudio::new(vec![0.0; 16_000 * 2]),
                 Arc::new(AtomicBool::new(false)),
+                TranscriptionKind::Final,
+                None,
             );
             let completed_without_native_failure = match &result {
                 Ok(_) => true,

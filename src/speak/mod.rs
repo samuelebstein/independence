@@ -14,6 +14,7 @@ use std::{
 
 use tracing::{error, info, warn};
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::protocol::{DictationOutput, Output};
 
@@ -77,11 +78,19 @@ static LOGGING: Once = Once::new();
 /// relying on `println!`'s normal line-buffered behavior.
 pub fn init_logging() {
     LOGGING.call_once(|| {
-        tracing_subscriber::fmt()
+        let terminal = tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_target(true)
             .with_level(true)
-            .with_writer(TerminalMakeWriter)
+            .with_writer(TerminalMakeWriter);
+        // Telemetry's custom JSONL sink is deliberately separate from this
+        // layer: readable dialogue logs intentionally contain text, while
+        // exported machine records never do.
+        let otel = tracing_opentelemetry::layer()
+            .with_tracer(opentelemetry::global::tracer("independence"));
+        tracing_subscriber::registry()
+            .with(terminal)
+            .with(otel)
             .init();
     });
 }

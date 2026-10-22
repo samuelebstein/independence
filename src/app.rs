@@ -5,7 +5,7 @@
 //! controller-approved output.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io,
     sync::{
         Arc,
@@ -32,6 +32,7 @@ use crate::{
         camera::{CameraRunError, CameraService, select_camera},
     },
     speak,
+    telemetry::{self, Interaction},
     think::{OllamaClient, ThinkError},
 };
 
@@ -41,26 +42,74 @@ const PARTIAL_TRANSCRIPTION_INTERVAL: Duration = Duration::from_millis(750);
 const MAX_QUEUED_PHOTO_CAPTURES: usize = 32;
 const MAX_DRAFT_PHOTO_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum OutputMode<'a> {
     Line,
-    Voice(&'a speak::SpeechHandle),
+    Voice {
+        speech: &'a speak::SpeechHandle,
+        interaction: Option<Interaction>,
+    },
+}
+
+/// What a controller-authorized answer did at the terminal/speech boundary.
+///
+/// Accepting answer text and successfully delivering it through Piper are
+/// separate facts. The controller owns the former; `VoiceRuntime` observes
+/// the latter through the speech worker's completion event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnswerSpeechEmission {
+    None,
+    Queued(speak::UtteranceId),
+    Unavailable,
 }
 
 impl OutputMode<'_> {
-    fn emit(self, output: crate::protocol::Output, speech_owner: speak::SpeechOwner) {
+    fn emit(
+        &self,
+        output: crate::protocol::Output,
+        speech_owner: speak::SpeechOwner,
+    ) -> AnswerSpeechEmission {
         match self {
-            Self::Line => speak::emit(output),
-            Self::Voice(speech) => match output {
+            Self::Line => {
+                speak::emit(output);
+                AnswerSpeechEmission::None
+            }
+            Self::Voice {
+                speech,
+                interaction,
+            } => match output {
                 crate::protocol::Output::Answer(answer) => {
                     // The same authorized text is logged before it is sent to
                     // the asynchronous worker. The worker cannot create or
                     // print dialogue on its own.
                     speak::independence_says(&answer);
-                    let _ = speech.say(speech_owner, answer);
+                    match speech.say_with_interaction(speech_owner, answer, interaction.clone()) {
+                        Some(utterance_id) => AnswerSpeechEmission::Queued(utterance_id),
+                        None => AnswerSpeechEmission::Unavailable,
+                    }
                 }
-                output => speak::emit(output),
+                output => {
+                    speak::emit(output);
+                    AnswerSpeechEmission::None
+                }
             },
+        }
+    }
+}
+
+/// The only extra fact the shared controller loop needs to give voice mode:
+/// an accepted answer reached the terminal, but its spoken delivery has not
+/// yet reached a terminal outcome.
+struct MainEventResult {
+    keep_running: bool,
+    pending_answer_speech: Option<(speak::UtteranceId, Interaction)>,
+}
+
+impl MainEventResult {
+    fn continue_without_speech() -> Self {
+        Self {
+            keep_running: true,
+            pending_answer_speech: None,
         }
     }
 }
@@ -81,7 +130,10 @@ pub async fn run() -> Result<(), AppError> {
             event = event_receiver.recv() => event.unwrap_or(Event::Input(Input::EndOfInput)),
         };
 
-        if !apply_main_event(&mut controller, &mut runtime, event, OutputMode::Line).await {
+        if !apply_main_event(&mut controller, &mut runtime, event, OutputMode::Line)
+            .await
+            .keep_running
+        {
             break;
         }
     }
@@ -246,7 +298,18 @@ async fn apply_main_event(
     runtime: &mut TurnRuntime,
     event: Event,
     output_mode: OutputMode<'_>,
-) -> bool {
+) -> MainEventResult {
+    let completed_turn = match &event {
+        Event::TurnFinished(finished) => Some((
+            runtime.active_interaction(finished.id),
+            match &finished.result {
+                TurnResult::Answer { .. } => "answer_returned",
+                TurnResult::Failed { .. } => "failed",
+                TurnResult::Cancelled => "cancelled",
+            },
+        )),
+        _ => None,
+    };
     let speech_owner = match &event {
         Event::TurnFinished(finished) => speak::SpeechOwner::Turn(finished.id),
         _ => speak::SpeechOwner::System,
@@ -255,12 +318,63 @@ async fn apply_main_event(
         runtime.retire(finished.id).await;
     }
 
-    for effect in controller.handle(event) {
-        if !runtime.apply(effect, output_mode, speech_owner).await {
-            return false;
+    let effects = controller.handle(event);
+    let accepted_answer = effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Display(crate::protocol::Output::Answer(_))));
+    let mut answer_speech = AnswerSpeechEmission::None;
+    for effect in effects {
+        let result = runtime
+            .apply(effect, output_mode.clone(), speech_owner)
+            .await;
+        if !result.keep_running {
+            return MainEventResult {
+                keep_running: false,
+                pending_answer_speech: None,
+            };
+        }
+        if result.answer_speech != AnswerSpeechEmission::None {
+            answer_speech = result.answer_speech;
         }
     }
-    true
+    let mut result = MainEventResult::continue_without_speech();
+    if let Some((Some(interaction), worker_outcome)) = completed_turn {
+        match (worker_outcome, accepted_answer) {
+            ("answer_returned", true) => {
+                interaction.mark("controller.answer_accepted");
+                match answer_speech {
+                    AnswerSpeechEmission::Queued(utterance_id) => {
+                        // Wait for the worker's specific final outcome. The
+                        // terminal text is already accepted, but playback is
+                        // still independently observable and may fail.
+                        result.pending_answer_speech = Some((utterance_id, interaction));
+                    }
+                    AnswerSpeechEmission::Unavailable => {
+                        interaction.event(
+                            "speech.final_answer",
+                            "queue_unavailable",
+                            telemetry::Fields::new(),
+                        );
+                        interaction
+                            .complete("accepted_text_speech_unavailable", telemetry::Fields::new());
+                    }
+                    AnswerSpeechEmission::None => {
+                        interaction.complete("accepted_text", telemetry::Fields::new());
+                    }
+                }
+            }
+            ("answer_returned", false) => {
+                interaction.complete(
+                    "rejected",
+                    telemetry::fields([("rejection_stage", serde_json::json!("controller"))]),
+                );
+            }
+            ("failed", _) => interaction.complete("failed", telemetry::Fields::new()),
+            ("cancelled", _) => interaction.complete("cancelled", telemetry::Fields::new()),
+            _ => {}
+        }
+    }
+    result
 }
 
 struct TurnRuntime {
@@ -268,12 +382,33 @@ struct TurnRuntime {
     camera: CameraService,
     event_sender: mpsc::Sender<Event>,
     active: Option<RunningTurn>,
+    pending_interaction: Option<Interaction>,
+    /// Cancellation returns control immediately, but an already-running
+    /// bounded V4L2 closure can still own the camera gate. These background
+    /// monitors finish telemetry only after that app-owned resource is idle;
+    /// shutdown joins them so they cannot outlive the application.
+    cleanup_tasks: Vec<JoinHandle<()>>,
 }
 
 struct RunningTurn {
     id: TurnId,
     cancellation: CancellationToken,
     handle: JoinHandle<()>,
+    interaction: Interaction,
+}
+
+struct RuntimeEffectResult {
+    keep_running: bool,
+    answer_speech: AnswerSpeechEmission,
+}
+
+impl RuntimeEffectResult {
+    fn continued() -> Self {
+        Self {
+            keep_running: true,
+            answer_speech: AnswerSpeechEmission::None,
+        }
+    }
 }
 
 impl TurnRuntime {
@@ -283,7 +418,25 @@ impl TurnRuntime {
             camera,
             event_sender,
             active: None,
+            pending_interaction: None,
+            cleanup_tasks: Vec::new(),
         }
+    }
+
+    /// Supplies the correlation created at a voice Enter press. The next
+    /// controller-authorized `StartTurn` consumes it; typed turns create their
+    /// timeline at dispatch instead.
+    fn set_pending_interaction(&mut self, interaction: Interaction) {
+        if let Some(previous) = self.pending_interaction.replace(interaction) {
+            previous.complete("superseded_before_dispatch", telemetry::Fields::new());
+        }
+    }
+
+    fn active_interaction(&self, id: TurnId) -> Option<Interaction> {
+        self.active
+            .as_ref()
+            .filter(|active| active.id == id)
+            .map(|active| active.interaction.clone())
     }
 
     async fn apply(
@@ -291,20 +444,28 @@ impl TurnRuntime {
         effect: Effect,
         output_mode: OutputMode<'_>,
         speech_owner: speak::SpeechOwner,
-    ) -> bool {
+    ) -> RuntimeEffectResult {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
-            Effect::Display(output) => output_mode.emit(output, speech_owner),
+            Effect::Display(output) => {
+                return RuntimeEffectResult {
+                    keep_running: true,
+                    answer_speech: output_mode.emit(output, speech_owner),
+                };
+            }
             Effect::Exit => {
                 self.shutdown().await;
-                return false;
+                return RuntimeEffectResult {
+                    keep_running: false,
+                    answer_speech: AnswerSpeechEmission::None,
+                };
             }
         }
 
-        true
+        RuntimeEffectResult::continued()
     }
 
     async fn start(&mut self, request: TurnRequest) {
@@ -316,18 +477,30 @@ impl TurnRuntime {
         self.stop_active_turn().await;
 
         let id = request.id;
+        let interaction = self
+            .pending_interaction
+            .take()
+            .unwrap_or_else(|| telemetry::start_interaction("typed", None));
+        interaction.bind_turn(id);
+        interaction.set_photo_count(match &request.visual {
+            VisualRequest::UseAccepted(photos) => photos.len(),
+            VisualRequest::ProposeNew(_) | VisualRequest::ProposeCamera(_) => 1,
+        });
+        interaction.mark("turn.request_dispatched");
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let client = self.client.clone();
         let camera = self.camera.clone();
         let event_sender = self.event_sender.clone();
+        let worker_interaction = interaction.clone();
         let handle = tokio::spawn(async move {
-            let result = run_turn(
+            let result = run_turn_with_interaction(
                 client,
                 camera,
                 event_sender.clone(),
                 request,
                 worker_cancellation.clone(),
+                worker_interaction,
             )
             .await;
 
@@ -345,6 +518,7 @@ impl TurnRuntime {
             id,
             cancellation,
             handle,
+            interaction,
         });
     }
 
@@ -384,17 +558,43 @@ impl TurnRuntime {
     }
 
     async fn stop_active_turn(&mut self) {
+        self.reap_finished_cleanup_tasks().await;
         let RunningTurn {
             cancellation,
             handle,
+            interaction,
             ..
         } = match self.active.take() {
             Some(active) => active,
             None => return,
         };
+        interaction.mark("cancellation.requested");
+        let cleanup = interaction.stage("interaction.local_cleanup", telemetry::Fields::new());
         cancellation.cancel();
         handle.abort();
         let _ = handle.await;
+        let camera = self.camera.clone();
+        let cleanup_interaction = interaction.clone();
+        self.cleanup_tasks.push(tokio::spawn(async move {
+            // This waits only for Independence's local camera gate. It does
+            // not claim to wait for Ollama's independent server-side work.
+            camera.wait_for_idle().await;
+            cleanup.finish("completed", telemetry::Fields::new());
+            cleanup_interaction.mark("cancellation.local_cleanup_completed");
+            cleanup_interaction.complete("cancelled", telemetry::Fields::new());
+        }));
+    }
+
+    async fn reap_finished_cleanup_tasks(&mut self) {
+        let mut active = Vec::with_capacity(self.cleanup_tasks.len());
+        for task in std::mem::take(&mut self.cleanup_tasks) {
+            if task.is_finished() {
+                let _ = task.await;
+            } else {
+                active.push(task);
+            }
+        }
+        self.cleanup_tasks = active;
     }
 
     async fn retire(&mut self, id: TurnId) {
@@ -415,6 +615,9 @@ impl TurnRuntime {
         // async task. It still owns this gate until V4L2 has released its
         // buffers and device handle, so wait before process shutdown.
         self.camera.wait_for_idle().await;
+        for task in std::mem::take(&mut self.cleanup_tasks) {
+            let _ = task.await;
+        }
     }
 }
 
@@ -442,6 +645,12 @@ struct VoiceRuntime {
     active_photo_capture: Option<(u64, u64)>,
     live_transcription: Option<LiveTranscription>,
     pending_snapshot: Option<(RecordingId, CapturedAudio)>,
+    cancelled_recordings: HashMap<RecordingId, Interaction>,
+    /// Accepted text answers whose matching Piper request still has to report
+    /// playback. This is deliberately keyed by worker utterance ID, rather
+    /// than by the current draft or turn, because a new draft may begin after
+    /// text acceptance while old audio is being cancelled.
+    pending_answer_speech: HashMap<speak::UtteranceId, Interaction>,
     next_draft_id: u64,
     next_partial_sequence: u64,
 }
@@ -461,6 +670,7 @@ struct VoiceDraft {
     last_partial_error: Option<String>,
     final_transcript: Option<String>,
     submitted: bool,
+    interaction: Interaction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,6 +681,8 @@ struct PendingListeningCue {
 
 impl VoiceDraft {
     fn new(id: u64) -> Self {
+        let interaction = telemetry::start_interaction("voice", Some(id));
+        interaction.mark("voice.enter_pressed");
         Self {
             id,
             recording_id: None,
@@ -486,6 +698,7 @@ impl VoiceDraft {
             last_partial_error: None,
             final_transcript: None,
             submitted: false,
+            interaction,
         }
     }
 
@@ -560,20 +773,33 @@ impl VoiceRuntime {
             active_photo_capture: None,
             live_transcription: None,
             pending_snapshot: None,
+            cancelled_recordings: HashMap::new(),
+            pending_answer_speech: HashMap::new(),
             next_draft_id: 1,
             next_partial_sequence: 1,
         }
     }
 
     async fn handle_main_event(&mut self, event: Event) -> bool {
+        let interaction = match &event {
+            Event::TurnFinished(finished) => self.turns.active_interaction(finished.id),
+            _ => None,
+        };
         let speech = self.speech.handle();
-        apply_main_event(
+        let result = apply_main_event(
             &mut self.controller,
             &mut self.turns,
             event,
-            OutputMode::Voice(&speech),
+            OutputMode::Voice {
+                speech: &speech,
+                interaction,
+            },
         )
-        .await
+        .await;
+        if let Some((utterance_id, interaction)) = result.pending_answer_speech {
+            self.pending_answer_speech.insert(utterance_id, interaction);
+        }
+        result.keep_running
     }
 
     async fn handle_dictation_event(&mut self, event: DictationEvent) -> bool {
@@ -596,7 +822,7 @@ impl VoiceRuntime {
             return true;
         }
 
-        match &event {
+        let terminal_recording = match &event {
             DictationEvent::RecordingSnapshot { .. } => {
                 unreachable!("recording snapshots return before dictation handling")
             }
@@ -617,9 +843,16 @@ impl VoiceRuntime {
                 } else {
                     self.release_draft();
                 }
+                None
             }
-            DictationEvent::Input(DictationInput::HoldEnd) => self.release_draft(),
-            DictationEvent::Input(DictationInput::Photo) => self.request_photo().await,
+            DictationEvent::Input(DictationInput::HoldEnd) => {
+                self.release_draft();
+                None
+            }
+            DictationEvent::Input(DictationInput::Photo) => {
+                self.request_photo().await;
+                None
+            }
             DictationEvent::Input(DictationInput::Escape) => {
                 self.cancel_draft();
                 self.speech.handle().cancel_all("escape");
@@ -627,36 +860,49 @@ impl VoiceRuntime {
                     return false;
                 }
                 speak::voice_log("draft cancelled");
+                None
             }
             DictationEvent::Input(DictationInput::Interrupt | DictationInput::EndOfInput) => {
                 self.cancel_draft();
                 self.speech.handle().cancel_all("input_ended");
+                None
             }
             DictationEvent::RecordingStarted { recording_id } => {
                 if let Some(draft) = self.draft.as_mut()
                     && draft.recording_id == Some(*recording_id)
                 {
                     draft.recording_started = true;
+                    draft.interaction.bind_recording(*recording_id);
+                    draft.interaction.mark("microphone.recording_started_event");
                     speak::process(
                         "microphone_capture_started",
                         format!("draft_id={} recording_id={recording_id:?}", draft.id),
                     );
                 }
+                None
             }
             DictationEvent::RecordingCancelled { recording_id }
-            | DictationEvent::RecordingFailed { recording_id, .. }
-            | DictationEvent::TranscriptionCancelled { recording_id }
+            | DictationEvent::TranscriptionCancelled { recording_id } => {
+                if self.draft_matches_recording(*recording_id) {
+                    self.cancel_draft();
+                    self.speech.handle().cancel_all("dictation_failed");
+                }
+                Some((*recording_id, "cancelled"))
+            }
+            DictationEvent::RecordingFailed { recording_id, .. }
             | DictationEvent::TranscriptionFailed { recording_id, .. } => {
                 if self.draft_matches_recording(*recording_id) {
                     self.cancel_draft();
                     self.speech.handle().cancel_all("dictation_failed");
                 }
+                Some((*recording_id, "failed"))
             }
             DictationEvent::TranscriptReady { recording_id, text }
                 if text.trim().is_empty() && self.draft_matches_recording(*recording_id) =>
             {
                 self.cancel_draft();
                 self.speech.handle().cancel_all("empty_transcript");
+                Some((*recording_id, "failed"))
             }
             DictationEvent::RecordingLimitReached { recording_id }
                 if self.draft_matches_recording(*recording_id) =>
@@ -664,17 +910,30 @@ impl VoiceRuntime {
                 // The bounded capture owner ended this hold. Treat that as a
                 // release so its authoritative final transcript can submit.
                 self.release_draft();
+                None
+            }
+            DictationEvent::RecordingFinished { recording_id, .. }
+                if self.draft_matches_recording(*recording_id) =>
+            {
+                if let Some(draft) = self.draft.as_ref() {
+                    draft.interaction.mark("microphone.recording_finished");
+                }
+                None
             }
             DictationEvent::RecordingFinished { .. }
             | DictationEvent::RecordingElapsed { .. }
             | DictationEvent::RecordingLimitReached { .. }
-            | DictationEvent::TranscriptReady { .. } => {}
-        }
+            | DictationEvent::TranscriptReady { .. } => None,
+        };
 
         for action in self.dictation.handle(event).await {
             if !self.handle_dictation_action(action).await {
                 return false;
             }
+        }
+
+        if let Some((recording_id, outcome)) = terminal_recording {
+            self.complete_pending_recording(recording_id, outcome);
         }
 
         true
@@ -702,6 +961,7 @@ impl VoiceRuntime {
 
                 speak::user_transcript("final", &text);
                 if let Some(draft) = self.draft.as_mut() {
+                    draft.interaction.mark("whisper.final_transcript_accepted");
                     draft.final_transcript = Some(text);
                 }
                 return self.try_submit().await;
@@ -735,6 +995,9 @@ impl VoiceRuntime {
                 // already released. Speaking now avoids recording our cue.
                 speak::voice_log("microphone released; finishing local transcription");
                 if let Some(draft) = self.draft.as_ref() {
+                    draft
+                        .interaction
+                        .mark("whisper.final_transcription_started");
                     let _ = self.say(speak::SpeechOwner::Draft(draft.id), "i'm thinking");
                 }
             }
@@ -764,6 +1027,9 @@ impl VoiceRuntime {
             .checked_add(1)
             .expect("voice draft identifiers exhausted");
         self.draft = Some(VoiceDraft::new(id));
+        if let Some(draft) = self.draft.as_ref() {
+            draft.interaction.mark("speech.listening_cue_queued");
+        }
 
         match self.say(speak::SpeechOwner::Draft(id), "i'm listening") {
             Some(utterance_id) => {
@@ -790,13 +1056,59 @@ impl VoiceRuntime {
     /// fixed interaction cues owned by this runtime.
     fn say(&self, owner: speak::SpeechOwner, text: &'static str) -> Option<speak::UtteranceId> {
         speak::independence_says(text);
-        self.speech.handle().say(owner, text)
+        let interaction = match owner {
+            speak::SpeechOwner::Draft(draft_id) => self
+                .draft
+                .as_ref()
+                .filter(|draft| draft.id == draft_id)
+                .map(|draft| draft.interaction.clone()),
+            speak::SpeechOwner::Turn(turn_id) => self.turns.active_interaction(turn_id),
+            speak::SpeechOwner::System => None,
+        };
+        self.speech
+            .handle()
+            .say_with_interaction(owner, text, interaction)
     }
 
     /// Handles a worker fact, rather than allowing the speech worker to
     /// manipulate microphone state directly. Only the exact listening cue for
     /// the currently-held draft may open capture.
     async fn handle_speech_event(&mut self, event: speak::SpeechEvent) -> bool {
+        if let Some(interaction) = self.pending_answer_speech.remove(&event.utterance_id) {
+            // The controller has already accepted and displayed the answer.
+            // This terminal worker fact only finishes its independently
+            // correlated speech-delivery outcome; it cannot alter history.
+            match event.outcome {
+                speak::SpeechOutcome::Played => {
+                    interaction.mark("speech.final_answer.playback_completed");
+                    interaction.complete("accepted_text_spoken", telemetry::Fields::new());
+                }
+                speak::SpeechOutcome::SynthesisFailed | speak::SpeechOutcome::PlaybackFailed => {
+                    interaction.event(
+                        "speech.final_answer",
+                        "failed",
+                        telemetry::fields([(
+                            "delivery_stage",
+                            serde_json::json!(match event.outcome {
+                                speak::SpeechOutcome::SynthesisFailed => "synthesis",
+                                speak::SpeechOutcome::PlaybackFailed => "playback",
+                                speak::SpeechOutcome::Played | speak::SpeechOutcome::Cancelled => {
+                                    unreachable!("the surrounding match excluded this outcome")
+                                }
+                            }),
+                        )]),
+                    );
+                    interaction.complete("accepted_text_speech_failed", telemetry::Fields::new());
+                }
+                speak::SpeechOutcome::Cancelled => {
+                    interaction.mark("speech.final_answer.cleanup_completed");
+                    interaction
+                        .complete("accepted_text_speech_cancelled", telemetry::Fields::new());
+                }
+            }
+            return true;
+        }
+
         let Some(pending) = self.pending_listening_cue else {
             return true;
         };
@@ -854,6 +1166,12 @@ impl VoiceRuntime {
             return true;
         }
 
+        if let Some(draft) = self.draft.as_ref() {
+            draft.interaction.mark("speech.listening_cue_completed");
+            self.dictation
+                .set_pending_interaction(draft.interaction.clone());
+        }
+
         for action in self
             .dictation
             .handle(DictationEvent::Input(DictationInput::HoldStart))
@@ -892,6 +1210,9 @@ impl VoiceRuntime {
         };
 
         if should_announce {
+            if let Some(draft) = self.draft.as_ref() {
+                draft.interaction.mark("voice.enter_released");
+            }
             self.cancel_live_transcription();
             // The thinking cue is deliberately delayed until DictationOutput::
             // Transcribing, after the microphone has actually been released.
@@ -927,6 +1248,11 @@ impl VoiceRuntime {
                 .checked_add(1)
                 .expect("voice photo request identifiers exhausted");
             draft.photos.insert(request_id, DraftPhoto::Queued);
+            draft.interaction.event(
+                "photo.request",
+                "queued",
+                telemetry::fields([("draft_photo_id", serde_json::json!(request_id))]),
+            );
             true
         };
 
@@ -950,9 +1276,14 @@ impl VoiceRuntime {
                 .photos
                 .get_mut(&request_id)
                 .expect("queued photo request was just found") = DraftPhoto::Capturing;
-            Some((draft.id, request_id, draft.cancellation.clone()))
+            Some((
+                draft.id,
+                request_id,
+                draft.cancellation.clone(),
+                draft.interaction.clone(),
+            ))
         });
-        let Some((draft_id, request_id, cancellation)) = request else {
+        let Some((draft_id, request_id, cancellation, interaction)) = request else {
             return;
         };
 
@@ -963,7 +1294,10 @@ impl VoiceRuntime {
             let result = match camera_service.list().await {
                 Ok(cameras) => match select_camera(&cameras, None) {
                     Ok(camera) => {
-                        match camera_service.capture(camera, cancellation.clone()).await {
+                        match camera_service
+                            .capture_with_telemetry(camera, cancellation.clone(), Some(interaction))
+                            .await
+                        {
                             Ok(photo) => Ok(photo),
                             Err(CameraRunError::Cancelled) => return,
                             Err(CameraRunError::Failed(error)) => Err(error.to_string()),
@@ -1040,10 +1374,27 @@ impl VoiceRuntime {
         let worker_cancelled = cancelled.clone();
         let transcriber: Arc<dyn Transcriber> = self.dictation.transcriber();
         let event_sender = self.aux_sender.clone();
+        let interaction = self.draft.as_ref().and_then(|draft| {
+            (draft.recording_id == Some(recording_id)).then(|| draft.interaction.clone())
+        });
+        let queued_at = std::time::Instant::now();
+        let in_flight = interaction
+            .as_ref()
+            .map(|interaction| interaction.in_flight_guard("whisper"));
         let handle = tokio::spawn(async move {
+            let _in_flight = in_flight;
             let recognition_cancelled = worker_cancelled.clone();
+            let worker_interaction = interaction.clone();
             let result = tokio::task::spawn_blocking(move || {
-                transcriber.transcribe(audio, recognition_cancelled)
+                if let Some(interaction) = &worker_interaction {
+                    interaction.queue_wait("whisper", queued_at.elapsed(), 0, 1);
+                }
+                transcriber.transcribe(
+                    audio,
+                    recognition_cancelled,
+                    crate::dictation::transcribe::TranscriptionKind::Partial,
+                    worker_interaction.as_ref(),
+                )
             })
             .await;
             if worker_cancelled.load(Ordering::Acquire) {
@@ -1218,9 +1569,10 @@ impl VoiceRuntime {
                     .clone()
                     .expect("transcript was checked"),
                 draft.captured_photos(),
+                draft.interaction.clone(),
             ))
         });
-        let Some((transcript, photos)) = submission else {
+        let Some((transcript, photos, interaction)) = submission else {
             return true;
         };
 
@@ -1233,6 +1585,7 @@ impl VoiceRuntime {
                 photos,
             }
         };
+        self.turns.set_pending_interaction(interaction);
         self.draft = None;
         self.handle_main_event(Event::Input(input)).await
     }
@@ -1257,6 +1610,32 @@ impl VoiceRuntime {
         self.active_photo_capture = None;
         if let Some(draft) = self.draft.take() {
             draft.cancellation.cancel();
+            draft.interaction.mark("cancellation.requested");
+            if let Some(recording_id) = draft.recording_id {
+                self.cancelled_recordings
+                    .insert(recording_id, draft.interaction);
+            } else {
+                // A cue-only draft has no microphone/Whisper handle to wait
+                // for. Its local cleanup is complete once the generation was
+                // invalidated above.
+                draft
+                    .interaction
+                    .mark("cancellation.local_cleanup_completed");
+                draft
+                    .interaction
+                    .complete("cancelled", telemetry::Fields::new());
+            }
+        }
+    }
+
+    fn complete_pending_recording(&mut self, recording_id: RecordingId, outcome: &'static str) {
+        if let Some(interaction) = self.cancelled_recordings.remove(&recording_id) {
+            if outcome == "cancelled" {
+                interaction.mark("cancellation.local_cleanup_completed");
+            } else {
+                interaction.mark("dictation.cleanup_completed_after_failure");
+            }
+            interaction.complete(outcome, telemetry::Fields::new());
         }
     }
 
@@ -1264,17 +1643,50 @@ impl VoiceRuntime {
         self.speech.handle().cancel_all("voice_shutdown");
         self.cancel_draft();
         self.dictation.shutdown().await;
+        for (_, interaction) in self.cancelled_recordings.drain() {
+            interaction.mark("cancellation.local_cleanup_completed");
+            interaction.complete("cancelled", telemetry::Fields::new());
+        }
         self.turns.shutdown().await;
         self.speech.shutdown();
+        // The worker is joined above, so any remaining final-answer request
+        // has completed its local cancellation cleanup even though the event
+        // loop is no longer running to receive its `SpeechEvent`.
+        for (_, interaction) in self.pending_answer_speech.drain() {
+            interaction.mark("speech.final_answer.cleanup_completed");
+            interaction.complete("accepted_text_speech_cancelled", telemetry::Fields::new());
+        }
     }
 }
 
+#[cfg(test)]
 async fn run_turn(
     client: Arc<OllamaClient>,
     camera_service: CameraService,
     event_sender: mpsc::Sender<Event>,
     request: TurnRequest,
     cancellation: CancellationToken,
+) -> TurnResult {
+    let interaction = telemetry::start_interaction("direct", None);
+    interaction.bind_turn(request.id);
+    run_turn_with_interaction(
+        client,
+        camera_service,
+        event_sender,
+        request,
+        cancellation,
+        interaction,
+    )
+    .await
+}
+
+async fn run_turn_with_interaction(
+    client: Arc<OllamaClient>,
+    camera_service: CameraService,
+    event_sender: mpsc::Sender<Event>,
+    request: TurnRequest,
+    cancellation: CancellationToken,
+    interaction: Interaction,
 ) -> TurnResult {
     let TurnRequest {
         id,
@@ -1287,21 +1699,59 @@ async fn run_turn(
     let (images, proposed_scene) = match visual {
         VisualRequest::UseAccepted(photos) => (photos, None),
         VisualRequest::ProposeNew(path) => {
+            interaction.event(
+                "photo.request",
+                "explicit_file_selected",
+                telemetry::Fields::new(),
+            );
+            let mut loading = Some(interaction.stage(
+                "photo.file.load_validate",
+                telemetry::fields([("source", serde_json::json!("explicit_file"))]),
+            ));
             let mut load_task = tokio::task::spawn_blocking(move || Photo::load(path));
             let photo = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
                     load_task.abort();
+                    if let Some(stage) = loading.take() {
+                        stage.finish("cancelled", telemetry::Fields::new());
+                    }
                     return TurnResult::Cancelled;
                 }
                 result = &mut load_task => match result {
-                    Ok(Ok(photo)) => photo,
+                    Ok(Ok(photo)) => {
+                        if let Some(stage) = loading.take() {
+                            stage.finish(
+                                "completed",
+                                telemetry::fields([("encoded_image_bytes", serde_json::json!(photo.bytes().len()))]),
+                            );
+                        }
+                        photo
+                    },
                     Ok(Err(error)) => {
+                        if let Some(stage) = loading.take() {
+                            stage.finish(
+                                "failed",
+                                telemetry::fields([(
+                                    "failure_class",
+                                    serde_json::json!("photo_read_or_validation_failure"),
+                                )]),
+                            );
+                        }
                         return TurnResult::Failed {
                             message: format!("could not use photo: {error}"),
                         };
                     }
                     Err(error) => {
+                        if let Some(stage) = loading.take() {
+                            stage.finish(
+                                "worker_failure",
+                                telemetry::fields([(
+                                    "failure_class",
+                                    serde_json::json!("blocking_worker_failure"),
+                                )]),
+                            );
+                        }
                         return TurnResult::Failed {
                             message: format!("photo loading task ended unexpectedly: {error}"),
                         };
@@ -1316,6 +1766,11 @@ async fn run_turn(
             (vec![photo.clone()], Some(photo))
         }
         VisualRequest::ProposeCamera(camera) => {
+            interaction.event(
+                "photo.request",
+                "camera_capture_requested",
+                telemetry::fields([("camera_id", serde_json::json!(camera.id().to_string()))]),
+            );
             if !send_camera_event(
                 &event_sender,
                 &cancellation,
@@ -1329,7 +1784,10 @@ async fn run_turn(
                 return TurnResult::Cancelled;
             }
 
-            let photo = match camera_service.capture(camera, cancellation.clone()).await {
+            let photo = match camera_service
+                .capture_with_telemetry(camera, cancellation.clone(), Some(interaction.clone()))
+                .await
+            {
                 Ok(photo) => photo,
                 Err(CameraRunError::Cancelled) => return TurnResult::Cancelled,
                 Err(CameraRunError::Failed(error)) => {
@@ -1367,11 +1825,16 @@ async fn run_turn(
     };
 
     let image_bytes = images.iter().map(Photo::bytes).collect::<Vec<_>>();
+    interaction.set_photo_count(image_bytes.len());
+    interaction.mark("ollama.request_dispatch_started");
+    let _ollama_in_flight = interaction.in_flight_guard("ollama");
 
     let answer = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => return TurnResult::Cancelled,
-        answer = client.answer(&history, &question, &image_bytes) => answer,
+        _ = cancellation.cancelled() => {
+            return TurnResult::Cancelled;
+        },
+        answer = client.answer_with_telemetry(&history, &question, &image_bytes, Some(&interaction)) => answer,
     };
 
     if cancellation.is_cancelled() {
@@ -1379,13 +1842,23 @@ async fn run_turn(
     }
 
     match answer {
-        Ok(answer) => TurnResult::Answer {
-            answer,
-            proposed_scene,
-        },
-        Err(error) => TurnResult::Failed {
-            message: format!("local inference failed: {error}"),
-        },
+        Ok(answer) => {
+            interaction.mark("ollama.response_received");
+            TurnResult::Answer {
+                answer: answer.text,
+                proposed_scene,
+            }
+        }
+        Err(error) => {
+            interaction.event(
+                "ollama.request.failed",
+                error.classification(),
+                telemetry::Fields::new(),
+            );
+            TurnResult::Failed {
+                message: format!("local inference failed: {error}"),
+            }
+        }
     }
 }
 
@@ -1565,6 +2038,7 @@ mod tests {
             &self,
             recording_id: RecordingId,
             event_sender: mpsc::Sender<DictationEvent>,
+            _interaction: Option<crate::telemetry::Interaction>,
         ) -> Result<Box<dyn RecordingHandle>, String> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             let _ = event_sender.try_send(DictationEvent::RecordingStarted { recording_id });
@@ -1650,6 +2124,8 @@ mod tests {
             &self,
             _audio: CapturedAudio,
             cancelled: Arc<AtomicBool>,
+            _kind: crate::dictation::transcribe::TranscriptionKind,
+            _interaction: Option<&crate::telemetry::Interaction>,
         ) -> Result<String, TranscriptionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if cancelled.load(Ordering::Acquire) {
@@ -2626,6 +3102,57 @@ mod tests {
         assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 1);
         assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_voice_text_waits_for_its_own_speech_delivery_outcome() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "A spoken answer."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut harness = voice_harness(
+            &server,
+            ["question with a final speech result".to_owned()],
+            unused_camera_service(),
+        );
+        harness.submit_next_transcript().await;
+        let event = harness
+            .main_events
+            .recv()
+            .await
+            .expect("mock Ollama completion");
+        assert!(harness.runtime.handle_main_event(event).await);
+
+        // Text acceptance remains controller-owned and immediate, while a
+        // distinct worker completion keeps the matching spoken outcome tied
+        // to this exact answer rather than a later draft.
+        assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
+        let utterance_id = *harness
+            .runtime
+            .pending_answer_speech
+            .keys()
+            .next()
+            .expect("accepted voice answer queues one speech request");
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id,
+                    owner: SpeechOwner::Turn(TurnId::new(1)),
+                    outcome: SpeechOutcome::PlaybackFailed,
+                })
+                .await
+        );
+        assert!(harness.runtime.pending_answer_speech.is_empty());
+        assert_eq!(harness.runtime.controller.accepted_history().len(), 1);
+        harness.runtime.shutdown().await;
     }
 
     #[tokio::test]

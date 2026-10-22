@@ -13,12 +13,16 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{info, warn};
 
-use crate::protocol::TurnId;
+use crate::{
+    protocol::TurnId,
+    telemetry::{self, Interaction},
+};
 
 use super::{
     playback::{
@@ -68,17 +72,29 @@ pub struct SpeechEvent {
     pub outcome: SpeechOutcome,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SpeechRequest {
     utterance_id: UtteranceId,
     owner: SpeechOwner,
     generation: u64,
     text: String,
+    interaction: Option<Interaction>,
+    enqueued_at: Instant,
+    pending_depth_before: usize,
 }
 
 enum SpeechCommand {
     Speak(SpeechRequest),
     Shutdown,
+}
+
+/// The two queue counters belong together because the worker updates them as
+/// one lifecycle: pending work becomes active work. Passing them as one value
+/// makes that ownership explicit without changing the queue itself.
+#[derive(Clone)]
+struct WorkerQueueMetrics {
+    pending_depth: Arc<AtomicU64>,
+    active_work: Arc<AtomicU64>,
 }
 
 /// Non-blocking application-facing speech control.
@@ -87,23 +103,56 @@ pub struct SpeechHandle {
     sender: SyncSender<SpeechCommand>,
     generation: Arc<AtomicU64>,
     next_utterance_id: Arc<AtomicU64>,
+    pending_depth: Arc<AtomicU64>,
+    active_work: Arc<AtomicU64>,
 }
 
 impl SpeechHandle {
     /// Queues exactly one authorized utterance. The bounded queue protects the
     /// controller when Piper or an audio device is slow.
     pub fn say(&self, owner: SpeechOwner, text: impl Into<String>) -> Option<UtteranceId> {
+        self.say_with_interaction(owner, text, None)
+    }
+
+    /// Queues an authorized utterance with its privacy-preserving interaction
+    /// correlation. The text itself never enters telemetry attributes.
+    pub fn say_with_interaction(
+        &self,
+        owner: SpeechOwner,
+        text: impl Into<String>,
+        interaction: Option<Interaction>,
+    ) -> Option<UtteranceId> {
         let utterance_id = UtteranceId(self.next_utterance_id.fetch_add(1, Ordering::Relaxed));
         let generation = self.generation.load(Ordering::Acquire);
+        let pending_depth_before = self.pending_depth.fetch_add(1, Ordering::AcqRel) as usize;
         let request = SpeechRequest {
             utterance_id,
             owner,
             generation,
             text: text.into(),
+            interaction: interaction.clone(),
+            enqueued_at: Instant::now(),
+            pending_depth_before,
         };
 
         match self.sender.try_send(SpeechCommand::Speak(request)) {
             Ok(()) => {
+                if let Some(interaction) = interaction {
+                    interaction.event(
+                        "speech.queue",
+                        "enqueued",
+                        telemetry::fields([
+                            ("utterance_id", serde_json::json!(utterance_id.value())),
+                            ("pending_depth", serde_json::json!(pending_depth_before + 1)),
+                            ("owner", serde_json::json!(speech_owner_label(owner))),
+                        ]),
+                    );
+                    interaction.queue_state(
+                        "speech",
+                        pending_depth_before + 1,
+                        self.active_work.load(Ordering::Acquire) as usize,
+                    );
+                }
                 info!(
                     target: "speech",
                     event = "queued",
@@ -115,6 +164,15 @@ impl SpeechHandle {
                 Some(utterance_id)
             }
             Err(TrySendError::Full(_)) => {
+                self.pending_depth.fetch_sub(1, Ordering::AcqRel);
+                if let Some(interaction) = interaction {
+                    interaction.event("speech.queue", "full", telemetry::Fields::new());
+                    interaction.queue_state(
+                        "speech",
+                        pending_depth_before,
+                        self.active_work.load(Ordering::Acquire) as usize,
+                    );
+                }
                 warn!(
                     target: "speech",
                     event = "queue_full",
@@ -125,6 +183,15 @@ impl SpeechHandle {
                 None
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.pending_depth.fetch_sub(1, Ordering::AcqRel);
+                if let Some(interaction) = interaction {
+                    interaction.event("speech.queue", "unavailable", telemetry::Fields::new());
+                    interaction.queue_state(
+                        "speech",
+                        pending_depth_before,
+                        self.active_work.load(Ordering::Acquire) as usize,
+                    );
+                }
                 warn!(
                     target: "speech",
                     event = "worker_unavailable",
@@ -192,6 +259,12 @@ impl SpeechService {
             sender,
             generation: generation.clone(),
             next_utterance_id: Arc::new(AtomicU64::new(1)),
+            pending_depth: Arc::new(AtomicU64::new(0)),
+            active_work: Arc::new(AtomicU64::new(0)),
+        };
+        let worker_metrics = WorkerQueueMetrics {
+            pending_depth: handle.pending_depth.clone(),
+            active_work: handle.active_work.clone(),
         };
         let worker = thread::Builder::new()
             .name("independence-speech".to_owned())
@@ -199,6 +272,11 @@ impl SpeechService {
                 let synthesizer = PiperCli::new(piper);
                 let playback = match RodioPlayback::open(&selection) {
                     Ok(playback) => {
+                        telemetry::run_event(
+                            "speech.output.initialize",
+                            "ready",
+                            telemetry::Fields::new(),
+                        );
                         info!(
                             target: "speech",
                             event = "output_selected",
@@ -209,6 +287,11 @@ impl SpeechService {
                         SystemPlayback::Ready(playback)
                     }
                     Err(error) => {
+                        telemetry::run_event(
+                            "speech.output.initialize",
+                            "unavailable",
+                            telemetry::Fields::new(),
+                        );
                         warn!(
                             target: "speech",
                             event = "output_unavailable",
@@ -218,7 +301,14 @@ impl SpeechService {
                         SystemPlayback::Unavailable(error)
                     }
                 };
-                worker_loop(receiver, event_sender, synthesizer, playback, generation);
+                worker_loop_with_metrics(
+                    receiver,
+                    event_sender,
+                    synthesizer,
+                    playback,
+                    generation,
+                    worker_metrics,
+                );
             })?;
 
         Ok(Self {
@@ -243,6 +333,8 @@ impl SpeechService {
             sender,
             generation,
             next_utterance_id: Arc::new(AtomicU64::new(1)),
+            pending_depth: Arc::new(AtomicU64::new(0)),
+            active_work: Arc::new(AtomicU64::new(0)),
         };
         let worker = thread::spawn(move || {
             while let Ok(command) = receiver.recv() {
@@ -302,12 +394,37 @@ impl Playback for SystemPlayback {
     }
 }
 
+#[cfg(test)]
 fn worker_loop<S, P>(
+    receiver: Receiver<SpeechCommand>,
+    event_sender: tokio_mpsc::Sender<SpeechEvent>,
+    synthesizer: S,
+    playback: P,
+    generation: Arc<AtomicU64>,
+) where
+    S: Synthesizer,
+    P: Playback,
+{
+    worker_loop_with_metrics(
+        receiver,
+        event_sender,
+        synthesizer,
+        playback,
+        generation,
+        WorkerQueueMetrics {
+            pending_depth: Arc::new(AtomicU64::new(0)),
+            active_work: Arc::new(AtomicU64::new(0)),
+        },
+    );
+}
+
+fn worker_loop_with_metrics<S, P>(
     receiver: Receiver<SpeechCommand>,
     event_sender: tokio_mpsc::Sender<SpeechEvent>,
     mut synthesizer: S,
     mut playback: P,
     generation: Arc<AtomicU64>,
+    queue_metrics: WorkerQueueMetrics,
 ) where
     S: Synthesizer,
     P: Playback,
@@ -324,6 +441,7 @@ fn worker_loop<S, P>(
                 &mut playback,
                 &generation,
                 &mut fixed_phrase_cache,
+                &queue_metrics,
             ),
         }
     }
@@ -338,16 +456,39 @@ fn process_request<S, P>(
     playback: &mut P,
     generation: &AtomicU64,
     fixed_phrase_cache: &mut HashMap<&'static str, Vec<u8>>,
+    queue_metrics: &WorkerQueueMetrics,
 ) where
     S: Synthesizer,
     P: Playback,
 {
+    queue_metrics.pending_depth.fetch_sub(1, Ordering::AcqRel);
+    queue_metrics.active_work.fetch_add(1, Ordering::AcqRel);
+    if let Some(interaction) = &request.interaction {
+        interaction.queue_wait(
+            "speech",
+            request.enqueued_at.elapsed(),
+            request.pending_depth_before,
+            queue_metrics.active_work.load(Ordering::Acquire) as usize,
+        );
+        interaction.in_flight("speech", 1);
+    }
     if request_is_stale(&request, generation) {
-        finish(event_sender, request, SpeechOutcome::Cancelled);
+        finish(
+            event_sender,
+            request,
+            SpeechOutcome::Cancelled,
+            queue_metrics.active_work.as_ref(),
+        );
         return;
     }
 
     let cache_key = fixed_phrase(&request.text);
+    let synthesis = request.interaction.as_ref().map(|interaction| {
+        interaction.stage(
+            "piper.synthesis",
+            telemetry::fields([("cache_candidate", serde_json::json!(cache_key.is_some()))]),
+        )
+    });
     let audio = if let Some(key) = cache_key
         && let Some(audio) = fixed_phrase_cache.get(key)
     {
@@ -385,6 +526,25 @@ fn process_request<S, P>(
 
     let audio = match audio {
         Ok(SynthesisResult::Audio(audio)) => {
+            if let Some(stage) = synthesis {
+                stage.finish(
+                    if cache_key.is_some() {
+                        "cache_hit"
+                    } else {
+                        "completed"
+                    },
+                    telemetry::fields([
+                        ("generated_audio_bytes", serde_json::json!(audio.len())),
+                        (
+                            "generated_audio_duration_ms",
+                            serde_json::json!(
+                                super::playback::wav_duration(&audio)
+                                    .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                            ),
+                        ),
+                    ]),
+                );
+            }
             info!(
                 target: "speech",
                 event = "synthesis_completed",
@@ -396,6 +556,9 @@ fn process_request<S, P>(
             audio
         }
         Ok(SynthesisResult::Cancelled) => {
+            if let Some(stage) = synthesis {
+                stage.finish("cancelled", telemetry::Fields::new());
+            }
             info!(
                 target: "speech",
                 event = "synthesis_cancelled",
@@ -403,10 +566,21 @@ fn process_request<S, P>(
                 owner = ?request.owner,
                 "speech"
             );
-            finish(event_sender, request, SpeechOutcome::Cancelled);
+            finish(
+                event_sender,
+                request,
+                SpeechOutcome::Cancelled,
+                queue_metrics.active_work.as_ref(),
+            );
             return;
         }
         Err(error) => {
+            if let Some(stage) = synthesis {
+                stage.finish(
+                    "failed",
+                    telemetry::fields([("failure_class", serde_json::json!("subprocess_failure"))]),
+                );
+            }
             warn!(
                 target: "speech",
                 event = "synthesis_failed",
@@ -415,7 +589,12 @@ fn process_request<S, P>(
                 owner = ?request.owner,
                 "speech"
             );
-            finish(event_sender, request, SpeechOutcome::SynthesisFailed);
+            finish(
+                event_sender,
+                request,
+                SpeechOutcome::SynthesisFailed,
+                queue_metrics.active_work.as_ref(),
+            );
             return;
         }
     };
@@ -428,7 +607,12 @@ fn process_request<S, P>(
             owner = ?request.owner,
             "speech"
         );
-        finish(event_sender, request, SpeechOutcome::Cancelled);
+        finish(
+            event_sender,
+            request,
+            SpeechOutcome::Cancelled,
+            queue_metrics.active_work.as_ref(),
+        );
         return;
     }
 
@@ -439,6 +623,18 @@ fn process_request<S, P>(
         owner = ?request.owner,
         "speech"
     );
+    if let Some(interaction) = &request.interaction {
+        // This is the point immediately before the worker asks the playback
+        // backend to start. It measures software dispatch, not sound at ears.
+        interaction.mark("speech.playback_started");
+        if matches!(request.owner, SpeechOwner::Turn(_)) {
+            interaction.mark("final_answer.playback_started");
+        }
+    }
+    let playback_stage = request
+        .interaction
+        .as_ref()
+        .map(|interaction| interaction.stage("speech.playback", telemetry::Fields::new()));
     match playback.play(
         PlaybackRequest {
             utterance_id: request.utterance_id.value(),
@@ -448,6 +644,9 @@ fn process_request<S, P>(
         generation,
     ) {
         Ok(PlaybackResult::Completed) => {
+            if let Some(stage) = playback_stage {
+                stage.finish("completed", telemetry::Fields::new());
+            }
             info!(
                 target: "speech",
                 event = "playback_completed",
@@ -455,9 +654,17 @@ fn process_request<S, P>(
                 owner = ?request.owner,
                 "speech"
             );
-            finish(event_sender, request, SpeechOutcome::Played);
+            finish(
+                event_sender,
+                request,
+                SpeechOutcome::Played,
+                queue_metrics.active_work.as_ref(),
+            );
         }
         Ok(PlaybackResult::Cancelled) => {
+            if let Some(stage) = playback_stage {
+                stage.finish("cancelled", telemetry::Fields::new());
+            }
             info!(
                 target: "speech",
                 event = "playback_cancelled",
@@ -465,9 +672,23 @@ fn process_request<S, P>(
                 owner = ?request.owner,
                 "speech"
             );
-            finish(event_sender, request, SpeechOutcome::Cancelled);
+            finish(
+                event_sender,
+                request,
+                SpeechOutcome::Cancelled,
+                queue_metrics.active_work.as_ref(),
+            );
         }
         Err(error) => {
+            if let Some(stage) = playback_stage {
+                stage.finish(
+                    "failed",
+                    telemetry::fields([(
+                        "failure_class",
+                        serde_json::json!("output_device_failure"),
+                    )]),
+                );
+            }
             warn!(
                 target: "speech",
                 event = "playback_failed",
@@ -476,7 +697,12 @@ fn process_request<S, P>(
                 owner = ?request.owner,
                 "terminal dialogue remains available"
             );
-            finish(event_sender, request, SpeechOutcome::PlaybackFailed);
+            finish(
+                event_sender,
+                request,
+                SpeechOutcome::PlaybackFailed,
+                queue_metrics.active_work.as_ref(),
+            );
         }
     }
 }
@@ -497,7 +723,26 @@ fn finish(
     event_sender: &tokio_mpsc::Sender<SpeechEvent>,
     request: SpeechRequest,
     outcome: SpeechOutcome,
+    active_work: &AtomicU64,
 ) {
+    active_work.fetch_sub(1, Ordering::AcqRel);
+    if let Some(interaction) = &request.interaction {
+        interaction.in_flight("speech", -1);
+        interaction.event(
+            "speech.utterance",
+            speech_outcome_label(outcome),
+            telemetry::fields([
+                (
+                    "utterance_id",
+                    serde_json::json!(request.utterance_id.value()),
+                ),
+                (
+                    "owner",
+                    serde_json::json!(speech_owner_label(request.owner)),
+                ),
+            ]),
+        );
+    }
     let event = SpeechEvent {
         utterance_id: request.utterance_id,
         owner: request.owner,
@@ -513,6 +758,23 @@ fn finish(
     }
 }
 
+fn speech_owner_label(owner: SpeechOwner) -> &'static str {
+    match owner {
+        SpeechOwner::Draft(_) => "draft",
+        SpeechOwner::Turn(_) => "turn",
+        SpeechOwner::System => "system",
+    }
+}
+
+fn speech_outcome_label(outcome: SpeechOutcome) -> &'static str {
+    match outcome {
+        SpeechOutcome::Played => "played",
+        SpeechOutcome::Cancelled => "cancelled",
+        SpeechOutcome::SynthesisFailed => "synthesis_failed",
+        SpeechOutcome::PlaybackFailed => "playback_failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -523,6 +785,7 @@ mod tests {
             mpsc,
         },
         thread,
+        time::Instant,
     };
 
     use tokio::sync::mpsc as tokio_mpsc;
@@ -608,6 +871,9 @@ mod tests {
             owner: SpeechOwner::Draft(id),
             generation,
             text: text.into(),
+            interaction: None,
+            enqueued_at: Instant::now(),
+            pending_depth_before: 0,
         }
     }
 

@@ -5,4 +5,5 @@ pub mod listen;
 pub mod protocol;
 pub mod see;
 pub mod speak;
+pub mod telemetry;
 pub mod think;

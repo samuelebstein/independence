@@ -7,7 +7,10 @@
 
 use std::{
     fmt, io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -25,6 +28,7 @@ use v4l::{
 };
 
 use super::{Photo, PhotoError};
+use crate::telemetry::{self, Interaction};
 
 /// The largest resolution accepted from a camera before allocating capture
 /// buffers. It is intentionally smaller than the general file-photo limit.
@@ -255,6 +259,8 @@ impl CameraBackend for V4lCameraBackend {
 pub(crate) struct CameraService {
     backend: Arc<dyn CameraBackend>,
     capture_gate: Arc<Semaphore>,
+    waiting_captures: Arc<AtomicUsize>,
+    active_captures: Arc<AtomicUsize>,
 }
 
 impl CameraService {
@@ -262,6 +268,8 @@ impl CameraService {
         Self {
             backend: Arc::new(V4lCameraBackend),
             capture_gate: Arc::new(Semaphore::new(1)),
+            waiting_captures: Arc::new(AtomicUsize::new(0)),
+            active_captures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -270,6 +278,8 @@ impl CameraService {
         Self {
             backend,
             capture_gate: Arc::new(Semaphore::new(1)),
+            waiting_captures: Arc::new(AtomicUsize::new(0)),
+            active_captures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -290,15 +300,43 @@ impl CameraService {
     /// Tokio cannot stop a running `spawn_blocking` task. The V4L2 backend's
     /// frame polls are bounded by `CAPTURE_WINDOW`, and the closure owns the
     /// semaphore until it has dropped its stream and device handle.
+    #[cfg(test)]
     pub(crate) async fn capture(
         &self,
         camera: CameraDescriptor,
         cancellation: CancellationToken,
     ) -> Result<Photo, CameraRunError> {
+        self.capture_with_telemetry(camera, cancellation, None)
+            .await
+    }
+
+    /// Captures through the existing exclusive hardware gate while optionally
+    /// recording its real queue wait and blocking execution time. Cancelling
+    /// this future still does not abort the V4L2 blocking closure.
+    pub(crate) async fn capture_with_telemetry(
+        &self,
+        camera: CameraDescriptor,
+        cancellation: CancellationToken,
+        interaction: Option<Interaction>,
+    ) -> Result<Photo, CameraRunError> {
+        let wait_started = Instant::now();
+        let pending_before = self.waiting_captures.fetch_add(1, Ordering::AcqRel);
         let capture_gate = self.capture_gate.clone();
         let permit = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Err(CameraRunError::Cancelled),
+            _ = cancellation.cancelled() => {
+                self.waiting_captures.fetch_sub(1, Ordering::AcqRel);
+                if let Some(interaction) = &interaction {
+                    interaction.queue_wait(
+                        "camera",
+                        wait_started.elapsed(),
+                        pending_before,
+                        self.active_captures.load(Ordering::Acquire),
+                    );
+                    interaction.event("camera.capture.gate", "cancelled", telemetry::Fields::new());
+                }
+                return Err(CameraRunError::Cancelled);
+            },
             permit = capture_gate.acquire_owned() => permit.map_err(|_| CameraRunError::Failed(
                 CameraError::Worker {
                     operation: "capture scheduling",
@@ -306,17 +344,63 @@ impl CameraService {
                 },
             ))?,
         };
+        self.waiting_captures.fetch_sub(1, Ordering::AcqRel);
+        if let Some(interaction) = &interaction {
+            interaction.queue_wait(
+                "camera",
+                wait_started.elapsed(),
+                pending_before,
+                self.active_captures.load(Ordering::Acquire),
+            );
+        }
 
         if cancellation.is_cancelled() {
+            if let Some(interaction) = &interaction {
+                interaction.event("camera.capture.gate", "cancelled", telemetry::Fields::new());
+            }
             return Err(CameraRunError::Cancelled);
         }
 
         let backend = self.backend.clone();
+        let active_captures = self.active_captures.clone();
+        let worker_interaction = interaction.clone();
+        let camera_for_metrics = camera.clone();
         let mut task = tokio::task::spawn_blocking(move || {
             // Keep this permit until `capture` has returned and all V4L2
             // objects in that call have been dropped.
             let _permit = permit;
-            backend.capture(&camera)
+            let _in_flight = worker_interaction
+                .as_ref()
+                .map(|interaction| interaction.in_flight_guard("camera"));
+            active_captures.fetch_add(1, Ordering::AcqRel);
+            let stage = worker_interaction.as_ref().map(|interaction| {
+                interaction.stage(
+                    "camera.capture_and_validate",
+                    telemetry::fields([(
+                        "camera_id",
+                        serde_json::json!(camera_for_metrics.id().to_string()),
+                    )]),
+                )
+            });
+            let result = backend.capture(&camera);
+            if let Some(stage) = stage {
+                let (outcome, fields) = match &result {
+                    Ok(photo) => (
+                        "completed",
+                        telemetry::fields([(
+                            "encoded_image_bytes",
+                            serde_json::json!(photo.bytes().len()),
+                        )]),
+                    ),
+                    Err(_) => (
+                        "failed",
+                        telemetry::fields([("failure_class", serde_json::json!("device_failure"))]),
+                    ),
+                };
+                stage.finish(outcome, fields);
+            }
+            active_captures.fetch_sub(1, Ordering::AcqRel);
+            result
         });
 
         tokio::select! {

@@ -15,6 +15,9 @@ It can:
   conversation for follow-up questions as `see` context; and
 - emit timestamped terminal logs for accepted dialogue and process state as
   `speak`; and
+- optionally emit redacted JSON Lines plus local OpenTelemetry traces and
+  metrics so an interaction's latency, queue wait, and outcome can be
+  inspected without recording its conversation or media; and
 - in button-controlled `--voice` mode, optionally synthesize that same
   authorized dialogue locally and play it through a selected output device.
 
@@ -40,15 +43,17 @@ Read these files in this order:
 1. [`VISION.md`](VISION.md) — why the project exists.
 2. [`src/main.rs`](src/main.rs) — the tiny executable entry point.
 3. [`src/app.rs`](src/app.rs) — runs input, worker tasks, and shutdown.
-4. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
+4. [`src/telemetry.rs`](src/telemetry.rs) — redacted interaction timelines,
+   JSONL, and optional OpenTelemetry export.
+5. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
    [`src/dictation/controller.rs`](src/dictation/controller.rs) — the separate
    dictation event loop and state machine.
-5. [`src/controller.rs`](src/controller.rs) — the session state machine and
+6. [`src/controller.rs`](src/controller.rs) — the session state machine and
    result-acceptance rule.
-6. [`src/think/mod.rs`](src/think/mod.rs) and
+7. [`src/think/mod.rs`](src/think/mod.rs) and
    [`src/think/teacher.txt`](src/think/teacher.txt) — Ollama transport and
    editable teaching guidance.
-7. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
+8. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
 
 ## Run it on the same laptop
@@ -518,12 +523,139 @@ prints its dimensions/format, and releases it. It does not save a photo or
 make an HTTP request. Replace `0` with the ID you chose. Do not run it as root
 or change device permissions merely to make it pass.
 
+## Observe one interaction
+
+Readable, timestamped terminal logs remain on stdout in every mode. They are
+intended for the person using the terminal, so recognized and authorized
+dialogue text appears there deliberately. Structured telemetry is a separate,
+opt-in path designed for latency and backlog inspection: it never includes
+transcripts, questions, answers, prompts, image/audio payloads, source paths,
+or credentials.
+
+To retain normal raw-terminal controls while appending redacted JSON Lines to
+a local file, run this from the repository root:
+
+```bash
+mkdir -p local-data/telemetry
+INDEPENDENCE_TELEMETRY_JSONL=local-data/telemetry/independence.jsonl \
+  cargo run -- --voice
+```
+
+`mkdir` creates an ignored local directory. The environment variable tells
+Independence to append one JSON object per line to that file; it changes no
+system setting and does not start an exporter. Start a recording, release
+Enter, wait for the text answer (and, if configured, final playback), then
+exit normally. `jq` can show compact interaction summaries:
+
+```bash
+jq -c '
+  select(.record_type == "interaction_summary") |
+  {
+    timestamp_utc_unix_ms,
+    run_id,
+    interaction_id,
+    trace_id,
+    span_id,
+    outcome,
+    duration_ms,
+    intervals_ms: .state.explicit_intervals_ms,
+    stages: [.state.stages[] | {operation, outcome, duration_ms}],
+    ollama: .state.ollama
+  }
+' local-data/telemetry/independence.jsonl
+```
+
+That command only reads the JSONL file. If `jq` is not installed, inspect the
+file with another JSONL-capable tool; do not treat it as a shell script.
+
+OpenTelemetry trace and metric export is also opt-in. Independence uses the
+standard OTLP environment variables but does not provide, install, or contact
+a collector unless you explicitly supply an endpoint. For a collector already
+listening on the same computer, for example:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+INDEPENDENCE_TELEMETRY_JSONL=local-data/telemetry/independence.jsonl \
+  cargo run -- --voice
+```
+
+This command may connect to that local collector; omit the `OTEL_*` variables
+to disable OTLP entirely. The JSONL file still works without a collector or a
+cloud account. Export trouble is reported as a telemetry diagnostic and does
+not stop microphone, camera, Ollama, or terminal use.
+
+### JSONL field dictionary
+
+Every local record has `schema_version` (`1`), `timestamp_utc_unix_ms`, and
+`run_id`. Interaction records also have `interaction_id`, `trace_id`,
+`span_id`, `mode`, `operation`, and `outcome`.
+
+| Field | Meaning |
+| --- | --- |
+| `record_type` | `event` is one boundary; `interaction_summary` is the one terminal summary; `run_event` records startup configuration such as telemetry, Whisper availability, Ollama configuration, or output initialization and has no interaction span. |
+| `state.draft_id`, `turn_id`, `recording_id` | Existing identifiers bound when that stage exists. They are correlation data, not metric labels. |
+| `state.milestones_ms` | Monotonic milliseconds from interaction creation; voice creation happens at Enter press, before `TurnId` exists. |
+| `state.explicit_intervals_ms` | Named user-visible intervals only when both endpoints occurred: Enter→recording, release→dispatch/text answer/playback start, and cancellation→local cleanup. |
+| `state.stages` | Independently timed operations such as Whisper load/recognition, photo work, Ollama encoding/HTTP/decode, Piper synthesis, and playback. |
+| `state.stage_union_covered_ms` | Union of terminal stage windows, not a sum. Completed and abandoned stages are both represented; overlaps are counted once. |
+| `state.unattributed_elapsed_ms` | Elapsed time outside terminal stages. It may include user recording, waiting, or scheduling; it deliberately does not claim a cause. |
+| `state.input` | Safe request facts: configured model, request type, accepted-history count, image count/byte count, and `stream: false`. |
+| `state.ollama` | Optional Ollama response statistics. Durations are converted from server nanoseconds to milliseconds; absent values are `null`, not zero. |
+| `state.unavailable` | A documented reason for a metric the current protocol cannot honestly provide, such as first-token latency with `stream: false` or Ollama server queue depth. |
+| `telemetry_jsonl_dropped_records` | Records dropped because the bounded local telemetry queue or writer could not keep up. |
+
+OpenTelemetry instruments use seconds for durations:
+`independence.operation.duration`, `independence.queue.wait`,
+`independence.ollama.reported_duration`, and
+`independence.ollama.generation_tokens_per_second`; the other instruments are
+`independence.operation.total`, `independence.in_flight`, sampled
+`independence.queue.pending_depth`, sampled `independence.active_work`, and
+`independence.ollama.tokens`. Their bounded attributes are component, model,
+mode, outcome, phase, or direction—not recordings, turns, questions, or other
+high-cardinality IDs.
+
+### How to read a timeline
+
+This is a **synthetic** summary shape, not a measurement from this computer:
+
+```text
+interaction starts at Enter press:                         0 ms
+microphone.recording_started:                            310 ms
+voice.enter_released:                                  4,800 ms
+audio.prepare_resample:                  4,801–4,840 ms (39 ms)
+whisper.final.recognition:               4,842–6,030 ms (1,188 ms)
+turn.request_dispatched:                              6,032 ms
+ollama.image.encode:                   6,033–6,068 ms (35 ms)
+ollama.http.exchange:                  6,070–9,410 ms (3,340 ms)
+controller.answer_accepted:                         9,414 ms
+final_answer.playback_started:                       9,690 ms
+```
+
+So the explicit intervals are 310 ms Enter→recording, 1,232 ms
+release→dispatch, 4,614 ms release→accepted text, and 4,890 ms
+release→software playback start. “Playback start” means the worker handed
+audio to its local output backend; it does not prove sound reached a person's
+ears. The `i'm thinking` cue is a separate utterance and never counts as final
+answer playback.
+
+For a first versus repeated model request, compare the local
+`ollama.http.exchange` stage with `state.ollama.ollama_reported_load_duration_ms`
+and the returned model name. The latter is **Ollama-reported load time**, not a
+claim about disk loading alone; do not force model unloading merely to create a
+“cold” value. For text-only versus photo requests, compare `image_count`,
+`total_image_bytes`, `ollama.image.encode`, and (when a camera was used) the
+camera gate/capture stage. The app has no verified measurement of Ollama's own
+server queue, so it reports that as unavailable rather than subtracting other
+durations and inventing one.
+
 ## Structure
 
 ```text
 src/
   main.rs        starts the Tokio runtime
   app.rs         owns worker-task lifecycle and application shutdown
+  telemetry.rs   redacted interaction timeline, JSONL, OpenTelemetry spans/metrics
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
   listen/        blocking keyboard adapter and command parser
@@ -579,7 +711,9 @@ application code.
 
 This is a map of what exists **now**. It shows three ways into the same local
 learning system: typed questions, transcript-only dictation, and integrated
-button-controlled voice questions with optional local Piper/HAL playback.
+button-controlled voice questions with optional local Piper/HAL playback. A
+redacted `telemetry::Interaction` follows the real work without gaining
+authority over it.
 
 ```text
                          cargo run
@@ -592,9 +726,15 @@ button-controlled voice questions with optional local Piper/HAL playback.
                                               |             |
                                               v             v
                                       accepted state <- TurnFinished
-                                              |
-                                              v
-                                          speak/mod.rs
+                                          |
+                                          v
+                                      speak/mod.rs
+
+Enter press / typed dispatch
+          |
+          v
+  telemetry.rs Interaction ──> JSONL / optional OTLP
+       (IDs, timing, sizes, outcomes only)
 ```
 
 ### Choose a mode
@@ -728,6 +868,7 @@ small coordinator for one unfinished hold-to-talk draft:
 ```mermaid
 flowchart TD
     A["Enter press / release / P"] --> Q["SpeechService queue\n'i'm listening'"]
+    A -. "starts Interaction" .-> O["telemetry.rs\nredacted interaction timeline"]
     Q --> D["VoiceRuntime in app.rs\nopens capture only after cue completion"]
     D --> B["DictationController\nvalidates RecordingId"]
     B --> C["DictationSession\nAcceptedTranscript { recording_id, text }"]
@@ -737,13 +878,16 @@ flowchart TD
     E --> F["Input::Ask(text) or\nInput::AskWithPhotos direct construction"]
     F --> G["existing Controller\nallocates TurnId"]
     G --> H["existing TurnRuntime"]
-    H --> I["OllamaClient::answer"]
+    H --> I["OllamaClient::answer_with_telemetry"]
+    D -. "recording / Whisper stages" .-> O
+    H -. "turn / photo / HTTP stages" .-> O
     I --> K["TurnFinished"]
     K --> G
     G --> J["speak::independence_says\ntimestamped dialogue log"]
     J --> W["SpeechService ordered queue"]
     W --> T["Piper CLI -> in-memory WAV"]
     T --> R["Rodio -> selected output device"]
+    W -. "synthesis / playback stages" .-> O
 ```
 
 The direct `Input::Ask(text)` / `Input::AskWithPhotos` construction is
@@ -791,6 +935,11 @@ VoiceRuntime (src/app.rs, --voice only)
 SpeechService (src/speak/worker.rs, --voice only)
   owns: one bounded ordered synthesis/playback queue and a cancellation generation
   performs: local Piper synthesis and Rodio playback for already-authorized text
+
+telemetry::Interaction (src/telemetry.rs)
+  owns: a redacted correlation/timing record beginning at voice Enter press
+  performs: JSONL events/summaries and optional OpenTelemetry spans/metrics
+  cannot: submit input, print dialogue, mutate history, or access media
 ```
 
 The controllers make decisions; runtimes perform I/O. Neither worker is allowed
@@ -802,6 +951,7 @@ to independently update conversation history or print an unapproved answer.
 src/
   main.rs                  selects typed, --dictate, or --voice mode
   app.rs                   application event loops and worker lifetimes
+  telemetry.rs             redacted correlations, JSONL, OTLP spans/metrics
   protocol.rs              typed events, effects, IDs, and requests/results
   controller.rs            accepted scene/history and TurnId authorization
 

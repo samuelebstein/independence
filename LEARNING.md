@@ -148,6 +148,69 @@ microphone; use a selectable headset when that matters. If Piper or an output
 device is unavailable, the text log remains authoritative and recording starts
 with a visible warning instead of pretending audio played.
 
+## Observability follows ownership, not dialogue
+
+[`src/telemetry.rs`](src/telemetry.rs) adds a fifth, deliberately passive
+boundary: `telemetry::Interaction`. It starts for voice mode in
+`VoiceDraft::new` at the actual Enter press—before a `RecordingId` or `TurnId`
+exists. Typed turns start one at dispatch. The interaction is then cloned into
+the existing owners, rather than recovered from whatever happens to be active
+when a worker finishes:
+
+```text
+VoiceDraft::new / TurnRuntime::start
+  -> Interaction { run ID, interaction ID, root tracing span, monotonic clock }
+  -> DictationSession + CpalRecorder + WhisperTranscriber
+  -> VoiceRuntime photo task / CameraService capture gate
+  -> TurnRuntime + OllamaClient
+  -> SpeechHandle + one Piper/Rodio worker request
+```
+
+That is intentional Rust ownership, not magic task-local context. A spawned
+Tokio task or `spawn_blocking` closure receives an explicit clone. The clone
+contains IDs, timestamps, sizes, bounded outcome labels, and a `tracing` span;
+it does **not** contain a transcript, answer, prompt, audio, image bytes, or a
+path. This gives a human or exporter a coherent trace while preserving the
+same controller rule: telemetry cannot submit input, authorize output, mutate
+accepted history, or restart hardware.
+
+`Interaction::stage` records a named execution window. It uses `Instant` for
+durations and UTC epoch milliseconds only for cross-process correlation. Its
+summary keeps stage start offsets instead of adding durations, because camera,
+audio, and worker scheduling can overlap. `state.stage_union_covered_ms` is a
+merged union of completed or abandoned stage windows;
+`state.unattributed_elapsed_ms` is the honest remainder, not a made-up “server
+queue” explanation.
+
+The named milestones calculate only intervals with both endpoints. In voice
+mode those include Enter→actual microphone recording, release→Ollama dispatch,
+release→accepted text, release→final-answer software playback start, and
+cancellation request→local resource cleanup. The thinking cue is its own
+speech request and cannot satisfy the final-answer playback milestone.
+
+The controller still accepts text before speech delivery completes. For
+observability, `VoiceRuntime` keeps that accepted interaction indexed by the
+specific `UtteranceId` until Piper/Rodio reports played, cancelled, synthesis
+failure, or playback failure. Thus a text answer accepted into history and a
+failed spoken delivery are distinguishable instead of being falsely reported
+as the same outcome.
+
+Ollama's `/api/chat` response may carry server statistics. `think::OllamaAnswer`
+keeps `total_duration`, `load_duration`, prompt/eval counts and durations, and
+`done_reason` as optional values. The server's units are nanoseconds; the
+telemetry layer converts them explicitly to seconds for OpenTelemetry metrics
+and milliseconds in JSONL. `eval_count / eval_duration` is emitted only when
+the duration is positive. A non-streaming request has no truthful first-token
+latency, and the local API does not expose a server queue depth, so both are
+reported unavailable rather than inferred by subtraction.
+
+The readable terminal logger and structured output are intentionally separate.
+The logger shows recognized/authorized dialogue on stdout. Set
+`INDEPENDENCE_TELEMETRY_JSONL` to opt into a bounded background JSONL writer;
+set standard `OTEL_EXPORTER_OTLP_*` endpoint variables only when an OTLP
+collector is deliberately available. See README's “Observe one interaction”
+section for exact commands, fields, a synthetic trace, and privacy limits.
+
 ## Why the controller owns state
 
 The model worker gets an owned snapshot of history, question, and photographs.

@@ -1,8 +1,8 @@
 # Independence
 
-Independence is an experiment in a local-first computer for noticing and
+Independence is an experiment in a local only, airgapped computer for noticing and
 learning about the physical world. This repository currently contains a narrow
-terminal prototype—not a finished camera device or general agent.
+terminal prototype—not a finished product.
 
 It can:
 

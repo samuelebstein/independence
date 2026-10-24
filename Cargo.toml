@@ -7,7 +7,9 @@ edition = "2024"
 base64 = "0.23.1"
 cpal = "0.18.2"
 crossterm = "0.29.0"
+evdev = "0.13.2"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+nix = { version = "0.29.0", default-features = false, features = ["fs"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics"] }

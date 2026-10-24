@@ -35,28 +35,31 @@ pub struct PiperConfig {
 
 impl PiperConfig {
     pub fn from_environment() -> Self {
+        Self::from_environment_with_defaults(
+            OsString::from(DEFAULT_PIPER_COMMAND),
+            PathBuf::from(DEFAULT_HAL_MODEL),
+        )
+    }
+
+    /// Resolves the existing Piper environment overrides over caller-provided
+    /// defaults.  A hardware profile can therefore choose portable local
+    /// paths without mutating process-wide environment variables.
+    pub fn from_environment_with_defaults(
+        default_command: OsString,
+        default_model: PathBuf,
+    ) -> Self {
         let model_path = env::var_os("INDEPENDENCE_TTS_MODEL")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_HAL_MODEL));
+            .unwrap_or(default_model);
         let config_path = env::var_os("INDEPENDENCE_TTS_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{}.json", model_path.display())));
-        let command = env::var_os("INDEPENDENCE_PIPER_COMMAND")
-            .unwrap_or_else(|| OsString::from(DEFAULT_PIPER_COMMAND));
+        let command = env::var_os("INDEPENDENCE_PIPER_COMMAND").unwrap_or(default_command);
 
-        Self {
-            command,
-            model_path,
-            config_path,
-        }
+        Self::new(command, model_path, config_path)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(
-        command: impl Into<OsString>,
-        model_path: PathBuf,
-        config_path: PathBuf,
-    ) -> Self {
+    pub fn new(command: impl Into<OsString>, model_path: PathBuf, config_path: PathBuf) -> Self {
         Self {
             command: command.into(),
             model_path,

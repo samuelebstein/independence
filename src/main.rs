@@ -8,33 +8,27 @@ async fn main() {
     telemetry.report_startup();
 
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    let result = match arguments.as_slice() {
-        [] => independence::app::run().await,
-        [mode] if mode.to_str() == Some("--dictate") => independence::app::run_dictation().await,
-        [mode] if mode.to_str() == Some("--voice") => independence::app::run_voice().await,
-        [mode] if mode.to_str() == Some("--audio-devices") => {
+    let result = match independence::launch::parse_arguments(&arguments) {
+        Ok(independence::launch::LaunchCommand::Interactive) => independence::app::run().await,
+        Ok(independence::launch::LaunchCommand::Dictate) => {
+            independence::app::run_dictation().await
+        }
+        Ok(independence::launch::LaunchCommand::Voice(options)) => {
+            independence::app::run_voice_with_options(options).await
+        }
+        Ok(independence::launch::LaunchCommand::ListAudioOutputs) => {
             independence::app::list_audio_outputs()
         }
-        [mode] if mode.to_str() == Some("--speak-test") => {
-            independence::app::run_speech_test(None).await
+        Ok(independence::launch::LaunchCommand::ListAudioInputs) => {
+            independence::app::list_audio_inputs()
         }
-        [mode, flag, device]
-            if mode.to_str() == Some("--voice") && flag.to_str() == Some("--audio-output") =>
-        {
-            let Some(device) = device.to_str() else {
-                usage_and_exit();
-            };
-            independence::app::run_voice_with_output(Some(device.to_owned())).await
+        Ok(independence::launch::LaunchCommand::ListInputDevices) => {
+            independence::app::list_input_devices()
         }
-        [mode, flag, device]
-            if mode.to_str() == Some("--speak-test") && flag.to_str() == Some("--audio-output") =>
-        {
-            let Some(device) = device.to_str() else {
-                usage_and_exit();
-            };
-            independence::app::run_speech_test(Some(device.to_owned())).await
+        Ok(independence::launch::LaunchCommand::SpeakTest { audio_output }) => {
+            independence::app::run_speech_test(audio_output).await
         }
-        _ => usage_and_exit(),
+        Err(message) => usage_and_exit(&message),
     };
 
     let exit_code = match result {
@@ -50,9 +44,10 @@ async fn main() {
     }
 }
 
-fn usage_and_exit() -> ! {
-    independence::speak::usage(
-        "cargo run -- [--dictate|--voice [--audio-output <exact device id>]|--audio-devices|--speak-test [--audio-output <exact device id>]",
+fn usage_and_exit(detail: &str) -> ! {
+    let usage = format!(
+        "{detail}. usage: cargo run -- [--dictate|--voice [--profile raspberry-pi] [--input terminal|buttons] [--input-device <stable /dev/input path>] [--audio-input <exact device id>] [--audio-output <exact device id>]|--audio-devices|--audio-input-devices|--input-devices|--speak-test [--audio-output <exact device id>]"
     );
+    independence::speak::usage(&usage);
     std::process::exit(2);
 }

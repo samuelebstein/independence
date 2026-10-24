@@ -6,15 +6,19 @@
 //! and device before the caller can start inference.
 
 use std::{
-    fmt, io,
+    ffi::{OsStr, OsString},
+    fmt,
+    io::{self, Read},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
-use image::{RgbImage, codecs::jpeg::JpegEncoder};
+use image::{ImageFormat, ImageReader, RgbImage, codecs::jpeg::JpegEncoder};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -41,6 +45,12 @@ const WARM_UP_FRAMES: usize = 2;
 const CAPTURE_WINDOW: Duration = Duration::from_secs(3);
 const MAX_FRAME_WAIT: Duration = Duration::from_secs(1);
 const JPEG_QUALITY: u8 = 85;
+const RPICAM_WIDTH: u32 = 1_280;
+const RPICAM_HEIGHT: u32 = 720;
+const RPICAM_SETTLE_TIMEOUT_MS: u64 = 1_000;
+const RPICAM_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+const RPICAM_STDERR_LIMIT: usize = 16 * 1024;
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The numeric portion of a `/dev/video<ID>` V4L2 node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -71,6 +81,13 @@ impl fmt::Display for CameraId {
 pub struct CameraDescriptor {
     id: CameraId,
     name: String,
+    location: CameraLocation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CameraLocation {
+    V4l2,
+    RpiCam,
 }
 
 impl CameraDescriptor {
@@ -78,6 +95,15 @@ impl CameraDescriptor {
         Self {
             id,
             name: name.into(),
+            location: CameraLocation::V4l2,
+        }
+    }
+
+    fn rpicam(id: CameraId, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            location: CameraLocation::RpiCam,
         }
     }
 
@@ -88,14 +114,33 @@ impl CameraDescriptor {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// The capture backend that supplied this inventory entry.
+    pub fn backend(&self) -> &'static str {
+        match self.location {
+            CameraLocation::V4l2 => "v4l2",
+            CameraLocation::RpiCam => "rpicam-still",
+        }
+    }
+
+    /// A human-readable device identity suitable for logs, never for shell
+    /// execution. Pi camera modules do not promise a V4L2 `/dev/video*` node.
+    pub fn device_path(&self) -> String {
+        match self.location {
+            CameraLocation::V4l2 => format!("/dev/video{}", self.id),
+            CameraLocation::RpiCam => format!("rpicam camera {}", self.id),
+        }
+    }
 }
 
 impl fmt::Display for CameraDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} (camera {}, /dev/video{})",
-            self.name, self.id, self.id
+            "{} (camera {}, {})",
+            self.name,
+            self.id,
+            self.device_path()
         )
     }
 }
@@ -145,7 +190,11 @@ impl CameraPhotoSource {
 /// tests. This is a real test seam: unit tests must never open a camera.
 pub(crate) trait CameraBackend: Send + Sync {
     fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError>;
-    fn capture(&self, camera: &CameraDescriptor) -> Result<Photo, CameraError>;
+    fn capture(
+        &self,
+        camera: &CameraDescriptor,
+        cancellation: &CancellationToken,
+    ) -> Result<Photo, CameraError>;
 }
 
 #[derive(Default)]
@@ -200,7 +249,14 @@ impl CameraBackend for V4lCameraBackend {
         Ok(cameras)
     }
 
-    fn capture(&self, camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+    fn capture(
+        &self,
+        camera: &CameraDescriptor,
+        cancellation: &CancellationToken,
+    ) -> Result<Photo, CameraError> {
+        if cancellation.is_cancelled() {
+            return Err(CameraError::Cancelled);
+        }
         let device = Device::new(camera.id.index()).map_err(|source| CameraError::Open {
             camera: camera.clone(),
             source,
@@ -212,7 +268,7 @@ impl CameraBackend for V4lCameraBackend {
                 source,
             })?;
 
-        let capture_result = capture_raw_frame(&device, camera);
+        let capture_result = capture_raw_frame(&device, camera, cancellation);
         // A format change can affect other local camera consumers. Restore the
         // format after the stream has dropped, even if capture itself failed.
         let restore_result = device.set_format(&original_format);
@@ -235,6 +291,10 @@ impl CameraBackend for V4lCameraBackend {
             }
         };
 
+        if cancellation.is_cancelled() {
+            return Err(CameraError::Cancelled);
+        }
+
         let jpeg = match captured.pixel_format {
             CameraPixelFormat::Mjpeg => captured.bytes,
             CameraPixelFormat::Yuyv => encode_yuyv_as_jpeg(&captured, camera)?,
@@ -252,6 +312,295 @@ impl CameraBackend for V4lCameraBackend {
     }
 }
 
+/// Configuration for the Raspberry Pi `rpicam-still` adapter.
+///
+/// The executable is configurable because distributions sometimes package it
+/// in a non-default location.  Capture remains one explicit still, not a
+/// preview or a persistent camera stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RpiCamStillConfig {
+    command: OsString,
+}
+
+impl RpiCamStillConfig {
+    pub(crate) fn from_environment() -> Self {
+        Self {
+            command: std::env::var_os("INDEPENDENCE_RPICAM_STILL")
+                .unwrap_or_else(|| OsString::from("rpicam-still")),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(command: impl Into<OsString>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+
+    fn list_arguments(&self) -> [&'static OsStr; 1] {
+        [OsStr::new("--list-cameras")]
+    }
+
+    fn capture_arguments(&self, camera: &CameraDescriptor) -> Vec<OsString> {
+        vec![
+            OsString::from("--nopreview"),
+            OsString::from("--camera"),
+            OsString::from(camera.id().to_string()),
+            OsString::from("--timeout"),
+            OsString::from(RPICAM_SETTLE_TIMEOUT_MS.to_string()),
+            OsString::from("--width"),
+            OsString::from(RPICAM_WIDTH.to_string()),
+            OsString::from("--height"),
+            OsString::from(RPICAM_HEIGHT.to_string()),
+            OsString::from("--encoding"),
+            OsString::from("jpg"),
+            OsString::from("--quality"),
+            OsString::from(JPEG_QUALITY.to_string()),
+            OsString::from("--output"),
+            OsString::from("-"),
+        ]
+    }
+}
+
+/// Pi Camera Module support through the Raspberry Pi-supported `rpicam-still`
+/// command.  It is a camera backend, not a shell script: arguments are passed
+/// directly, stdout holds only JPEG data, and stderr is retained only as a
+/// bounded error summary.
+struct RpiCamStillBackend {
+    config: RpiCamStillConfig,
+}
+
+impl RpiCamStillBackend {
+    fn new(config: RpiCamStillConfig) -> Self {
+        Self { config }
+    }
+
+    fn list_cameras(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+        let output = Command::new(&self.config.command)
+            .args(self.config.list_arguments())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| CameraError::RpiCamStart {
+                command: self.config.command.clone(),
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(CameraError::RpiCamExit {
+                status: output.status,
+                detail: bounded_diagnostic(&output.stderr),
+            });
+        }
+
+        let output = String::from_utf8_lossy(&output.stdout);
+        let cameras = parse_rpicam_camera_list(&output);
+        if cameras.is_empty() {
+            return Err(CameraError::NoRpiCamCameras);
+        }
+        Ok(cameras)
+    }
+
+    fn capture_one(
+        &self,
+        camera: &CameraDescriptor,
+        cancellation: &CancellationToken,
+    ) -> Result<Photo, CameraError> {
+        if cancellation.is_cancelled() {
+            return Err(CameraError::Cancelled);
+        }
+        if camera.location != CameraLocation::RpiCam {
+            return Err(CameraError::BackendMismatch {
+                camera: camera.clone(),
+                backend: "rpicam-still",
+            });
+        }
+
+        let mut child = Command::new(&self.config.command)
+            .args(self.config.capture_arguments(camera))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| CameraError::RpiCamStart {
+                command: self.config.command.clone(),
+                source,
+            })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                stop_child(&mut child);
+                return Err(CameraError::RpiCamPipe("stdout"));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                stop_child(&mut child);
+                return Err(CameraError::RpiCamPipe("stderr"));
+            }
+        };
+        let stdout_reader = thread::spawn(move || read_bounded(stdout, super::MAX_PHOTO_BYTES));
+        let stderr_reader = thread::spawn(move || read_bounded(stderr, RPICAM_STDERR_LIMIT));
+        let started = Instant::now();
+
+        let status = loop {
+            if cancellation.is_cancelled() {
+                stop_child(&mut child);
+                let _ = join_reader(stdout_reader);
+                let _ = join_reader(stderr_reader);
+                return Err(CameraError::Cancelled);
+            }
+            if started.elapsed() >= RPICAM_PROCESS_TIMEOUT {
+                stop_child(&mut child);
+                let _ = join_reader(stdout_reader);
+                let _ = join_reader(stderr_reader);
+                return Err(CameraError::RpiCamTimeout);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => thread::sleep(PROCESS_POLL_INTERVAL),
+                Err(source) => {
+                    // `Child` drop does not terminate a live process. Even a
+                    // rare wait error must therefore use the same explicit
+                    // kill/reap cleanup as cancellation and timeout.
+                    stop_child(&mut child);
+                    let _ = join_reader(stdout_reader);
+                    let _ = join_reader(stderr_reader);
+                    return Err(CameraError::RpiCamWait { source });
+                }
+            }
+        };
+
+        let stdout = join_reader(stdout_reader)?;
+        let stderr = join_reader(stderr_reader)?;
+        if !status.success() {
+            return Err(CameraError::RpiCamExit {
+                status,
+                detail: bounded_diagnostic(&stderr.bytes),
+            });
+        }
+        if stdout.exceeded {
+            return Err(CameraError::RpiCamOutputTooLarge {
+                size_limit: super::MAX_PHOTO_BYTES,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Err(CameraError::Cancelled);
+        }
+
+        let (width, height) =
+            rpicam_jpeg_dimensions(&stdout.bytes).map_err(|source| CameraError::Validate {
+                camera: camera.clone(),
+                source: Box::new(PhotoError::CameraInvalid {
+                    format: "JPEG",
+                    source,
+                }),
+            })?;
+        let source = CameraPhotoSource::new(camera.clone(), width, height, "rpicam-still JPEG");
+        Photo::from_camera_jpeg(source, stdout.bytes).map_err(|source| CameraError::Validate {
+            camera: camera.clone(),
+            source: Box::new(source),
+        })
+    }
+}
+
+impl CameraBackend for RpiCamStillBackend {
+    fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+        self.list_cameras()
+    }
+
+    fn capture(
+        &self,
+        camera: &CameraDescriptor,
+        cancellation: &CancellationToken,
+    ) -> Result<Photo, CameraError> {
+        self.capture_one(camera, cancellation)
+    }
+}
+
+/// Parses the stable leading `N : camera name` portion emitted by
+/// `rpicam-still --list-cameras`.  The rest of the line is intentionally left
+/// as a human-provided label because rpicam's detailed sensor metadata is not
+/// a public machine protocol.
+fn parse_rpicam_camera_list(output: &str) -> Vec<CameraDescriptor> {
+    let mut cameras = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        let Some((index, detail)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(index) = index.trim().parse::<u32>() else {
+            continue;
+        };
+        let name = detail
+            .trim()
+            .split_once('[')
+            .map_or(detail.trim(), |(name, _)| name.trim());
+        if name.is_empty() {
+            continue;
+        }
+        cameras.push(CameraDescriptor::rpicam(CameraId::new(index), name));
+    }
+    cameras.sort_by_key(CameraDescriptor::id);
+    cameras.dedup_by_key(|camera| camera.id());
+    cameras
+}
+
+struct BoundedRead {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<BoundedRead> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(bytes.len());
+        let copied = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..copied]);
+        if copied < read {
+            exceeded = true;
+        }
+    }
+    Ok(BoundedRead { bytes, exceeded })
+}
+
+fn join_reader(
+    reader: thread::JoinHandle<io::Result<BoundedRead>>,
+) -> Result<BoundedRead, CameraError> {
+    reader
+        .join()
+        .map_err(|_| CameraError::RpiCamReader("reader thread panicked".into()))?
+        .map_err(|source| CameraError::RpiCamReader(source.to_string()))
+}
+
+fn stop_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn bounded_diagnostic(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).trim().to_owned();
+    if text.is_empty() {
+        "no diagnostic text".into()
+    } else if text.len() > RPICAM_STDERR_LIMIT {
+        format!("{}…", &text[..RPICAM_STDERR_LIMIT])
+    } else {
+        text
+    }
+}
+
+fn rpicam_jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), image::ImageError> {
+    let reader = ImageReader::with_format(io::Cursor::new(bytes), ImageFormat::Jpeg);
+    reader.into_dimensions()
+}
+
 /// Coordinates bounded capture work. The semaphore remains owned by the
 /// blocking closure, so cancelling an async caller cannot accidentally start
 /// a second task against a camera that is still closing.
@@ -265,8 +614,20 @@ pub(crate) struct CameraService {
 
 impl CameraService {
     pub(crate) fn v4l() -> Self {
+        Self::with_runtime_backend(Arc::new(V4lCameraBackend))
+    }
+
+    /// Uses the Raspberry Pi supported `rpicam-still` command for an official
+    /// CSI camera module. Laptop launches retain the V4L2 backend by default.
+    pub(crate) fn rpicam() -> Self {
+        Self::with_runtime_backend(Arc::new(RpiCamStillBackend::new(
+            RpiCamStillConfig::from_environment(),
+        )))
+    }
+
+    fn with_runtime_backend(backend: Arc<dyn CameraBackend>) -> Self {
         Self {
-            backend: Arc::new(V4lCameraBackend),
+            backend,
             capture_gate: Arc::new(Semaphore::new(1)),
             waiting_captures: Arc::new(AtomicUsize::new(0)),
             active_captures: Arc::new(AtomicUsize::new(0)),
@@ -298,8 +659,9 @@ impl CameraService {
     ///
     /// Once the blocking capture has begun it is deliberately not aborted:
     /// Tokio cannot stop a running `spawn_blocking` task. The V4L2 backend's
-    /// frame polls are bounded by `CAPTURE_WINDOW`, and the closure owns the
-    /// semaphore until it has dropped its stream and device handle.
+    /// frame polls are bounded by `CAPTURE_WINDOW`; the Pi backend observes
+    /// the same cancellation token and kills/reaps its direct child. In both
+    /// cases the closure owns the semaphore until it releases the hardware.
     #[cfg(test)]
     pub(crate) async fn capture(
         &self,
@@ -312,7 +674,8 @@ impl CameraService {
 
     /// Captures through the existing exclusive hardware gate while optionally
     /// recording its real queue wait and blocking execution time. Cancelling
-    /// this future still does not abort the V4L2 blocking closure.
+    /// this future still does not abort a blocking closure. Each backend is
+    /// responsible for its documented bounded cleanup behavior.
     pub(crate) async fn capture_with_telemetry(
         &self,
         camera: CameraDescriptor,
@@ -365,9 +728,11 @@ impl CameraService {
         let active_captures = self.active_captures.clone();
         let worker_interaction = interaction.clone();
         let camera_for_metrics = camera.clone();
+        let worker_cancellation = cancellation.clone();
         let mut task = tokio::task::spawn_blocking(move || {
-            // Keep this permit until `capture` has returned and all V4L2
-            // objects in that call have been dropped.
+            // Keep this permit until `capture` has returned and every
+            // backend-owned resource (a V4L2 stream or rpicam child) has
+            // been released.
             let _permit = permit;
             let _in_flight = worker_interaction
                 .as_ref()
@@ -382,7 +747,7 @@ impl CameraService {
                     )]),
                 )
             });
-            let result = backend.capture(&camera);
+            let result = backend.capture(&camera, &worker_cancellation);
             if let Some(stage) = stage {
                 let (outcome, fields) = match &result {
                     Ok(photo) => (
@@ -392,6 +757,7 @@ impl CameraService {
                             serde_json::json!(photo.bytes().len()),
                         )]),
                     ),
+                    Err(CameraError::Cancelled) => ("cancelled", telemetry::Fields::new()),
                     Err(_) => (
                         "failed",
                         telemetry::fields([("failure_class", serde_json::json!("device_failure"))]),
@@ -400,20 +766,24 @@ impl CameraService {
                 stage.finish(outcome, fields);
             }
             active_captures.fetch_sub(1, Ordering::AcqRel);
-            result
+            result.map_err(|error| match error {
+                CameraError::Cancelled => CameraRunError::Cancelled,
+                error => CameraRunError::Failed(error),
+            })
         });
 
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
                 // Do not abort this task. A running blocking task cannot be
-                // forcibly stopped safely; it will finish its bounded V4L2
-                // window and release `_permit` before another capture starts.
+                // forcibly stopped safely; its backend observes the shared
+                // cancellation token and releases `_permit` before another
+                // capture starts.
                 Err(CameraRunError::Cancelled)
             }
             result = &mut task => match result {
                 Ok(Ok(photo)) => Ok(photo),
-                Ok(Err(error)) => Err(CameraRunError::Failed(error)),
+                Ok(Err(error)) => Err(error),
                 Err(error) => Err(CameraRunError::Failed(CameraError::Worker {
                     operation: "capture",
                     detail: error.to_string(),
@@ -423,8 +793,8 @@ impl CameraService {
     }
 
     /// Waits until a previously cancelled blocking capture has released its
-    /// V4L2 resources. Runtime shutdown uses this; ordinary `/stop` does not,
-    /// so the terminal remains responsive while the bounded cleanup finishes.
+    /// camera resources. Runtime shutdown uses this; ordinary `/stop` does
+    /// not, so the terminal remains responsive while bounded cleanup finishes.
     pub(crate) async fn wait_for_idle(&self) {
         if let Ok(permit) = self.capture_gate.clone().acquire_owned().await {
             drop(permit);
@@ -564,6 +934,46 @@ pub(crate) enum CameraError {
     )]
     CaptureAndRestore { capture: String, restore: String },
 
+    #[error("rpicam-still reported no usable camera modules")]
+    NoRpiCamCameras,
+
+    #[error("could not start rpicam-still command `{}`: {source}", command.to_string_lossy())]
+    RpiCamStart {
+        command: OsString,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("rpicam-still could not provide {0} pipe")]
+    RpiCamPipe(&'static str),
+
+    #[error("rpicam-still process wait failed: {source}")]
+    RpiCamWait {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("rpicam-still did not finish within the five-second capture bound")]
+    RpiCamTimeout,
+
+    #[error("rpicam-still exited with {status}: {detail}")]
+    RpiCamExit { status: ExitStatus, detail: String },
+
+    #[error("rpicam-still JPEG stdout exceeded the {} MiB in-memory limit", size_limit / (1024 * 1024))]
+    RpiCamOutputTooLarge { size_limit: usize },
+
+    #[error("rpicam-still output reader failed: {0}")]
+    RpiCamReader(String),
+
+    #[error("{camera} belongs to a different camera backend than {backend}")]
+    BackendMismatch {
+        camera: CameraDescriptor,
+        backend: &'static str,
+    },
+
+    #[error("camera capture was cancelled before a still was accepted")]
+    Cancelled,
+
     #[error("{operation} worker ended unexpectedly: {detail}")]
     Worker {
         operation: &'static str,
@@ -605,6 +1015,7 @@ struct CapturedFrame {
 fn capture_raw_frame(
     device: &Device,
     camera: &CameraDescriptor,
+    cancellation: &CancellationToken,
 ) -> Result<CapturedFrame, CameraError> {
     let format = configure_format(device, camera)?;
     let pixel_format = CameraPixelFormat::from_fourcc(format.fourcc).ok_or_else(|| {
@@ -624,7 +1035,13 @@ fn capture_raw_frame(
         // Some sensors need a couple of frames to settle after stream-on.
         // Those frames are discarded; the third frame is the still image.
         for _ in 0..WARM_UP_FRAMES {
+            if cancellation.is_cancelled() {
+                return Err(CameraError::Cancelled);
+            }
             let _ = read_frame(&mut stream, deadline, camera)?;
+        }
+        if cancellation.is_cancelled() {
+            return Err(CameraError::Cancelled);
         }
         read_frame(&mut stream, deadline, camera)?
         // `stream` drops here, releasing its MMAP buffers before format
@@ -856,7 +1273,9 @@ fn is_supported_fourcc(fourcc: FourCC) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        env,
+        env, fs,
+        io::Cursor,
+        os::unix::fs::PermissionsExt,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -872,8 +1291,9 @@ mod tests {
 
     use super::{
         CameraBackend, CameraDescriptor, CameraError, CameraId, CameraPhotoSource,
-        CameraPixelFormat, CameraRunError, CameraService, CapturedFrame, V4lCameraBackend,
-        encode_yuyv_as_jpeg, select_camera,
+        CameraPixelFormat, CameraRunError, CameraService, CapturedFrame, RpiCamStillBackend,
+        RpiCamStillConfig, V4lCameraBackend, encode_yuyv_as_jpeg, parse_rpicam_camera_list,
+        read_bounded, select_camera,
     };
     use crate::see::{Photo, PhotoSource};
 
@@ -952,6 +1372,122 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn rpicam_inventory_and_capture_arguments_are_explicit_and_shell_free() {
+        let cameras = parse_rpicam_camera_list(
+            "Available cameras\n-----------------\n0 : imx708 [4608x2592 10-bit RGGB] (/base/soc)\n1 : test sensor [640x480]\n",
+        );
+        assert_eq!(cameras.len(), 2);
+        assert_eq!(cameras[0].name(), "imx708");
+        assert_eq!(cameras[0].backend(), "rpicam-still");
+        assert_eq!(cameras[0].device_path(), "rpicam camera 0");
+
+        let config = RpiCamStillConfig::new("/usr/bin/rpicam-still");
+        let arguments = config
+            .capture_arguments(&cameras[0])
+            .into_iter()
+            .map(|argument| argument.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec![
+                "--nopreview",
+                "--camera",
+                "0",
+                "--timeout",
+                "1000",
+                "--width",
+                "1280",
+                "--height",
+                "720",
+                "--encoding",
+                "jpg",
+                "--quality",
+                "85",
+                "--output",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn rpicam_output_reader_bounds_memory_but_drains_the_pipe() {
+        let read = read_bounded(Cursor::new(vec![7_u8; 17]), 8).unwrap();
+        assert_eq!(read.bytes, vec![7_u8; 8]);
+        assert!(read.exceeded);
+    }
+
+    #[test]
+    fn rpicam_adapter_validates_stdout_jpeg_without_any_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let jpeg_path = directory.path().join("still.jpg");
+        fs::write(&jpeg_path, tiny_jpeg()).unwrap();
+        let script = directory.path().join("rpicam-fixture");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ncat '{}'\n", jpeg_path.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let backend = RpiCamStillBackend::new(RpiCamStillConfig::new(script.as_os_str()));
+        let camera = CameraDescriptor::rpicam(CameraId::new(0), "fixture module");
+        let photo = backend
+            .capture(&camera, &CancellationToken::new())
+            .expect("fixture rpicam output should validate");
+        assert!(matches!(
+            photo.source(),
+            PhotoSource::Camera(source)
+                if source.camera() == &camera
+                    && source.width() == 2
+                    && source.height() == 2
+                    && source.input_format() == "rpicam-still JPEG"
+        ));
+    }
+
+    #[test]
+    fn rpicam_cancellation_kills_and_reaps_the_direct_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let started = directory.path().join("started");
+        let script = directory.path().join("rpicam-sleep");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho ready > '{}'\nexec sleep 10\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let backend = RpiCamStillBackend::new(RpiCamStillConfig::new(script.as_os_str()));
+        let camera = CameraDescriptor::rpicam(CameraId::new(0), "fixture module");
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(backend.capture(&camera, &worker_cancellation));
+        });
+
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture child did not start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cancellation.cancel();
+        let result = receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("cancelled rpicam child did not finish");
+        assert!(matches!(result, Err(CameraError::Cancelled)));
+    }
+
     struct ImmediateBackend {
         cameras: Vec<CameraDescriptor>,
         photo: Photo,
@@ -965,7 +1501,11 @@ mod tests {
             Ok(self.cameras.clone())
         }
 
-        fn capture(&self, _camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.active.fetch_add(1, Ordering::SeqCst);
             struct Active<'a>(&'a AtomicUsize);
@@ -1055,7 +1595,11 @@ mod tests {
             Ok(vec![self.camera.clone()])
         }
 
-        fn capture(&self, _camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.record_maximum(active);
@@ -1175,7 +1719,9 @@ mod tests {
         let backend = V4lCameraBackend;
         let cameras = backend.list().expect("could not enumerate V4L2 cameras");
         let camera = select_camera(&cameras, Some(id)).expect("requested camera is not usable");
-        let photo = backend.capture(&camera).expect("camera capture failed");
+        let photo = backend
+            .capture(&camera, &CancellationToken::new())
+            .expect("camera capture failed");
         let PhotoSource::Camera(source) = photo.source() else {
             panic!("V4L2 backend returned a non-camera source");
         };
@@ -1183,6 +1729,34 @@ mod tests {
             "captured camera {} ({}) at {}x{} from {} as validated JPEG",
             source.camera().id(),
             source.camera().name(),
+            source.width(),
+            source.height(),
+            source.input_format(),
+        );
+        assert!(!photo.bytes().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a Raspberry Pi camera and rpicam-still; choose its ID explicitly"]
+    fn manual_rpicam_capture_without_ollama() {
+        let id = env::var("INDEPENDENCE_RPICAM_CAMERA")
+            .ok()
+            .and_then(|value| CameraId::parse(&value))
+            .expect("set INDEPENDENCE_RPICAM_CAMERA to an ID shown by rpicam-still --list-cameras");
+        let backend = RpiCamStillBackend::new(RpiCamStillConfig::from_environment());
+        let cameras = backend
+            .list()
+            .expect("could not enumerate rpicam-still cameras");
+        let camera = select_camera(&cameras, Some(id)).expect("requested Pi camera is not usable");
+        let photo = backend
+            .capture(&camera, &CancellationToken::new())
+            .expect("rpicam-still capture failed");
+        let PhotoSource::Camera(source) = photo.source() else {
+            panic!("rpicam-still backend returned a non-camera source");
+        };
+        eprintln!(
+            "captured {} at {}x{} from {} as validated JPEG",
+            source.camera(),
             source.width(),
             source.height(),
             source.input_format(),

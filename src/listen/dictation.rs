@@ -24,7 +24,10 @@ use crossterm::{
 };
 use tokio::sync::mpsc::Sender;
 
-use crate::protocol::{DictationEvent, DictationInput};
+use crate::{
+    listen::controls::{VoiceControlEvent, VoiceInputEvent, VoiceInputSource},
+    protocol::{DictationEvent, DictationInput},
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -33,6 +36,26 @@ pub struct DictationKeyReader {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     raw_mode: Option<RawModeGuard>,
+}
+
+/// Owns the terminal-specific raw-key reader used by hold-to-talk voice mode.
+///
+/// The rest of the application sees only device-independent
+/// [`VoiceControlEvent`] values.  This source alone owns raw terminal mode.
+pub struct TerminalVoiceInputSource {
+    reader: DictationKeyReader,
+}
+
+impl VoiceInputSource for TerminalVoiceInputSource {
+    fn shutdown(&mut self) {
+        self.reader.shutdown();
+    }
+}
+
+impl TerminalVoiceInputSource {
+    pub fn shutdown(&mut self) {
+        VoiceInputSource::shutdown(self);
+    }
 }
 
 impl DictationKeyReader {
@@ -77,18 +100,22 @@ pub fn spawn_dictation_key_reader(
 ///
 /// This deliberately refuses terminals that cannot report keyboard event
 /// types. A timeout cannot distinguish a still-held Enter key from a release.
-pub fn spawn_voice_key_reader(sender: Sender<DictationEvent>) -> io::Result<DictationKeyReader> {
+pub fn spawn_terminal_voice_input(
+    sender: Sender<VoiceInputEvent>,
+) -> io::Result<TerminalVoiceInputSource> {
     let raw_mode = RawModeGuard::enable_hold_to_talk()?;
     let stop = Arc::new(AtomicBool::new(false));
     let worker_stop = stop.clone();
     let thread = thread::Builder::new()
         .name("independence-voice-keys".into())
-        .spawn(move || read_keys(sender, worker_stop, classify_voice_key))?;
+        .spawn(move || read_voice_controls(sender, worker_stop))?;
 
-    Ok(DictationKeyReader {
-        stop,
-        thread: Some(thread),
-        raw_mode: Some(raw_mode),
+    Ok(TerminalVoiceInputSource {
+        reader: DictationKeyReader {
+            stop,
+            thread: Some(thread),
+            raw_mode: Some(raw_mode),
+        },
     })
 }
 
@@ -124,6 +151,40 @@ fn read_keys(
     }
 }
 
+fn read_voice_controls(sender: Sender<VoiceInputEvent>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Acquire) {
+        match event::poll(POLL_INTERVAL) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
+                    let Some(input) = classify_voice_key(key) else {
+                        continue;
+                    };
+                    let interrupt = matches!(input, VoiceInputEvent::Interrupt);
+                    if sender.blocking_send(input).is_err() || interrupt {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = sender.blocking_send(VoiceInputEvent::SourceFailed {
+                        source: "terminal controls",
+                        message: error.to_string(),
+                    });
+                    break;
+                }
+            },
+            Ok(false) => {}
+            Err(error) => {
+                let _ = sender.blocking_send(VoiceInputEvent::SourceFailed {
+                    source: "terminal controls",
+                    message: error.to_string(),
+                });
+                break;
+            }
+        }
+    }
+}
+
 /// Maps a press event into dictation controls. Key repeat and release events
 /// are purposefully ignored, so holding Enter cannot queue recordings.
 pub(crate) fn classify_key(key: KeyEvent) -> Option<DictationInput> {
@@ -144,16 +205,24 @@ pub(crate) fn classify_key(key: KeyEvent) -> Option<DictationInput> {
 /// Maps Kitty/CSI-u key event types into the button-controlled voice inputs.
 /// Repeat is intentionally ignored for Enter and P, so a held key does not
 /// start another draft or queue accidental photos.
-pub(crate) fn classify_voice_key(key: KeyEvent) -> Option<DictationInput> {
+pub(crate) fn classify_voice_key(key: KeyEvent) -> Option<VoiceInputEvent> {
     match (key.code, key.kind) {
-        (KeyCode::Enter, KeyEventKind::Press) => Some(DictationInput::HoldStart),
-        (KeyCode::Enter, KeyEventKind::Release) => Some(DictationInput::HoldEnd),
-        (KeyCode::Char('p' | 'P'), KeyEventKind::Press) => Some(DictationInput::Photo),
-        (KeyCode::Esc, KeyEventKind::Press) => Some(DictationInput::Escape),
+        (KeyCode::Enter, KeyEventKind::Press) => {
+            Some(VoiceInputEvent::Control(VoiceControlEvent::TalkPressed))
+        }
+        (KeyCode::Enter, KeyEventKind::Release) => {
+            Some(VoiceInputEvent::Control(VoiceControlEvent::TalkReleased))
+        }
+        (KeyCode::Char('p' | 'P'), KeyEventKind::Press) => {
+            Some(VoiceInputEvent::Control(VoiceControlEvent::PhotoPressed))
+        }
+        (KeyCode::Esc, KeyEventKind::Press) => {
+            Some(VoiceInputEvent::Control(VoiceControlEvent::Cancel))
+        }
         (KeyCode::Char('c'), KeyEventKind::Press)
             if key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
-            Some(DictationInput::Interrupt)
+            Some(VoiceInputEvent::Interrupt)
         }
         _ => None,
     }
@@ -207,7 +276,10 @@ impl Drop for RawModeGuard {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-    use crate::protocol::DictationInput;
+    use crate::{
+        listen::controls::{VoiceControlEvent, VoiceInputEvent},
+        protocol::DictationInput,
+    };
 
     use super::{classify_key, classify_voice_key};
 
@@ -255,7 +327,7 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Press,
             )),
-            Some(DictationInput::HoldStart)
+            Some(VoiceInputEvent::Control(VoiceControlEvent::TalkPressed))
         );
         assert_eq!(
             classify_voice_key(KeyEvent::new_with_kind(
@@ -263,7 +335,7 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Release,
             )),
-            Some(DictationInput::HoldEnd)
+            Some(VoiceInputEvent::Control(VoiceControlEvent::TalkReleased))
         );
         assert_eq!(
             classify_voice_key(KeyEvent::new_with_kind(
@@ -271,7 +343,7 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Press,
             )),
-            Some(DictationInput::Photo)
+            Some(VoiceInputEvent::Control(VoiceControlEvent::PhotoPressed))
         );
         assert_eq!(
             classify_voice_key(KeyEvent::new_with_kind(

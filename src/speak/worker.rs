@@ -248,6 +248,17 @@ impl SpeechService {
         Self::start(piper, selection, event_sender)
     }
 
+    /// Starts speech with already-resolved local configuration.  This keeps
+    /// profile defaults and command-line overrides outside the worker, whose
+    /// only job is ordered synthesis and playback.
+    pub(crate) fn with_configuration(
+        piper: PiperConfig,
+        selection: OutputSelection,
+        event_sender: tokio_mpsc::Sender<SpeechEvent>,
+    ) -> io::Result<Self> {
+        Self::start(piper, selection, event_sender)
+    }
+
     fn start(
         piper: PiperConfig,
         selection: OutputSelection,

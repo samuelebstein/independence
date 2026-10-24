@@ -1,7 +1,9 @@
 pub mod app;
 pub mod controller;
 pub mod dictation;
+pub mod launch;
 pub mod listen;
+pub mod profile;
 pub mod protocol;
 pub mod see;
 pub mod speak;

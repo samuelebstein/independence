@@ -225,7 +225,8 @@ pub fn emit(output: Output) {
                         event = "camera_available",
                         id = %camera.id(),
                         name = camera.name(),
-                        device = %format!("/dev/video{}", camera.id()),
+                        backend = camera.backend(),
+                        device = %camera.device_path(),
                         "camera"
                     );
                 }

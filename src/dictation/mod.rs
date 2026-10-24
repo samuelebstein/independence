@@ -69,21 +69,6 @@ pub(crate) struct DictationSession {
 }
 
 impl DictationSession {
-    pub(crate) fn from_environment(event_sender: mpsc::Sender<DictationEvent>) -> Self {
-        let recorder = Arc::new(CpalRecorder::from_environment());
-        let transcriber = Arc::new(WhisperTranscriber::from_environment());
-        telemetry::run_event(
-            "whisper.model.configuration",
-            if transcriber.model_is_available() {
-                "available"
-            } else {
-                "missing"
-            },
-            telemetry::Fields::new(),
-        );
-        Self::with_services(recorder, transcriber, event_sender)
-    }
-
     pub(crate) fn with_services(
         recorder: Arc<dyn Recorder>,
         transcriber: Arc<dyn Transcriber>,

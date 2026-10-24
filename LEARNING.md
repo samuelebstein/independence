@@ -55,10 +55,11 @@ Both become the same base64 image field in the existing Ollama request.
 
 ## Follow one dictation recording or spoken question
 
-Both `--dictate` and `--voice` select a raw-key listener instead of the normal
-line reader. `--dictate` retains a tap-to-start/tap-to-finish interaction.
-`--voice` uses a terminal that can report real press and release events, so it
-does not guess when Enter was released:
+On the default laptop/terminal path, both `--dictate` and `--voice` select a
+raw-key listener instead of the normal line reader. `--dictate` retains a
+tap-to-start/tap-to-finish interaction. `--voice` uses a terminal that can
+report real press and release events, so it does not guess when Enter was
+released:
 
 ```text
 hold-to-talk Enter press
@@ -285,11 +286,13 @@ each frame wait is bounded and the total acquisition window is three seconds.
 It also gives the blocking closure an owned Tokio `Semaphore` permit. If the
 async caller is cancelled, the closure keeps the permit until it has dropped
 the V4L2 stream and device. A second camera request waits rather than starting
-another worker against a still-closing device. This is a bounded cleanup
-strategy, not a claim that cancellation interrupts a sensor instantly. The
-three-second bound covers frame polling; V4L2 setup ioctls themselves are
-driver calls without a separate timeout exposed by this backend, so a broken
-driver can still misbehave there.
+another worker against a still-closing device. The Raspberry Pi adapter has a
+different bounded cleanup mechanism: its `rpicam-still` child observes the
+same cancellation token, then Independence kills and reaps that child. Neither
+path claims that a sensor stops at an exact instant. The three-second V4L2
+bound covers frame polling; V4L2 setup ioctls themselves are driver calls
+without a separate timeout exposed by this backend, so a broken driver can
+still misbehave there.
 
 Dictation has a similar but narrower qualification. CPAL's callback runs on a
 platform audio thread, so it only converts sample format, averages channels,
@@ -465,3 +468,120 @@ tests separately verify that recording does not open before the listening cue,
 that a late cue after release/Escape cannot reopen it, and that `P` during the
 cue cannot activate a camera. They do not prove that a physical speaker works;
 only `cargo run -- --speak-test` can do that on the selected machine.
+
+## Latest milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
+
+This milestone changes **how physical intent enters** the existing voice
+runtime, not who owns conversation state. `Controller` still owns accepted
+history and `TurnId` authorization. `VoiceRuntime` still owns one unfinished
+hold-to-talk draft. The new small boundary lives in
+[`src/listen/controls.rs`](src/listen/controls.rs):
+
+```text
+one physical event
+  -> VoiceControlEvent
+       TalkPressed | TalkReleased | PhotoPressed | Cancel
+  -> VoiceInputEvent (adds source-loss/recovery facts)
+  -> VoiceRuntime::handle_control_event
+  -> existing DictationInput / existing voice draft lifecycle
+```
+
+There are now two adapters that produce those same facts:
+
+```text
+terminal profile/default                  raspberry-pi button profile
+------------------------                  ---------------------------
+listen/dictation.rs                       listen/evdev.rs
+Crossterm raw terminal                    selected /dev/input node
+Kitty key press/release                   Linux EV_KEY values
+        |                                         |
+        +------------ identical events -----------+
+```
+
+`TerminalVoiceInputSource` is deliberately still the only raw-terminal owner
+for ordinary `--voice`. `EvdevButtonInputSource` does not create a terminal
+reader at all. It opens the exact path passed to `--input-device`, checks that
+Enter, `P`, and Escape are supported, sets nonblocking I/O, and takes an
+exclusive Linux grab. That makes an attached keyboard a controller rather than
+a text keyboard. It ignores autorepeat and all unrelated keys. On
+`SYN_DROPPED` or device loss, it sends `SourceLost`; `VoiceRuntime` follows its
+ordinary Escape cancellation path, so an uncertain held recording cannot
+submit. The adapter retries only the same explicit path, emits
+`SourceRecovered` if it comes back, and requires a fresh press.
+
+This is why SSH is safe in button mode:
+
+```text
+SSH terminal keys  --x--> no Crossterm reader, no stdin reader
+attached keyboard  -----> evdev source -----> VoiceRuntime
+SIGINT / Ctrl+C    -----> Tokio signal handler -----> normal shutdown
+```
+
+The exact input node must be chosen rather than guessed. These commands are
+read-only; they do not load Whisper/Piper/Ollama, start a microphone, grab a
+keyboard, or capture a photograph:
+
+```bash
+cargo run --release -- --input-devices
+cargo run --release -- --audio-input-devices
+cargo run --release -- --audio-devices
+```
+
+[`src/launch.rs`](src/launch.rs) parses literal options; it does not touch
+hardware. [`src/profile.rs`](src/profile.rs) applies a narrow `raspberry-pi`
+profile. Its precedence is:
+
+```text
+--input / --input-device / --audio-input / --audio-output
+    > corresponding environment variables
+    > raspberry-pi profile defaults
+    > ordinary laptop defaults
+```
+
+The Pi defaults are intentionally conservative:
+
+```text
+input adapter: buttons (but an explicit --input-device is required)
+Ollama model:  gemma3:1b
+image contract: text-only
+camera backend: rpicam-still
+```
+
+“Text-only” is an application safety contract, not a guess based on a model
+name. `TurnRuntime::prepare_camera`, the voice `P` path, and
+`OllamaClient::answer_with_telemetry` all reject image work before camera
+enumeration, image encoding, or HTTP when it is selected. To intentionally use
+a verified vision model, set both `OLLAMA_MODEL` and
+`INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision` for that launch. This prevents an
+unverified Pi text model from receiving a photo or pretending to understand
+one.
+
+The Pi camera remains behind the existing `CameraService` interface:
+
+```text
+PhotoPressed while actual recording is active
+  -> VoiceRuntime queues an ordered draft photo
+  -> CameraService's one-permit capture gate
+  -> RpiCamStillBackend
+  -> direct rpicam-still --nopreview ... --output - child (no shell)
+  -> bounded stdout JPEG + full validation
+  -> child/handle released before an Ollama request can begin
+  -> existing ordered in-memory Photo collection
+```
+
+The V4L2 webcam backend remains the normal laptop/default backend. For Pi
+hardware, `rpicam-still` is selected only by the profile or the explicit
+`INDEPENDENCE_CAMERA_BACKEND=rpicam-still` override. The adapter uses a
+five-second child-process bound, a 10 MiB in-memory JPEG bound, no preview, no
+disk file, and no shell. Cancellation kills/reaps the app-owned child; that is
+stronger than simply aborting its async wrapper, but it still says nothing
+about any unrelated camera service the operating system might own.
+
+The ordinary test suite uses a fake event source, fake microphone/transcriber,
+fake camera backends, a direct fixture subprocess, and mock Ollama. It proves
+key mappings, repeat suppression, talk/photo/cancel routing, source-loss
+cancellation, explicit text-only camera rejection, direct subprocess arguments,
+bounded output, and child cancellation/reaping. It does **not** prove an
+attached Pi keyboard, USB microphone/speaker, ARM64 Whisper/Piper installation,
+or Camera Module 3 Wide. Those remain separate, documented hardware checks in
+[`docs/rasberry-pi.md`](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).

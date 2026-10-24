@@ -9,7 +9,8 @@ It can:
 - take keyboard input as its `listen` capability;
 - send a text question, or an ordered in-memory JPEG/PNG context plus a
   question, to a local Ollama model as `think`;
-- list local Linux V4L2 cameras and explicitly capture one still image as
+- list local Linux V4L2 cameras (or a Raspberry Pi `rpicam-still` camera
+  module when explicitly profiled) and explicitly capture one still image as
   `see` input;
 - retain successfully accepted photographs, in attachment order, and
   conversation for follow-up questions as `see` context; and
@@ -240,7 +241,13 @@ cargo run -- --dictate
 Cargo compiles the package (writing `target/`) and starts raw-key dictation
 mode. At READY it prints the selected microphone and Whisper model path. CPAL
 chooses the system default input by default. To select a particular input by
-its exact CPAL device name, use an environment variable for one launch:
+its exact CPAL device name or ID, first inspect it without opening a stream:
+
+```bash
+cargo run -- --audio-input-devices
+```
+
+`--dictate` uses the existing environment selector for one launch:
 
 ```bash
 INDEPENDENCE_MICROPHONE='Exact microphone name' cargo run -- --dictate
@@ -268,6 +275,11 @@ INDEPENDENCE_MICROPHONE='Exact microphone name' \
 OLLAMA_MODEL=qwen3-vl:4b-instruct \
 cargo run -- --voice
 ```
+
+For `--voice`, the explicit `--audio-input 'Exact CPAL input id'` option has
+the same selection behavior and wins over `INDEPENDENCE_MICROPHONE`. It is
+especially useful alongside the Raspberry Pi button profile; run
+`cargo run -- --input-devices` to list a separate attached-keyboard controller.
 
 `--dictate` retains its original tap-Enter controls. `--voice` has separate,
 button-controlled behavior and requires a terminal that supports Kitty/CSI-u
@@ -342,14 +354,15 @@ For `--voice`, try this separate sequence:
    while a model answer is pending. None of those unfinished results should
    print or alter the previously accepted conversation.
 
-Current limits: English `base.en` recognition runs on CPU; there is no input
-device list UI, voice activity detection, saved audio, microphone permissions
-workflow, decision-model routing, photo permission loop, autonomous camera
-decision, TTS streaming, or echo cancellation. Voice questions cannot use
-typed `/look` or `/camera` commands; keep using the default keyboard mode for
-those. Whisper cancellation is cooperative: Esc prevents a result from being
-accepted, while the native recognizer exits at its next supported abort
-callback point.
+Current limits: English `base.en` recognition runs on CPU; there is no GUI,
+voice activity detection, saved audio, decision-model routing, photo permission
+loop, autonomous camera decision, TTS streaming, or echo cancellation.
+`--audio-input-devices` and `--input-devices` provide explicit device listings,
+but a person still chooses which device to use and grants its narrow Linux
+permissions. Voice questions cannot use typed `/look` or `/camera` commands;
+keep using the default keyboard mode for those. Whisper cancellation is
+cooperative: Esc prevents a result from being accepted, while the native
+recognizer exits at its next supported abort callback point.
 
 The camera code adds the Rust `v4l` crate for Linux V4L2 devices. Cargo may
 download and compile it on the first build; this current Linux Mint machine
@@ -693,8 +706,10 @@ application code.
   streaming, or echo cancellation.
 - One explicit JPEG/PNG or one explicit camera still at a time; no live view,
   continuous vision, background capture, or autonomous camera use.
-- Camera support is Linux V4L2 single-plane MJPEG/YUYV only; unusual drivers or
-  multi-plane-only devices may not be listed as usable.
+- Camera support is Linux V4L2 single-plane MJPEG/YUYV by default; the explicit
+  Raspberry Pi profile also supports a one-shot `rpicam-still` JPEG path for
+  an installed Pi camera stack. Unusual V4L2 drivers or unavailable Pi camera
+  tooling may not be listed as usable.
 - Non-streaming Ollama responses; no partial answer is printed.
 - Six accepted exchanges per scene/session; this is a simple context cap, not
   exact token budgeting. Start a new scene with `/look` or use `/reset`.
@@ -952,6 +967,8 @@ to independently update conversation history or print an unapproved answer.
 ```text
 src/
   main.rs                  selects typed, --dictate, or --voice mode
+  launch.rs                parses explicit launch/profile/device choices
+  profile.rs               resolves laptop/Pi defaults and local overrides
   app.rs                   application event loops and worker lifetimes
   telemetry.rs             redacted correlations, JSONL, OTLP spans/metrics
   protocol.rs              typed events, effects, IDs, and requests/results
@@ -960,6 +977,8 @@ src/
   listen/
     mod.rs                 typed terminal-line parsing for normal mode
     dictation.rs           raw-key input for --dictate and --voice
+    controls.rs            device-independent talk/photo/cancel controls
+    evdev.rs               directly attached Linux keyboard button adapter
 
   dictation/
     mod.rs                 DictationSession and standalone dictation runtime
@@ -969,7 +988,7 @@ src/
 
   see/
     mod.rs                 explicit JPEG/PNG validation and Photo
-    camera.rs              Linux V4L2 discovery and one-still capture
+    camera.rs              V4L2 and rpicam-still one-still camera backends
 
   think/
     mod.rs                 loopback-only Ollama /api/chat client
@@ -988,3 +1007,61 @@ There is currently no decision model, photo-permission state, autonomous
 camera call, microphone transcription in normal typed mode, wake word,
 continuous vision, persistent memory, cloud fallback, agent/tool framework,
 speech streaming, TTS-driven turn-taking, or echo cancellation.
+
+### Latest: Raspberry Pi hardware adapters and keyboard-as-buttons
+
+The Pi work adds adapters around the existing voice runtime; it does not add a
+second controller or a different conversation model. Both input sources turn
+physical facts into the same four typed events:
+
+```text
+SSH/laptop terminal                    keyboard attached directly to Pi
+Crossterm raw-key reader               Linux evdev reader + exclusive grab
+        |                                          |
+        +---------- VoiceControlEvent -------------+
+                  TalkPressed / TalkReleased
+                  PhotoPressed / Cancel
+                              |
+                              v
+                 VoiceRuntime in src/app.rs
+                              |
+         +--------------------+---------------------+
+         |                    |                     |
+         v                    v                     v
+    DictationSession     CameraService          TurnRuntime
+    CPAL + Whisper       V4L2 or rpicam         Controller + Ollama
+```
+
+The adapter boundary matters: button mode never creates a stdin or Crossterm
+reader. An SSH session is therefore only a log window; Enter, `P`, and Escape
+typed there cannot control a recording. Ctrl+C remains an operating-system
+signal and performs the normal orderly shutdown.
+
+Use these read-only inventory commands before selecting anything:
+
+```bash
+cargo run --release -- --input-devices
+cargo run --release -- --audio-input-devices
+cargo run --release -- --audio-devices
+```
+
+Then an explicit Pi launch has this shape (replace the quoted IDs and stable
+device path with values from the listings):
+
+```bash
+cargo run --release -- --voice --profile raspberry-pi \
+  --input buttons \
+  --input-device /dev/input/by-id/usb-Example-event-kbd \
+  --audio-input 'Exact CPAL input id' \
+  --audio-output 'Exact CPAL output id'
+```
+
+The profile defaults to `gemma3:1b`, which Independence marks **text-only**.
+That is intentional: a `P` press reports that capture remains off instead of
+silently taking a photograph the selected model cannot use. A deliberately
+verified local vision model needs both `OLLAMA_MODEL=...` and
+`INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision` for one launch. The Pi profile also
+selects `rpicam-still`; its direct child process writes one bounded JPEG to
+memory, is validated, and is released before Ollama is asked. Details,
+permissions, and the physical acceptance sequence are in
+[the Raspberry Pi guide](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).

@@ -32,11 +32,30 @@ pub struct ConversationTurn {
     pub assistant: String,
 }
 
+/// Whether the selected model has been explicitly configured to accept image
+/// payloads.  This is a local application contract, not a guess from a model
+/// name or a claim about what an Ollama server might support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageInputSupport {
+    Vision,
+    TextOnly,
+}
+
+impl ImageInputSupport {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vision => "vision",
+            Self::TextOnly => "text-only",
+        }
+    }
+}
+
 /// Configuration for a loopback-only Ollama endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OllamaConfig {
     endpoint: Url,
     model: String,
+    image_input_support: ImageInputSupport,
 }
 
 impl OllamaConfig {
@@ -45,11 +64,22 @@ impl OllamaConfig {
         let endpoint = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_owned());
         let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_owned());
 
-        Self::new(&endpoint, model)
+        Self::new_with_image_support(&endpoint, model, ImageInputSupport::Vision)
     }
 
     /// Builds a configuration for tests or an explicitly configured local server.
     pub fn new(endpoint: &str, model: impl Into<String>) -> Result<Self, ThinkError> {
+        Self::new_with_image_support(endpoint, model, ImageInputSupport::Vision)
+    }
+
+    /// Builds a configuration with an explicit local image-input contract.
+    /// Profiles use this to keep a text-only Pi model from receiving a photo
+    /// merely because it shares the same Ollama transport as the laptop model.
+    pub fn new_with_image_support(
+        endpoint: &str,
+        model: impl Into<String>,
+        image_input_support: ImageInputSupport,
+    ) -> Result<Self, ThinkError> {
         let endpoint =
             Url::parse(endpoint).map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))?;
         let model = model.into();
@@ -70,13 +100,25 @@ impl OllamaConfig {
             return Err(ThinkError::EmptyModel);
         }
 
-        Ok(Self { endpoint, model })
+        Ok(Self {
+            endpoint,
+            model,
+            image_input_support,
+        })
     }
 
     fn chat_url(&self) -> Result<Url, ThinkError> {
         self.endpoint
             .join("api/chat")
             .map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))
+    }
+
+    pub fn image_input_support(&self) -> ImageInputSupport {
+        self.image_input_support
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 }
 
@@ -164,6 +206,14 @@ impl OllamaClient {
         &self.config.model
     }
 
+    pub fn image_input_support(&self) -> ImageInputSupport {
+        self.config.image_input_support()
+    }
+
+    pub fn supports_images(&self) -> bool {
+        self.image_input_support() == ImageInputSupport::Vision
+    }
+
     /// Requests one complete, non-streaming answer from Ollama.
     ///
     /// This convenience form preserves the transport boundary for callers
@@ -187,6 +237,11 @@ impl OllamaClient {
         images: &[&[u8]],
         interaction: Option<&Interaction>,
     ) -> Result<OllamaAnswer, ThinkError> {
+        if !images.is_empty() && !self.supports_images() {
+            return Err(ThinkError::ImagesUnsupported {
+                model: self.model().to_owned(),
+            });
+        }
         let image_bytes = images.iter().map(|bytes| bytes.len()).sum::<usize>();
         if let Some(interaction) = interaction {
             interaction.unavailable(
@@ -569,6 +624,11 @@ pub enum ThinkError {
 
     #[error("Ollama returned an empty answer; no answer was accepted")]
     EmptyAnswer,
+
+    #[error(
+        "configured model `{model}` is marked text-only; configure a verified vision model before submitting photographs"
+    )]
+    ImagesUnsupported { model: String },
 }
 
 impl ThinkError {
@@ -587,7 +647,8 @@ impl ThinkError {
             | Self::UnsupportedScheme(_)
             | Self::NonLoopbackEndpoint(_)
             | Self::EndpointHasPath(_)
-            | Self::EmptyModel => "configuration",
+            | Self::EmptyModel
+            | Self::ImagesUnsupported { .. } => "configuration",
         }
     }
 }
@@ -603,7 +664,8 @@ mod tests {
     };
 
     use super::{
-        ConversationTurn, OllamaClient, OllamaConfig, OllamaStatistics, TEACHER_INSTRUCTIONS,
+        ConversationTurn, ImageInputSupport, OllamaClient, OllamaConfig, OllamaStatistics,
+        TEACHER_INSTRUCTIONS, ThinkError,
     };
 
     fn client(server: &MockServer) -> OllamaClient {
@@ -615,6 +677,26 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), future)
             .await
             .expect("mock HTTP test exceeded its three-second timeout")
+    }
+
+    #[tokio::test]
+    async fn a_text_only_configuration_rejects_photo_bytes_before_http() {
+        let server = MockServer::start().await;
+        let client = OllamaClient::new(
+            OllamaConfig::new_with_image_support(
+                &server.uri(),
+                "text-only-model",
+                ImageInputSupport::TextOnly,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = client
+            .answer(&[], "What is visible?", &[b"not an image"])
+            .await;
+        assert!(matches!(result, Err(ThinkError::ImagesUnsupported { .. })));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

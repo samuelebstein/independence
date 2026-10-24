@@ -45,6 +45,49 @@ pub struct MicrophoneDescription {
     channels: u16,
 }
 
+/// One CPAL input device available for an explicit microphone selection.
+///
+/// `id` is CPAL's host-qualified identifier and is the preferred selector;
+/// `name` remains useful for a person reading the list. Listing does not open
+/// a stream or begin capture.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Lists OS input devices without starting microphone capture.
+pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
+    let host = cpal::default_host();
+    let default_id = host
+        .default_input_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+    let mut devices = host
+        .input_devices()
+        .map_err(|error| format!("could not enumerate microphone devices: {error}"))?
+        .map(|device| {
+            let id = device
+                .id()
+                .map_err(|error| format!("could not read microphone identifier: {error}"))?
+                .to_string();
+            let name = device
+                .description()
+                .map_err(|error| format!("could not read microphone description: {error}"))?
+                .name()
+                .to_owned();
+            Ok(InputDevice {
+                is_default: default_id.as_deref() == Some(id.as_str()),
+                id,
+                name,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    devices.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(devices)
+}
+
 impl MicrophoneDescription {
     pub(crate) fn new(name: String, sample_rate: u32, channels: u16) -> Self {
         Self {
@@ -102,6 +145,13 @@ impl CpalRecorder {
         let requested_name = env::var("INDEPENDENCE_MICROPHONE")
             .ok()
             .filter(|name| !name.trim().is_empty());
+        Self::with_requested_name(requested_name)
+    }
+
+    /// Constructs a recorder with an exact CPAL device identifier or name.
+    /// Command-line/profile resolution happens above this hardware boundary;
+    /// the recorder itself never changes global audio settings.
+    pub fn with_requested_name(requested_name: Option<String>) -> Self {
         Self { requested_name }
     }
 
@@ -117,13 +167,17 @@ impl CpalRecorder {
                     .map_err(|error| format!("could not read microphone description: {error}"))?
                     .name()
                     .to_owned();
-                if &name == requested_name {
+                let id = device
+                    .id()
+                    .map_err(|error| format!("could not read microphone identifier: {error}"))?
+                    .to_string();
+                if &name == requested_name || &id == requested_name {
                     return Ok(device);
                 }
             }
 
             return Err(format!(
-                "microphone `{requested_name}` was not found; unset INDEPENDENCE_MICROPHONE or choose an exact available device name"
+                "microphone `{requested_name}` was not found; unset INDEPENDENCE_MICROPHONE or choose an exact ID/name from --audio-input-devices"
             ));
         }
 

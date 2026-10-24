@@ -17,12 +17,22 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::{
     controller::Controller,
-    dictation::transcribe::{Transcriber, TranscriptionError},
     dictation::{self, DictationAction, DictationSession},
-    listen,
+    dictation::{
+        audio::CpalRecorder,
+        transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
+    },
+    launch::VoiceLaunchOptions,
+    listen::{
+        self,
+        controls::{VoiceControlEvent, VoiceInputEvent, VoiceInputSource},
+        evdev::{self, EvdevButtonInputSource},
+    },
+    profile::{self, CameraBackendSelection, ResolvedVoiceInput},
     protocol::{
         CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
@@ -154,13 +164,78 @@ pub async fn run_dictation() -> Result<(), AppError> {
 /// own microphone and Whisper lifetimes. Only an accepted transcript crosses
 /// into the main controller as literal `Input::Ask` text.
 pub async fn run_voice() -> Result<(), AppError> {
-    run_voice_with_output(None).await
+    run_voice_with_options(VoiceLaunchOptions::default()).await
 }
 
 /// Lists local audio output devices without creating a Piper worker, opening
 /// an output stream, or touching microphone/model/camera capabilities.
 pub fn list_audio_outputs() -> Result<(), AppError> {
     speak::list_audio_outputs().map_err(AppError::AudioOutput)
+}
+
+/// Lists microphone devices through CPAL without opening a stream, loading
+/// Whisper, or constructing a voice/controller runtime.
+pub fn list_audio_inputs() -> Result<(), AppError> {
+    let devices = dictation::audio::list_input_devices().map_err(AppError::AudioInput)?;
+    if devices.is_empty() {
+        speak::warning(
+            "audio_input_unavailable",
+            "no microphone devices were reported by the local CPAL backend",
+        );
+        return Ok(());
+    }
+    speak::process("audio_input_list", format!("{} device(s)", devices.len()));
+    for device in devices {
+        info!(
+            target: "process",
+            event = "audio_input_available",
+            default = device.is_default,
+            id = %device.id,
+            device = ?device.name,
+            "audio input"
+        );
+    }
+    Ok(())
+}
+
+/// Lists Linux input nodes without opening a microphone, model, camera, or
+/// output stream.  The selected button-controller path must be supplied
+/// explicitly to `--input-device`; this command never selects one itself.
+pub fn list_input_devices() -> Result<(), AppError> {
+    let devices = evdev::list_input_devices().map_err(AppError::InputDevices)?;
+    if devices.is_empty() {
+        speak::warning(
+            "input_device_unavailable",
+            "no /dev/input/event* devices were found",
+        );
+        return Ok(());
+    }
+    speak::process("input_device_list", format!("{} node(s)", devices.len()));
+    for device in devices {
+        match device.access_error {
+            Some(error) => speak::warning(
+                "input_device_inaccessible",
+                format!("{}: {error}", device.path.display()),
+            ),
+            None => {
+                let controls = device.controls.expect("open device has controls");
+                info!(
+                    target: "process",
+                    event = "input_device_available",
+                    path = %device.path.display(),
+                    stable_path = ?device.stable_path.as_ref().map(|path| path.display().to_string()),
+                    device = ?device.name,
+                    physical_path = ?device.physical_path,
+                    enter = controls.enter,
+                    photo_p = controls.photo,
+                    escape = controls.cancel,
+                    controller_compatible = device.supports_controller(),
+                    "Linux input device"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Deliberately exercises exactly one local synthesis/playback request. This
@@ -205,19 +280,61 @@ pub async fn run_speech_test(audio_output_id: Option<String>) -> Result<(), AppE
 /// audio-output device identifier from the command line. `None` keeps the
 /// configured/default output selection behavior.
 pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<(), AppError> {
-    let client = OllamaClient::from_environment()?;
+    run_voice_with_options(VoiceLaunchOptions {
+        audio_output: audio_output_id,
+        ..VoiceLaunchOptions::default()
+    })
+    .await
+}
+
+/// Runs hold-to-talk voice with a terminal or directly attached physical
+/// button source.  Both sources send the same `VoiceControlEvent` values into
+/// one `VoiceRuntime`; neither gets a special controller path.
+pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), AppError> {
+    let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
+    let client = OllamaClient::new(resolved.ollama)?;
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
         mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (voice_aux_sender, mut voice_aux_receiver) = mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
     let (speech_event_sender, mut speech_event_receiver) =
         mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
-    let speech = speak::SpeechService::with_output_id(audio_output_id, speech_event_sender)
-        .map_err(AppError::Speech)?;
-    let mut input = listen::dictation::spawn_voice_key_reader(dictation_event_sender.clone())
-        .map_err(AppError::InputAdapter)?;
+    let (control_sender, mut control_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let speech = speak::SpeechService::with_configuration(
+        resolved.piper,
+        speak::playback::OutputSelection::from_requested_id(resolved.audio_output),
+        speech_event_sender,
+    )
+    .map_err(AppError::Speech)?;
+    let source_name = resolved.input.label();
+    let mut input: Box<dyn VoiceInputSource> = match resolved.input {
+        ResolvedVoiceInput::Terminal => Box::new(
+            listen::dictation::spawn_terminal_voice_input(control_sender)
+                .map_err(AppError::InputAdapter)?,
+        ),
+        ResolvedVoiceInput::Buttons(path) => Box::new(
+            EvdevButtonInputSource::open(path, control_sender).map_err(AppError::ButtonInput)?,
+        ),
+    };
+    speak::process("voice_input_source", source_name);
+    if let Some(profile) = resolved.profile {
+        speak::process("hardware_profile", profile.label());
+    }
+    speak::process("voice_camera_backend", resolved.camera_backend.label());
+    speak::process(
+        "voice_model",
+        format!(
+            "{} ({})",
+            client.model(),
+            client.image_input_support().label()
+        ),
+    );
 
-    let dictation = DictationSession::from_environment(dictation_event_sender);
+    let dictation = DictationSession::with_services(
+        Arc::new(CpalRecorder::with_requested_name(resolved.microphone)),
+        Arc::new(WhisperTranscriber::new(resolved.whisper_model)),
+        dictation_event_sender,
+    );
     let microphone_label = dictation.microphone_label();
     let microphone_for_display = match &microphone_label {
         Ok(label) => Ok(label.as_str()),
@@ -231,7 +348,14 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 
     let mut runtime = VoiceRuntime::new(
         Controller::new(),
-        TurnRuntime::new(client, CameraService::v4l(), main_event_sender),
+        TurnRuntime::new(
+            client,
+            match resolved.camera_backend {
+                CameraBackendSelection::V4l => CameraService::v4l(),
+                CameraBackendSelection::RpiCamStill => CameraService::rpicam(),
+            },
+            main_event_sender,
+        ),
         dictation,
         voice_aux_sender,
         speech,
@@ -241,7 +365,11 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 
     loop {
         let event = tokio::select! {
-            _ = tokio::signal::ctrl_c() => VoiceEvent::Dictation(DictationEvent::Input(DictationInput::Interrupt)),
+            _ = tokio::signal::ctrl_c() => VoiceEvent::Control(VoiceInputEvent::Interrupt),
+            event = control_receiver.recv() => match event {
+                Some(event) => VoiceEvent::Control(event),
+                None => VoiceEvent::ControlChannelClosed,
+            },
             event = dictation_event_receiver.recv() => VoiceEvent::Dictation(event.unwrap_or(DictationEvent::Input(DictationInput::EndOfInput))),
             event = main_event_receiver.recv() => VoiceEvent::Main(event.unwrap_or(Event::Input(Input::Interrupt))),
             event = voice_aux_receiver.recv() => match event {
@@ -256,6 +384,15 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
         };
 
         let keep_running = match event {
+            VoiceEvent::Control(event) => runtime.handle_control_event(event).await,
+            VoiceEvent::ControlChannelClosed => {
+                runtime
+                    .handle_control_source_failure(
+                        source_name,
+                        "control channel closed unexpectedly".into(),
+                    )
+                    .await
+            }
             VoiceEvent::Dictation(event) => runtime.handle_dictation_event(event).await,
             VoiceEvent::Main(event) => runtime.handle_main_event(event).await,
             VoiceEvent::Aux(event) => runtime.handle_aux_event(event).await,
@@ -281,6 +418,8 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 }
 
 enum VoiceEvent {
+    Control(VoiceInputEvent),
+    ControlChannelClosed,
     Dictation(DictationEvent),
     Main(Event),
     Aux(VoiceAuxEvent),
@@ -439,6 +578,10 @@ impl TurnRuntime {
             .map(|active| active.interaction.clone())
     }
 
+    fn supports_images(&self) -> bool {
+        self.client.supports_images()
+    }
+
     async fn apply(
         &mut self,
         effect: Effect,
@@ -487,6 +630,31 @@ impl TurnRuntime {
             VisualRequest::ProposeNew(_) | VisualRequest::ProposeCamera(_) => 1,
         });
         interaction.mark("turn.request_dispatched");
+        let request_uses_images = match &request.visual {
+            VisualRequest::UseAccepted(photos) => !photos.is_empty(),
+            VisualRequest::ProposeNew(_) | VisualRequest::ProposeCamera(_) => true,
+        };
+        if request_uses_images && !self.client.supports_images() {
+            interaction.event(
+                "turn.image_support",
+                "rejected",
+                telemetry::fields([("reason", serde_json::json!("configured_text_only_model"))]),
+            );
+            interaction.complete("failed", telemetry::Fields::new());
+            let _ = self
+                .event_sender
+                .send(Event::TurnFinished(TurnFinished {
+                    id,
+                    result: TurnResult::Failed {
+                        message: format!(
+                            "configured model `{}` is text-only; choose a verified vision model and set INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision before submitting photographs",
+                            self.client.model()
+                        ),
+                    },
+                }))
+                .await;
+            return;
+        }
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let client = self.client.clone();
@@ -532,6 +700,20 @@ impl TurnRuntime {
     }
 
     fn prepare_camera(&self, preparation: CameraPreparation) {
+        if !self.client.supports_images() {
+            let event_sender = self.event_sender.clone();
+            tokio::spawn(async move {
+                let _ = event_sender
+                    .send(Event::CameraPrepared {
+                        id: preparation.id,
+                        result: Err(
+                            "the configured model is text-only; camera capture remains off until a verified vision model is configured".into(),
+                        ),
+                    })
+                    .await;
+            });
+            return;
+        }
         let camera = self.camera.clone();
         let event_sender = self.event_sender.clone();
         tokio::spawn(async move {
@@ -800,6 +982,76 @@ impl VoiceRuntime {
             self.pending_answer_speech.insert(utterance_id, interaction);
         }
         result.keep_running
+    }
+
+    /// Applies a device-independent physical control through the same paths
+    /// the terminal adapter used before controls were separated out.
+    ///
+    /// This is intentionally a translation layer, not a second button state
+    /// machine: DictationSession still owns microphone/transcription state and
+    /// the main Controller still owns model-turn cancellation and acceptance.
+    async fn handle_control_event(&mut self, event: VoiceInputEvent) -> bool {
+        match event {
+            VoiceInputEvent::Control(control) => {
+                let input = match control {
+                    VoiceControlEvent::TalkPressed => DictationInput::HoldStart,
+                    VoiceControlEvent::TalkReleased => DictationInput::HoldEnd,
+                    VoiceControlEvent::PhotoPressed => DictationInput::Photo,
+                    VoiceControlEvent::Cancel => DictationInput::Escape,
+                };
+                self.handle_dictation_event(DictationEvent::Input(input))
+                    .await
+            }
+            VoiceInputEvent::Interrupt => {
+                self.handle_dictation_event(DictationEvent::Input(DictationInput::Interrupt))
+                    .await
+            }
+            VoiceInputEvent::SourceFailed { source, message } => {
+                self.handle_control_source_failure(source, message).await
+            }
+            VoiceInputEvent::SourceLost { source, message } => {
+                self.handle_control_source_lost(source, message).await
+            }
+            VoiceInputEvent::SourceRecovered { source } => {
+                speak::process(
+                    "voice_input_source_recovered",
+                    format!(
+                        "{source} was reacquired; press Enter again to start a fresh recording"
+                    ),
+                );
+                true
+            }
+        }
+    }
+
+    /// A physical button source must never fail while leaving an active
+    /// recording or authorized model turn alive.  We first use the ordinary
+    /// interruption path, then leave the voice loop so its owner can release
+    /// the source and all native work.
+    async fn handle_control_source_failure(&mut self, source: &str, message: String) -> bool {
+        speak::warning(
+            "voice_input_source_failed",
+            format!("{source} failed: {message}; cancelling the active interaction"),
+        );
+        let _ = self
+            .handle_dictation_event(DictationEvent::Input(DictationInput::Interrupt))
+            .await;
+        false
+    }
+
+    /// A USB keyboard can disappear and later return.  Its last release may
+    /// never have reached us, so treat loss as an ordinary cancellation rather
+    /// than submitting the potentially incomplete held recording.  The evdev
+    /// adapter reports recovery separately; no key state survives the loss.
+    async fn handle_control_source_lost(&mut self, source: &str, message: String) -> bool {
+        speak::warning(
+            "voice_input_source_lost",
+            format!(
+                "{source} was lost: {message}; cancelling unfinished work and waiting for recovery"
+            ),
+        );
+        self.handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+            .await
     }
 
     async fn handle_dictation_event(&mut self, event: DictationEvent) -> bool {
@@ -1221,6 +1473,13 @@ impl VoiceRuntime {
     }
 
     async fn request_photo(&mut self) {
+        if !self.turns.supports_images() {
+            speak::warning(
+                "photo_capture_unavailable",
+                "the configured model is text-only; camera capture remains off until a verified vision model is configured",
+            );
+            return;
+        }
         let queued = {
             let Some(draft) = self.draft.as_mut() else {
                 return;
@@ -1882,11 +2141,23 @@ pub enum AppError {
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
 
+    #[error("could not inspect Linux input devices: {0}")]
+    InputDevices(#[source] evdev::InputDeviceError),
+
+    #[error("could not start the Linux button controller: {0}")]
+    ButtonInput(#[source] evdev::InputDeviceError),
+
+    #[error("could not resolve the hardware profile: {0}")]
+    Profile(#[source] profile::ProfileError),
+
     #[error("could not start the local speech worker: {0}")]
     Speech(#[source] io::Error),
 
     #[error("could not inspect local audio output devices: {0}")]
     AudioOutput(#[source] speak::playback::PlaybackError),
+
+    #[error("could not inspect local audio input devices: {0}")]
+    AudioInput(String),
 
     #[error("the local speech worker could not queue the test sentence")]
     SpeechTestUnavailable,
@@ -1938,9 +2209,13 @@ mod tests {
             audio::{MicrophoneDescription, Recorder, RecordingHandle},
             transcribe::{Transcriber, TranscriptionError},
         },
+        listen::controls::{
+            FakeVoiceInputSource, VoiceControlEvent, VoiceInputEvent, VoiceInputSource,
+        },
         protocol::{
-            CapturedAudio, DictationEvent, DictationInput, Effect, Event, Input, RecordingId,
-            TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
+            CameraPreparation, CameraRequestId, CapturedAudio, DictationEvent, DictationInput,
+            Effect, Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult,
+            VisualRequest,
         },
         see::{
             MAX_PHOTO_BYTES, Photo, PhotoSource,
@@ -1949,7 +2224,7 @@ mod tests {
                 CameraService,
             },
         },
-        think::{OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
+        think::{ImageInputSupport, OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
     };
 
     use super::{TurnRuntime, VoiceRuntime, run_turn};
@@ -2309,7 +2584,11 @@ mod tests {
             Ok(vec![self.camera.clone()])
         }
 
-        fn capture(&self, _camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
             self.captures.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 Err(CameraError::NoCameras)
@@ -2330,13 +2609,38 @@ mod tests {
             Ok(vec![self.camera.clone()])
         }
 
-        fn capture(&self, _camera: &CameraDescriptor) -> Result<Photo, CameraError> {
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
             self.captures.fetch_add(1, Ordering::SeqCst);
             self.photos
                 .lock()
                 .expect("synthetic camera sequence lock")
                 .pop_front()
                 .ok_or(CameraError::NoCameras)
+        }
+    }
+
+    struct UnexpectedCameraBackend {
+        list_calls: Arc<AtomicUsize>,
+        capture_calls: Arc<AtomicUsize>,
+    }
+
+    impl CameraBackend for UnexpectedCameraBackend {
+        fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CameraError::NoCameras)
+        }
+
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
+            self.capture_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CameraError::NoCameras)
         }
     }
 
@@ -2350,6 +2654,194 @@ mod tests {
         (camera, photo)
     }
 
+    #[tokio::test]
+    async fn fake_button_source_uses_the_same_talk_press_and_release_path() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(
+            &server,
+            ["literal button question".to_owned()],
+            unused_camera_service(),
+        );
+        let (sender, mut receiver) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let mut source = FakeVoiceInputSource::new(sender);
+
+        source
+            .emit(VoiceInputEvent::Control(VoiceControlEvent::TalkPressed))
+            .await;
+        let event = receiver.recv().await.expect("fake press event");
+        assert!(harness.runtime.handle_control_event(event).await);
+        let cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("button press should queue the existing listening cue");
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: cue.utterance_id,
+                    owner: SpeechOwner::Draft(cue.draft_id),
+                    outcome: SpeechOutcome::Played,
+                })
+                .await
+        );
+        let started = harness.next_dictation_event().await;
+        let recording_id = match started {
+            DictationEvent::RecordingStarted { recording_id } => recording_id,
+            event => panic!("expected recording start from button press, got {event:?}"),
+        };
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::RecordingStarted { recording_id })
+                .await
+        );
+
+        source
+            .emit(VoiceInputEvent::Control(VoiceControlEvent::TalkReleased))
+            .await;
+        let event = receiver.recv().await.expect("fake release event");
+        assert!(harness.runtime.handle_control_event(event).await);
+        assert_eq!(harness.recorder.finishes.load(Ordering::SeqCst), 1);
+
+        source.shutdown();
+        assert!(source.was_shutdown());
+    }
+
+    #[tokio::test]
+    async fn button_photo_and_cancel_controls_use_the_common_voice_runtime_path() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: false,
+            captures: captures.clone(),
+        }));
+        let mut harness = voice_harness(
+            &server,
+            ["a draft that must be cancelled".to_owned()],
+            camera_service,
+        );
+        let (sender, mut receiver) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let mut source = FakeVoiceInputSource::new(sender);
+
+        source
+            .emit(VoiceInputEvent::Control(VoiceControlEvent::TalkPressed))
+            .await;
+        assert!(
+            harness
+                .runtime
+                .handle_control_event(receiver.recv().await.expect("button press event"))
+                .await
+        );
+        let cue = harness
+            .runtime
+            .pending_listening_cue
+            .expect("talk press should start the established listening cue");
+        assert!(
+            harness
+                .runtime
+                .handle_speech_event(SpeechEvent {
+                    utterance_id: cue.utterance_id,
+                    owner: SpeechOwner::Draft(cue.draft_id),
+                    outcome: SpeechOutcome::Played,
+                })
+                .await
+        );
+        let recording_id = match harness.next_dictation_event().await {
+            DictationEvent::RecordingStarted { recording_id } => recording_id,
+            event => panic!("expected recording start, got {event:?}"),
+        };
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::RecordingStarted { recording_id })
+                .await
+        );
+
+        // A `P` press is a separate control event, not typed text. It uses
+        // the same ordered photo path as the terminal adapter once recording
+        // is actually open.
+        source
+            .emit(VoiceInputEvent::Control(VoiceControlEvent::PhotoPressed))
+            .await;
+        assert!(
+            harness
+                .runtime
+                .handle_control_event(receiver.recv().await.expect("photo press event"))
+                .await
+        );
+        let photo_finished = harness.next_aux_event().await;
+        assert!(matches!(
+            &photo_finished,
+            super::VoiceAuxEvent::PhotoCaptureFinished { result: Ok(_), .. }
+        ));
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+
+        source
+            .emit(VoiceInputEvent::Control(VoiceControlEvent::Cancel))
+            .await;
+        assert!(
+            harness
+                .runtime
+                .handle_control_event(receiver.recv().await.expect("cancel event"))
+                .await
+        );
+        let cancelled = harness.next_dictation_event().await;
+        assert!(matches!(
+            &cancelled,
+            DictationEvent::RecordingCancelled { recording_id: id } if *id == recording_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(cancelled).await);
+        assert!(harness.runtime.draft.is_none());
+        assert!(!harness.runtime.controller.has_active_turn());
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        source.shutdown();
+        assert!(source.was_shutdown());
+    }
+
+    #[tokio::test]
+    async fn button_source_loss_cancels_incomplete_capture_and_recovery_needs_a_fresh_press() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(
+            &server,
+            ["should never submit".to_owned()],
+            unused_camera_service(),
+        );
+        let _recording_id = harness.start_hold().await;
+
+        assert!(
+            harness
+                .runtime
+                .handle_control_event(VoiceInputEvent::SourceLost {
+                    source: "synthetic buttons",
+                    message: "device disconnected".into(),
+                })
+                .await
+        );
+        let cancelled = harness.next_dictation_event().await;
+        assert!(matches!(
+            cancelled,
+            DictationEvent::RecordingCancelled { .. }
+        ));
+        assert!(harness.runtime.handle_dictation_event(cancelled).await);
+        assert_eq!(harness.recorder.cancels.load(Ordering::SeqCst), 1);
+        assert!(harness.runtime.draft.is_none());
+
+        assert!(
+            harness
+                .runtime
+                .handle_control_event(VoiceInputEvent::SourceRecovered {
+                    source: "synthetic buttons",
+                })
+                .await
+        );
+        assert!(harness.main_events.try_recv().is_err());
+    }
+
     fn start_request(effects: Vec<Effect>) -> TurnRequest {
         effects
             .into_iter()
@@ -2358,6 +2850,46 @@ mod tests {
                 _ => None,
             })
             .expect("controller should start a turn")
+    }
+
+    #[tokio::test]
+    async fn text_only_model_rejects_camera_preparation_before_device_access() {
+        let server = MockServer::start().await;
+        let client = OllamaClient::new(
+            OllamaConfig::new_with_image_support(
+                &server.uri(),
+                "text-only-model",
+                ImageInputSupport::TextOnly,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let capture_calls = Arc::new(AtomicUsize::new(0));
+        let camera = CameraService::with_backend(Arc::new(UnexpectedCameraBackend {
+            list_calls: list_calls.clone(),
+            capture_calls: capture_calls.clone(),
+        }));
+        let (sender, mut receiver) = mpsc::channel(super::EVENT_CHANNEL_CAPACITY);
+        let runtime = TurnRuntime::new(client, camera, sender);
+
+        runtime.prepare_camera(CameraPreparation {
+            id: CameraRequestId::new(1),
+            requested: None,
+        });
+        let event = within_test_timeout(receiver.recv())
+            .await
+            .expect("text-only camera rejection");
+        assert!(matches!(
+            event,
+            Event::CameraPrepared {
+                result: Err(message),
+                ..
+            } if message.contains("text-only")
+        ));
+        assert_eq!(list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(capture_calls.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

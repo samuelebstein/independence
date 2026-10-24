@@ -55,6 +55,8 @@ Read these files in this order:
    editable teaching guidance.
 8. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
+9. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
+   text-only local installation path.
 
 ## Run it on the same laptop
 

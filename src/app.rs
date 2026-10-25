@@ -323,42 +323,45 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 /// one `VoiceRuntime`; neither gets a special controller path.
 pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), AppError> {
     let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
-    match resolved.pipeline {
-        VoicePipeline::TranscribeAndSpeak => {
-            // Profile resolution rejects the model-less fixture backend for
-            // this pipeline. Keep the invariant local to configuration rather
-            // than allowing the text path to silently choose a backend.
-            let client = OllamaClient::new(
-                resolved
-                    .ollama
-                    .clone()
-                    .expect("text pipeline requires the resolved Ollama backend"),
-            )?;
+    match (resolved.pipeline, resolved.backend) {
+        (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
+            let client = configured_ollama_client(&resolved)?;
             discover_model_capabilities(&client).await;
             run_transcribe_and_speak(resolved, client).await
         }
-        VoicePipeline::AudioToAudio => {
+        (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
+            backend: backend.label(),
+            pipeline: VoicePipeline::TranscribeAndSpeak.label(),
+        }),
+        (VoicePipeline::AudioToAudio, backend) => {
             // The fixture backend is specifically a microphone→backend→speaker
             // plumbing check. It must not start an Ollama client or probe a
             // model. The explicit `ollama` backend receives cached metadata
             // first and will reject unsupported/unknown direct-audio support.
-            let client = if resolved.backend == ModelBackend::Ollama {
-                let client = OllamaClient::new(
-                    resolved
-                        .ollama
-                        .clone()
-                        .expect("Ollama backend requires resolved Ollama configuration"),
-                )?;
-                discover_model_capabilities(&client).await;
-                Some(client)
-            } else {
-                None
+            let client = match backend {
+                ModelBackend::Ollama => {
+                    let client = configured_ollama_client(&resolved)?;
+                    discover_model_capabilities(&client).await;
+                    Some(client)
+                }
+                ModelBackend::Fixture => None,
             };
             crate::audio_to_audio::run(resolved, client)
                 .await
                 .map_err(AppError::AudioToAudio)
         }
     }
+}
+
+/// Creates an Ollama client only after runtime pipeline selection chose the
+/// Ollama adapter. Profile resolution intentionally does not decide whether a
+/// model can perform the selected operation.
+fn configured_ollama_client(resolved: &ResolvedVoiceProfile) -> Result<OllamaClient, AppError> {
+    let config = resolved
+        .ollama
+        .clone()
+        .ok_or(AppError::MissingBackendConfiguration { backend: "ollama" })?;
+    Ok(OllamaClient::new(config)?)
 }
 
 /// The established transcript → text-model → Piper path. It receives already
@@ -401,9 +404,9 @@ async fn run_transcribe_and_speak(
     speak::process(
         "voice_model",
         format!(
-            "{} ({})",
+            "{} (image_input={})",
             client.model(),
-            client.image_input_support().label()
+            client.capabilities().image_input.label()
         ),
     );
 
@@ -2262,6 +2265,15 @@ pub enum AppError {
 
     #[error("could not run the direct audio-to-audio experiment: {0}")]
     AudioToAudio(#[source] crate::audio_to_audio::AudioToAudioError),
+
+    #[error("backend `{backend}` does not implement pipeline `{pipeline}`")]
+    UnsupportedPipeline {
+        backend: &'static str,
+        pipeline: &'static str,
+    },
+
+    #[error("backend `{backend}` did not provide its required local configuration")]
+    MissingBackendConfiguration { backend: &'static str },
 }
 
 #[cfg(test)]
@@ -2313,10 +2325,11 @@ mod tests {
                 CameraService,
             },
         },
-        think::{ImageInputSupport, OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
+        think::{OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
     };
 
-    use super::{TurnRuntime, VoiceRuntime, run_turn};
+    use super::{AppError, TurnRuntime, VoiceRuntime, run_turn, run_voice_with_options};
+    use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
     use crate::speak::{SpeechEvent, SpeechOutcome, SpeechOwner, SpeechService};
 
     fn client(server: &MockServer) -> Arc<OllamaClient> {
@@ -2944,17 +2957,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_only_model_rejects_camera_preparation_before_device_access() {
+    async fn unsupported_pipeline_backend_is_reported_at_runtime_before_device_setup() {
+        let result = run_voice_with_options(VoiceLaunchOptions {
+            backend: Some(ModelBackend::Fixture),
+            pipeline: Some(VoicePipeline::TranscribeAndSpeak),
+            ..VoiceLaunchOptions::default()
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::UnsupportedPipeline {
+                backend: "fixture",
+                pipeline: "transcribe-and-speak",
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_without_advertised_vision_rejects_camera_preparation_before_device_access() {
         let server = MockServer::start().await;
-        let client = OllamaClient::new(
-            OllamaConfig::new_with_image_support(
-                &server.uri(),
-                "text-only-model",
-                ImageInputSupport::TextOnly,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "text-model").unwrap()).unwrap();
         client.set_capabilities_for_test(&[]);
         let list_calls = Arc::new(AtomicUsize::new(0));
         let capture_calls = Arc::new(AtomicUsize::new(0));

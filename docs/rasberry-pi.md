@@ -350,8 +350,10 @@ are explicit command-line choices and win over profile defaults and the
 corresponding environment variables. `INDEPENDENCE_MICROPHONE` and
 `INDEPENDENCE_AUDIO_OUTPUT` remain useful per-launch selectors when no matching
 command-line option is supplied. The profile supplies defaults only where
-neither is set. `OLLAMA_MODEL`,
-`INDEPENDENCE_WHISPER_MODEL`, `INDEPENDENCE_TTS_MODEL`,
+neither is set. `INDEPENDENCE_BACKEND` selects the model runtime when
+`--backend` is absent; it defaults to `ollama`. `INDEPENDENCE_MODEL` selects a
+backend-neutral model name and takes precedence over the compatible legacy
+`OLLAMA_MODEL`. `INDEPENDENCE_WHISPER_MODEL`, `INDEPENDENCE_TTS_MODEL`,
 `INDEPENDENCE_TTS_CONFIG`, `INDEPENDENCE_PIPER_COMMAND`, and
 `INDEPENDENCE_CAMERA_BACKEND` remain per-launch environment overrides.
 
@@ -428,22 +430,25 @@ INDEPENDENCE_RPICAM_CAMERA=0 \
 This intentionally activates the selected camera once, prints dimensions and
 format, and releases it. It was not run as part of this code change.
 
-`gemma3:1b` remains the Pi profile's text-test model and is deliberately marked
-text-only. Pressing `P` with that configuration reports that camera capture
-remains off; Independence does not pretend the text model can inspect a photo.
-After deliberately installing and verifying a local vision model, make both
-facts explicit for one launch:
+`gemma3:1b` remains the Pi profile's text-test model. Its local Ollama
+`/api/show` metadata must advertise `vision` before Independence will allow
+camera work. Pressing `P` when that verification is absent reports that camera
+capture remains off; Independence does not pretend the text model can inspect a
+photo. After deliberately installing a local vision model, select it for one
+launch and let Independence verify its metadata:
 
 ```bash
 OLLAMA_MODEL='qwen3-vl:4b-instruct' \
-INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision \
 ./target/release/independence --voice --profile raspberry-pi \
   --input buttons \
   --input-device /dev/input/independence/button-kbd
 ```
 
-Only then can a `P` press request the Camera Module still for the held draft.
-This configuration does not download a model or alter Ollama globally.
+Only a successful `vision` result from `/api/show` permits a `P` press to
+request the Camera Module still for the held draft. This configuration does
+not download a model or alter Ollama globally. Independence has no separate
+image-support setting: the selected Ollama backend/model supplies that runtime
+decision through `/api/show`.
 
 ### End-to-end physical acceptance test
 

@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     launch::{HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline},
     speak::tts::{DEFAULT_HAL_MODEL, DEFAULT_PIPER_COMMAND, PiperConfig},
-    think::{ImageInputSupport, OllamaConfig, ThinkError},
+    think::{OllamaConfig, ThinkError},
 };
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -94,7 +94,6 @@ struct EnvironmentOverrides {
     ollama_url: Option<String>,
     // Kept for compatibility with the existing typed/Ollama launch path.
     ollama_model: Option<String>,
-    image_support: Option<String>,
     camera_backend: Option<String>,
 }
 
@@ -111,7 +110,6 @@ impl EnvironmentOverrides {
             model: nonempty_var("INDEPENDENCE_MODEL"),
             ollama_url: nonempty_var("OLLAMA_URL"),
             ollama_model: nonempty_var("OLLAMA_MODEL"),
-            image_support: nonempty_var("INDEPENDENCE_IMAGE_MODEL_SUPPORT"),
             camera_backend: nonempty_var("INDEPENDENCE_CAMERA_BACKEND"),
         }
     }
@@ -179,13 +177,6 @@ fn resolve_with_environment(
             None => ModelBackend::Ollama,
         },
     };
-    if backend == ModelBackend::Fixture && pipeline != VoicePipeline::AudioToAudio {
-        return Err(ProfileError::BackendPipelineMismatch {
-            backend: backend.label(),
-            pipeline: pipeline.label(),
-        });
-    }
-
     let model = options
         .model
         .clone()
@@ -196,26 +187,15 @@ fn resolve_with_environment(
         return Err(ProfileError::EmptyModel);
     }
 
-    // The old flag remains accepted for compatibility. `vision` no longer
-    // grants a capability: only a successful `/api/show` response can do
-    // that. `text-only` remains a safe local restriction. Fixture launches do
-    // not parse Ollama-only settings or construct an Ollama client.
+    // Profile resolution selects names and local endpoint settings only. It
+    // deliberately does not declare model capabilities or pipeline support:
+    // the selected backend decides those at runtime from its own metadata and
+    // implemented request/response contract.
     let ollama = if backend == ModelBackend::Ollama {
-        let image_support = match environment.image_support {
-            Some(value) => match value.as_str() {
-                "vision" => ImageInputSupport::Vision,
-                "text" | "text-only" => ImageInputSupport::TextOnly,
-                _ => return Err(ProfileError::InvalidImageSupport(value)),
-            },
-            None => ImageInputSupport::Vision,
-        };
         let endpoint = environment
             .ollama_url
             .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_owned());
-        Some(
-            OllamaConfig::new_with_image_support(&endpoint, model.clone(), image_support)
-                .map_err(ProfileError::Ollama)?,
-        )
+        Some(OllamaConfig::new(&endpoint, model.clone()).map_err(ProfileError::Ollama)?)
     } else {
         None
     };
@@ -263,21 +243,12 @@ pub enum ProfileError {
     MissingButtonDevice,
     #[error("--input-device is meaningful only with --input buttons")]
     TerminalDevicePath,
-    #[error("INDEPENDENCE_IMAGE_MODEL_SUPPORT must be `vision`, `text`, or `text-only`, not `{0}`")]
-    InvalidImageSupport(String),
     #[error("INDEPENDENCE_CAMERA_BACKEND must be `v4l2` or `rpicam-still`, not `{0}")]
     InvalidCameraBackend(String),
     #[error("unknown backend `{0}`; use `ollama` or `fixture`")]
     InvalidBackend(String),
     #[error("model name must not be empty")]
     EmptyModel,
-    #[error(
-        "backend `{backend}` cannot run pipeline `{pipeline}`; use `--backend ollama` or select `--pipeline audio-to-audio`"
-    )]
-    BackendPipelineMismatch {
-        backend: &'static str,
-        pipeline: &'static str,
-    },
     #[error("invalid local Ollama configuration: {0}")]
     Ollama(#[source] ThinkError),
 }
@@ -339,20 +310,18 @@ mod tests {
     }
 
     #[test]
-    fn environment_vision_spelling_is_compatible_but_not_a_capability_claim() {
+    fn profile_resolves_a_model_without_declaring_its_capabilities() {
         let options = VoiceLaunchOptions::default();
         let resolved = resolve_with_environment(
             &options,
             EnvironmentOverrides {
                 ollama_model: Some("a-verified-vision-model".into()),
-                image_support: Some("vision".into()),
                 ..EnvironmentOverrides::default()
             },
         )
         .unwrap();
         assert_eq!(resolved.model, "a-verified-vision-model");
-        // A `/api/show` response—not this old environment setting—will later
-        // determine whether the model actually accepts photographs.
+        assert!(resolved.ollama.is_some());
     }
 
     #[test]
@@ -425,16 +394,18 @@ mod tests {
     }
 
     #[test]
-    fn fixture_cannot_masquerade_as_the_text_conversation_backend() {
-        let error = resolve_with_environment(
+    fn profile_defers_fixture_pipeline_support_to_runtime() {
+        let resolved = resolve_with_environment(
             &VoiceLaunchOptions {
                 backend: Some(ModelBackend::Fixture),
                 ..VoiceLaunchOptions::default()
             },
             EnvironmentOverrides::default(),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("cannot run pipeline"));
+        .unwrap();
+        assert_eq!(resolved.backend, ModelBackend::Fixture);
+        assert_eq!(resolved.pipeline, VoicePipeline::TranscribeAndSpeak);
+        assert!(resolved.ollama.is_none());
     }
 
     #[test]

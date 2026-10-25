@@ -469,7 +469,7 @@ that a late cue after release/Escape cannot reopen it, and that `P` during the
 cue cannot activate a camera. They do not prove that a physical speaker works;
 only `cargo run -- --speak-test` can do that on the selected machine.
 
-## Latest milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
+## Previous milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
 
 This milestone changes **how physical intent enters** the existing voice
 runtime, not who owns conversation state. `Controller` still owns accepted
@@ -543,18 +543,17 @@ The Pi defaults are intentionally conservative:
 ```text
 input adapter: buttons (but an explicit --input-device is required)
 Ollama model:  gemma3:1b
-image contract: text-only
+image capability: determined at runtime by Ollama /api/show
 camera backend: rpicam-still
 ```
 
-“Text-only” is an application safety contract, not a guess based on a model
-name. `TurnRuntime::prepare_camera`, the voice `P` path, and
+`TurnRuntime::prepare_camera`, the voice `P` path, and
 `OllamaClient::answer_with_telemetry` all reject image work before camera
-enumeration, image encoding, or HTTP when it is selected. To intentionally use
-a verified vision model, set both `OLLAMA_MODEL` and
-`INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision` for that launch. This prevents an
+enumeration, image encoding, or HTTP unless the selected Ollama model's cached
+`/api/show` metadata advertises `vision`. To intentionally use a verified
+vision model, select it with `--model` or `OLLAMA_MODEL`. This prevents an
 unverified Pi text model from receiving a photo or pretending to understand
-one.
+one, without an application-side image-support setting.
 
 The Pi camera remains behind the existing `CameraService` interface:
 
@@ -585,3 +584,66 @@ bounded output, and child cancellation/reaping. It does **not** prove an
 attached Pi keyboard, USB microphone/speaker, ARM64 Whisper/Piper installation,
 or Camera Module 3 Wide. Those remain separate, documented hardware checks in
 [`docs/rasberry-pi.md`](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
+
+## Latest milestone: separate pipeline, backend, and model choices
+
+The new path adds a second **pipeline**, not a second application or
+controller. This follow-up keeps the model runtime separate from that pipeline:
+
+```text
+TalkPressed -> CpalRecorder -> CapturedAudio { mono f32, actual rate }
+TalkReleased -> Controller::Input::AskAudio -> AudioTurnRequest + TurnId
+             -> AudioAnswerBackend -> AudioTurnFinished
+             -> Controller authorization -> Effect::PlayAudio
+             -> DirectPlaybackService -> existing RodioPlayback
+```
+
+This is intentionally unlike the default voice route:
+
+```text
+transcribe-and-speak: capture -> prepare_for_whisper(16 kHz) -> Whisper
+                       -> text Controller/Ollama -> Piper -> Rodio
+
+audio-to-audio:       capture -> direct backend -> complete WAV -> Rodio
+```
+
+The three launch choices answer different questions:
+
+```text
+--pipeline  transcribe-and-speak or audio-to-audio
+--backend   ollama (default) or fixture (a direct-audio plumbing test)
+--model     the backend's selected model
+```
+
+A Pi/laptop hardware profile still chooses only input, microphone, speaker,
+and camera defaults. It does not select a pipeline, backend, or model. Ollama
+is the default backend for both pipelines. The fixture is deliberately
+model-less and is valid only for the direct-audio route.
+
+`CapturedAudio` now retains the actual capture sample rate after CPAL has
+converted/downmixed samples. That solves a small but important abstraction
+problem: Whisper gets its required 16 kHz conversion at the Whisper boundary,
+while a direct-audio backend can receive honest source-format metadata and make
+its own documented conversion choice.
+
+`AudioToAudioRuntime` owns the direct capture/backend/playback lifecycle.
+`Controller` still owns the active `TurnId`, so workers merely return WAV bytes
+and cannot play stale output themselves. Escape and a new Talk press issue
+cancellation, remove controller authorization, and invalidate the direct
+playback generation. The direct path has no text history, photo service,
+Whisper, Piper, HAL cue, or automatic listening behavior.
+
+For now use the fixture route:
+
+```bash
+cargo run --release -- --voice \
+  --pipeline audio-to-audio \
+  --backend fixture
+```
+
+It returns a known short WAV tone, proving capture → backend → playback. The
+ordinary tests use synthetic audio and a fake playback device to confirm format
+preservation, malformed-audio rejection, and stale-result cancellation. See
+[`docs/audio-to-audio.md`](docs/audio-to-audio.md) for controls, Pi/button use,
+configuration precedence, and why a backend must verify both a model's
+capabilities and the request/response format before direct audio can run.

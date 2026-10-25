@@ -36,30 +36,6 @@ pub struct ConversationTurn {
     pub assistant: String,
 }
 
-/// The current, cached image-input state for a selected backend/model.
-///
-/// `Vision` is assigned only after the backend's `/api/show` response
-/// advertises `vision`; it is never inferred from a model name. `TextOnly`
-/// means that response explicitly lacked it (or a legacy configuration safely
-/// disabled images). `Unknown` keeps camera capture off until metadata can be
-/// read successfully.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageInputSupport {
-    Vision,
-    TextOnly,
-    Unknown,
-}
-
-impl ImageInputSupport {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Vision => "vision",
-            Self::TextOnly => "text-only",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 /// A backend capability that is either affirmatively advertised,
 /// affirmatively absent, or unavailable because metadata could not be
 /// obtained/interpreted.  The reason is a concise diagnostic, never a prompt
@@ -140,14 +116,6 @@ impl ModelCapabilities {
     pub fn advertised(&self) -> &[String] {
         &self.advertised
     }
-
-    pub fn image_input_support(&self) -> ImageInputSupport {
-        match self.image_input {
-            CapabilityStatus::Supported => ImageInputSupport::Vision,
-            CapabilityStatus::Unsupported => ImageInputSupport::TextOnly,
-            CapabilityStatus::Unknown { .. } => ImageInputSupport::Unknown,
-        }
-    }
 }
 
 /// Configuration for a loopback-only Ollama endpoint.
@@ -155,10 +123,6 @@ impl ModelCapabilities {
 pub struct OllamaConfig {
     endpoint: Url,
     model: String,
-    /// Compatibility-only restriction from the former
-    /// `INDEPENDENCE_IMAGE_MODEL_SUPPORT` setting. It may disable images, but
-    /// can never claim they work when `/api/show` says otherwise or is absent.
-    legacy_image_restriction: Option<ImageInputSupport>,
 }
 
 impl OllamaConfig {
@@ -167,46 +131,11 @@ impl OllamaConfig {
         let endpoint = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_owned());
         let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_owned());
 
-        let legacy_image_restriction = match env::var("INDEPENDENCE_IMAGE_MODEL_SUPPORT") {
-            Ok(value) => match value.as_str() {
-                "text" | "text-only" => Some(ImageInputSupport::TextOnly),
-                // Preserve the historical spelling for compatibility, but it
-                // is deliberately not evidence that the selected model can
-                // accept images. `/api/show` remains authoritative.
-                "vision" => None,
-                _ => return Err(ThinkError::InvalidImageSupportOverride(value)),
-            },
-            Err(_) => None,
-        };
-
-        Self::new_with_restriction(&endpoint, model, legacy_image_restriction)
+        Self::new(&endpoint, model)
     }
 
     /// Builds a configuration for tests or an explicitly configured local server.
     pub fn new(endpoint: &str, model: impl Into<String>) -> Result<Self, ThinkError> {
-        Self::new_with_restriction(endpoint, model, None)
-    }
-
-    /// Builds a configuration with an explicit local image-input contract.
-    /// Profiles use this to keep a text-only Pi model from receiving a photo
-    /// merely because it shares the same Ollama transport as the laptop model.
-    pub fn new_with_image_support(
-        endpoint: &str,
-        model: impl Into<String>,
-        image_input_support: ImageInputSupport,
-    ) -> Result<Self, ThinkError> {
-        let restriction = match image_input_support {
-            ImageInputSupport::TextOnly => Some(ImageInputSupport::TextOnly),
-            ImageInputSupport::Vision | ImageInputSupport::Unknown => None,
-        };
-        Self::new_with_restriction(endpoint, model, restriction)
-    }
-
-    fn new_with_restriction(
-        endpoint: &str,
-        model: impl Into<String>,
-        legacy_image_restriction: Option<ImageInputSupport>,
-    ) -> Result<Self, ThinkError> {
         let endpoint =
             Url::parse(endpoint).map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))?;
         let model = model.into();
@@ -227,11 +156,7 @@ impl OllamaConfig {
             return Err(ThinkError::EmptyModel);
         }
 
-        Ok(Self {
-            endpoint,
-            model,
-            legacy_image_restriction,
-        })
+        Ok(Self { endpoint, model })
     }
 
     fn chat_url(&self) -> Result<Url, ThinkError> {
@@ -340,12 +265,8 @@ impl OllamaClient {
         &self.config.model
     }
 
-    pub fn image_input_support(&self) -> ImageInputSupport {
-        self.capabilities().image_input_support()
-    }
-
     pub fn supports_images(&self) -> bool {
-        self.image_input_support() == ImageInputSupport::Vision
+        matches!(self.capabilities().image_input, CapabilityStatus::Supported)
     }
 
     /// A concise, capability-grounded reason to keep a camera inactive.
@@ -408,7 +329,7 @@ impl OllamaClient {
                 .json::<ShowResponse>()
                 .await
                 .map_err(ThinkError::InvalidResponse)?;
-            let mut capabilities = match response.capabilities {
+            let capabilities = match response.capabilities {
                 Some(mut capabilities) => {
                     capabilities.sort();
                     ModelCapabilities::from_advertised(capabilities)
@@ -417,12 +338,6 @@ impl OllamaClient {
                     "the Ollama /api/show response omitted its capabilities field",
                 ),
             };
-            // A legacy text-only setting is a safe local restriction. A
-            // historical `vision` setting never upgrades unsupported/unknown
-            // backend metadata.
-            if self.config.legacy_image_restriction == Some(ImageInputSupport::TextOnly) {
-                capabilities.image_input = CapabilityStatus::Unsupported;
-            }
             Ok(capabilities)
         }
         .await;
@@ -508,14 +423,14 @@ impl OllamaClient {
         interaction: Option<&Interaction>,
     ) -> Result<OllamaAnswer, ThinkError> {
         if !images.is_empty() && !self.supports_images() {
-            return Err(match self.image_input_support() {
-                ImageInputSupport::TextOnly => ThinkError::ImagesUnsupported {
+            return Err(match self.capabilities().image_input {
+                CapabilityStatus::Unsupported => ThinkError::ImagesUnsupported {
                     model: self.model().to_owned(),
                 },
-                ImageInputSupport::Unknown => ThinkError::ImageCapabilitiesUnknown {
+                CapabilityStatus::Unknown { .. } => ThinkError::ImageCapabilitiesUnknown {
                     model: self.model().to_owned(),
                 },
-                ImageInputSupport::Vision => unreachable!("supports_images checked Vision"),
+                CapabilityStatus::Supported => unreachable!("supports_images checked support"),
             });
         }
         let image_bytes = images.iter().map(|bytes| bytes.len()).sum::<usize>();
@@ -889,9 +804,6 @@ pub enum ThinkError {
     #[error("OLLAMA_MODEL must not be empty")]
     EmptyModel,
 
-    #[error("INDEPENDENCE_IMAGE_MODEL_SUPPORT must be `vision`, `text`, or `text-only`, not `{0}`")]
-    InvalidImageSupportOverride(String),
-
     #[error("could not build the local Ollama HTTP client: {0}")]
     BuildClient(#[source] reqwest::Error),
 
@@ -914,9 +826,7 @@ pub enum ThinkError {
     #[error("Ollama returned an empty answer; no answer was accepted")]
     EmptyAnswer,
 
-    #[error(
-        "configured model `{model}` is marked text-only; configure a verified vision model before submitting photographs"
-    )]
+    #[error("model `{model}` does not advertise vision through Ollama /api/show")]
     ImagesUnsupported { model: String },
 
     #[error(
@@ -942,7 +852,6 @@ impl ThinkError {
             | Self::NonLoopbackEndpoint(_)
             | Self::EndpointHasPath(_)
             | Self::EmptyModel
-            | Self::InvalidImageSupportOverride(_)
             | Self::ImagesUnsupported { .. }
             | Self::ImageCapabilitiesUnknown { .. } => "configuration",
         }
@@ -960,8 +869,8 @@ mod tests {
     };
 
     use super::{
-        CapabilityStatus, ConversationTurn, ImageInputSupport, OllamaClient, OllamaConfig,
-        OllamaStatistics, TEACHER_INSTRUCTIONS, ThinkError,
+        CapabilityStatus, ConversationTurn, OllamaClient, OllamaConfig, OllamaStatistics,
+        TEACHER_INSTRUCTIONS, ThinkError,
     };
 
     fn client(server: &MockServer) -> OllamaClient {
@@ -1019,7 +928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_vision_claim_cannot_override_contradictory_show_metadata() {
+    async fn metadata_without_vision_keeps_camera_off() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/show"))
@@ -1028,17 +937,8 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        // `Vision` mirrors the legacy compatibility spelling: it is not an
-        // affirmative capability claim. The backend response remains final.
-        let client = OllamaClient::new(
-            OllamaConfig::new_with_image_support(
-                &server.uri(),
-                "contradictory-model",
-                ImageInputSupport::Vision,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "text-model").unwrap()).unwrap();
 
         let capabilities = within_test_timeout(client.discover_capabilities())
             .await
@@ -1048,7 +948,6 @@ mod tests {
             capabilities.image_input,
             CapabilityStatus::Unsupported
         ));
-        assert_eq!(client.image_input_support(), ImageInputSupport::TextOnly);
         assert!(!client.supports_images());
     }
 
@@ -1109,17 +1008,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_text_only_configuration_rejects_photo_bytes_before_http() {
+    async fn metadata_without_vision_rejects_photo_bytes_before_http() {
         let server = MockServer::start().await;
-        let client = OllamaClient::new(
-            OllamaConfig::new_with_image_support(
-                &server.uri(),
-                "text-only-model",
-                ImageInputSupport::TextOnly,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "text-model").unwrap()).unwrap();
         client.set_capabilities_for_test(&[]);
 
         let result = client

@@ -4,7 +4,11 @@
 //! endpoint. It deliberately does not print, read terminal input, or update
 //! application history; the controller added later owns those decisions.
 
-use std::{env, time::Duration};
+use std::{
+    env,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
@@ -32,13 +36,18 @@ pub struct ConversationTurn {
     pub assistant: String,
 }
 
-/// Whether the selected model has been explicitly configured to accept image
-/// payloads.  This is a local application contract, not a guess from a model
-/// name or a claim about what an Ollama server might support.
+/// The current, cached image-input state for a selected backend/model.
+///
+/// `Vision` is assigned only after the backend's `/api/show` response
+/// advertises `vision`; it is never inferred from a model name. `TextOnly`
+/// means that response explicitly lacked it (or a legacy configuration safely
+/// disabled images). `Unknown` keeps camera capture off until metadata can be
+/// read successfully.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageInputSupport {
     Vision,
     TextOnly,
+    Unknown,
 }
 
 impl ImageInputSupport {
@@ -46,6 +55,97 @@ impl ImageInputSupport {
         match self {
             Self::Vision => "vision",
             Self::TextOnly => "text-only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A backend capability that is either affirmatively advertised,
+/// affirmatively absent, or unavailable because metadata could not be
+/// obtained/interpreted.  The reason is a concise diagnostic, never a prompt
+/// or audio/image payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Supported,
+    Unsupported,
+    Unknown { reason: String },
+}
+
+impl CapabilityStatus {
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+}
+
+/// Capability metadata cached for one configured Ollama model/backend pair.
+/// The raw advertised names remain available for concise diagnostics, but do
+/// not become dynamic application behavior by themselves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub image_input: CapabilityStatus,
+    pub audio_input: CapabilityStatus,
+    pub audio_output: CapabilityStatus,
+    advertised: Vec<String>,
+}
+
+impl ModelCapabilities {
+    fn not_yet_discovered() -> Self {
+        Self::unknown("model capabilities have not been discovered yet")
+    }
+
+    fn unknown(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            image_input: CapabilityStatus::Unknown {
+                reason: reason.clone(),
+            },
+            audio_input: CapabilityStatus::Unknown {
+                reason: reason.clone(),
+            },
+            audio_output: CapabilityStatus::Unknown { reason },
+            advertised: Vec::new(),
+        }
+    }
+
+    fn from_advertised(capabilities: Vec<String>) -> Self {
+        let has = |name: &str| capabilities.iter().any(|value| value == name);
+        Self {
+            image_input: if has("vision") {
+                CapabilityStatus::Supported
+            } else {
+                CapabilityStatus::Unsupported
+            },
+            // Ollama's documented `/api/show` capability list currently
+            // advertises `speech` for text-to-speech output. It does not
+            // define a standard direct audio-input request capability, so we
+            // refuse to invent one from a model family or arbitrary metadata.
+            audio_input: CapabilityStatus::Unknown {
+                reason: "the current Ollama API does not advertise a documented direct audio-input capability".into(),
+            },
+            audio_output: if has("speech") {
+                CapabilityStatus::Supported
+            } else {
+                CapabilityStatus::Unsupported
+            },
+            advertised: capabilities,
+        }
+    }
+
+    /// Capability strings reported by the backend, sorted deterministically
+    /// for logs/tests. They contain no conversation or media data.
+    pub fn advertised(&self) -> &[String] {
+        &self.advertised
+    }
+
+    pub fn image_input_support(&self) -> ImageInputSupport {
+        match self.image_input {
+            CapabilityStatus::Supported => ImageInputSupport::Vision,
+            CapabilityStatus::Unsupported => ImageInputSupport::TextOnly,
+            CapabilityStatus::Unknown { .. } => ImageInputSupport::Unknown,
         }
     }
 }
@@ -55,7 +155,10 @@ impl ImageInputSupport {
 pub struct OllamaConfig {
     endpoint: Url,
     model: String,
-    image_input_support: ImageInputSupport,
+    /// Compatibility-only restriction from the former
+    /// `INDEPENDENCE_IMAGE_MODEL_SUPPORT` setting. It may disable images, but
+    /// can never claim they work when `/api/show` says otherwise or is absent.
+    legacy_image_restriction: Option<ImageInputSupport>,
 }
 
 impl OllamaConfig {
@@ -64,12 +167,24 @@ impl OllamaConfig {
         let endpoint = env::var("OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_owned());
         let model = env::var("OLLAMA_MODEL").unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_owned());
 
-        Self::new_with_image_support(&endpoint, model, ImageInputSupport::Vision)
+        let legacy_image_restriction = match env::var("INDEPENDENCE_IMAGE_MODEL_SUPPORT") {
+            Ok(value) => match value.as_str() {
+                "text" | "text-only" => Some(ImageInputSupport::TextOnly),
+                // Preserve the historical spelling for compatibility, but it
+                // is deliberately not evidence that the selected model can
+                // accept images. `/api/show` remains authoritative.
+                "vision" => None,
+                _ => return Err(ThinkError::InvalidImageSupportOverride(value)),
+            },
+            Err(_) => None,
+        };
+
+        Self::new_with_restriction(&endpoint, model, legacy_image_restriction)
     }
 
     /// Builds a configuration for tests or an explicitly configured local server.
     pub fn new(endpoint: &str, model: impl Into<String>) -> Result<Self, ThinkError> {
-        Self::new_with_image_support(endpoint, model, ImageInputSupport::Vision)
+        Self::new_with_restriction(endpoint, model, None)
     }
 
     /// Builds a configuration with an explicit local image-input contract.
@@ -79,6 +194,18 @@ impl OllamaConfig {
         endpoint: &str,
         model: impl Into<String>,
         image_input_support: ImageInputSupport,
+    ) -> Result<Self, ThinkError> {
+        let restriction = match image_input_support {
+            ImageInputSupport::TextOnly => Some(ImageInputSupport::TextOnly),
+            ImageInputSupport::Vision | ImageInputSupport::Unknown => None,
+        };
+        Self::new_with_restriction(endpoint, model, restriction)
+    }
+
+    fn new_with_restriction(
+        endpoint: &str,
+        model: impl Into<String>,
+        legacy_image_restriction: Option<ImageInputSupport>,
     ) -> Result<Self, ThinkError> {
         let endpoint =
             Url::parse(endpoint).map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))?;
@@ -103,7 +230,7 @@ impl OllamaConfig {
         Ok(Self {
             endpoint,
             model,
-            image_input_support,
+            legacy_image_restriction,
         })
     }
 
@@ -113,8 +240,10 @@ impl OllamaConfig {
             .map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))
     }
 
-    pub fn image_input_support(&self) -> ImageInputSupport {
-        self.image_input_support
+    fn show_url(&self) -> Result<Url, ThinkError> {
+        self.endpoint
+            .join("api/show")
+            .map_err(|error| ThinkError::InvalidEndpoint(error.to_string()))
     }
 
     pub fn model(&self) -> &str {
@@ -127,6 +256,7 @@ impl OllamaConfig {
 pub struct OllamaClient {
     http: Client,
     config: OllamaConfig,
+    capabilities: Arc<RwLock<Option<ModelCapabilities>>>,
 }
 
 /// A complete non-streaming Ollama answer plus optional server-reported
@@ -199,7 +329,11 @@ impl OllamaClient {
             .build()
             .map_err(ThinkError::BuildClient)?;
 
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            capabilities: Arc::new(RwLock::new(None)),
+        })
     }
 
     pub fn model(&self) -> &str {
@@ -207,11 +341,147 @@ impl OllamaClient {
     }
 
     pub fn image_input_support(&self) -> ImageInputSupport {
-        self.config.image_input_support()
+        self.capabilities().image_input_support()
     }
 
     pub fn supports_images(&self) -> bool {
         self.image_input_support() == ImageInputSupport::Vision
+    }
+
+    /// A concise, capability-grounded reason to keep a camera inactive.
+    pub fn image_input_restriction(&self) -> String {
+        match &self.capabilities().image_input {
+            CapabilityStatus::Supported => "image input is supported".into(),
+            CapabilityStatus::Unsupported => format!(
+                "model `{}` does not advertise vision through Ollama /api/show",
+                self.model()
+            ),
+            CapabilityStatus::Unknown { reason } => format!(
+                "model `{}` image capability is unknown: {reason}",
+                self.model()
+            ),
+        }
+    }
+
+    /// Returns the once-per-session cached capability record. Before
+    /// discovery, all capabilities are explicitly unknown rather than guessed
+    /// from a model name.
+    pub fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities
+            .read()
+            .expect("Ollama capability cache lock was poisoned")
+            .clone()
+            .unwrap_or_else(ModelCapabilities::not_yet_discovered)
+    }
+
+    /// Reads `/api/show` exactly once for this client and caches either the
+    /// advertised capabilities or an explicit unknown state. A caller can log
+    /// the error while the rest of the text-only application stays usable.
+    pub async fn discover_capabilities(&self) -> Result<ModelCapabilities, ThinkError> {
+        if let Some(capabilities) = self
+            .capabilities
+            .read()
+            .expect("Ollama capability cache lock was poisoned")
+            .clone()
+        {
+            return Ok(capabilities);
+        }
+
+        let endpoint = self.config.show_url()?;
+        let result = async {
+            let response = self
+                .http
+                .post(endpoint.clone())
+                .json(&ShowRequest {
+                    model: self.config.model.clone(),
+                })
+                .send()
+                .await
+                .map_err(|source| ThinkError::Request {
+                    endpoint: endpoint.clone(),
+                    source,
+                })?;
+            if !response.status().is_success() {
+                return Err(http_error(response.status(), response).await);
+            }
+            let response = response
+                .json::<ShowResponse>()
+                .await
+                .map_err(ThinkError::InvalidResponse)?;
+            let mut capabilities = match response.capabilities {
+                Some(mut capabilities) => {
+                    capabilities.sort();
+                    ModelCapabilities::from_advertised(capabilities)
+                }
+                None => ModelCapabilities::unknown(
+                    "the Ollama /api/show response omitted its capabilities field",
+                ),
+            };
+            // A legacy text-only setting is a safe local restriction. A
+            // historical `vision` setting never upgrades unsupported/unknown
+            // backend metadata.
+            if self.config.legacy_image_restriction == Some(ImageInputSupport::TextOnly) {
+                capabilities.image_input = CapabilityStatus::Unsupported;
+            }
+            Ok(capabilities)
+        }
+        .await;
+
+        match result {
+            Ok(capabilities) => {
+                telemetry::run_event(
+                    "ollama.model.capabilities",
+                    "discovered",
+                    telemetry::fields([
+                        ("model", serde_json::json!(self.model())),
+                        (
+                            "image_input",
+                            serde_json::json!(capabilities.image_input.label()),
+                        ),
+                        (
+                            "audio_input",
+                            serde_json::json!(capabilities.audio_input.label()),
+                        ),
+                        (
+                            "audio_output",
+                            serde_json::json!(capabilities.audio_output.label()),
+                        ),
+                    ]),
+                );
+                *self
+                    .capabilities
+                    .write()
+                    .expect("Ollama capability cache lock was poisoned") =
+                    Some(capabilities.clone());
+                Ok(capabilities)
+            }
+            Err(error) => {
+                let unknown = ModelCapabilities::unknown(format!(
+                    "could not read /api/show for model `{}`: {}",
+                    self.model(),
+                    error.classification()
+                ));
+                *self
+                    .capabilities
+                    .write()
+                    .expect("Ollama capability cache lock was poisoned") = Some(unknown);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_capabilities_for_test(&self, advertised: &[&str]) {
+        let mut advertised = advertised
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        advertised.sort();
+        *self
+            .capabilities
+            .write()
+            .expect("Ollama capability cache lock was poisoned") =
+            Some(ModelCapabilities::from_advertised(advertised));
     }
 
     /// Requests one complete, non-streaming answer from Ollama.
@@ -238,8 +508,14 @@ impl OllamaClient {
         interaction: Option<&Interaction>,
     ) -> Result<OllamaAnswer, ThinkError> {
         if !images.is_empty() && !self.supports_images() {
-            return Err(ThinkError::ImagesUnsupported {
-                model: self.model().to_owned(),
+            return Err(match self.image_input_support() {
+                ImageInputSupport::TextOnly => ThinkError::ImagesUnsupported {
+                    model: self.model().to_owned(),
+                },
+                ImageInputSupport::Unknown => ThinkError::ImageCapabilitiesUnknown {
+                    model: self.model().to_owned(),
+                },
+                ImageInputSupport::Vision => unreachable!("supports_images checked Vision"),
             });
         }
         let image_bytes = images.iter().map(|bytes| bytes.len()).sum::<usize>();
@@ -586,6 +862,16 @@ struct OllamaErrorResponse {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ShowRequest {
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct ShowResponse {
+    capabilities: Option<Vec<String>>,
+}
+
 #[derive(Debug, Error)]
 pub enum ThinkError {
     #[error("OLLAMA_URL is not a valid URL: {0}")]
@@ -602,6 +888,9 @@ pub enum ThinkError {
 
     #[error("OLLAMA_MODEL must not be empty")]
     EmptyModel,
+
+    #[error("INDEPENDENCE_IMAGE_MODEL_SUPPORT must be `vision`, `text`, or `text-only`, not `{0}`")]
+    InvalidImageSupportOverride(String),
 
     #[error("could not build the local Ollama HTTP client: {0}")]
     BuildClient(#[source] reqwest::Error),
@@ -629,6 +918,11 @@ pub enum ThinkError {
         "configured model `{model}` is marked text-only; configure a verified vision model before submitting photographs"
     )]
     ImagesUnsupported { model: String },
+
+    #[error(
+        "could not verify whether configured model `{model}` accepts images; camera capture remains off until /api/show succeeds"
+    )]
+    ImageCapabilitiesUnknown { model: String },
 }
 
 impl ThinkError {
@@ -648,7 +942,9 @@ impl ThinkError {
             | Self::NonLoopbackEndpoint(_)
             | Self::EndpointHasPath(_)
             | Self::EmptyModel
-            | Self::ImagesUnsupported { .. } => "configuration",
+            | Self::InvalidImageSupportOverride(_)
+            | Self::ImagesUnsupported { .. }
+            | Self::ImageCapabilitiesUnknown { .. } => "configuration",
         }
     }
 }
@@ -664,19 +960,152 @@ mod tests {
     };
 
     use super::{
-        ConversationTurn, ImageInputSupport, OllamaClient, OllamaConfig, OllamaStatistics,
-        TEACHER_INSTRUCTIONS, ThinkError,
+        CapabilityStatus, ConversationTurn, ImageInputSupport, OllamaClient, OllamaConfig,
+        OllamaStatistics, TEACHER_INSTRUCTIONS, ThinkError,
     };
 
     fn client(server: &MockServer) -> OllamaClient {
         let config = OllamaConfig::new(&server.uri(), "test-model").unwrap();
-        OllamaClient::new(config).unwrap()
+        let client = OllamaClient::new(config).unwrap();
+        client.set_capabilities_for_test(&["vision"]);
+        client
     }
 
     async fn within_test_timeout<T>(future: impl Future<Output = T>) -> T {
         tokio::time::timeout(Duration::from_secs(3), future)
             .await
             .expect("mock HTTP test exceeded its three-second timeout")
+    }
+
+    #[tokio::test]
+    async fn show_capabilities_are_cached_for_one_selected_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .and(body_json(json!({"model": "verified-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "capabilities": ["tools", "vision", "completion"]
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "verified-model").unwrap()).unwrap();
+
+        let first = within_test_timeout(client.discover_capabilities())
+            .await
+            .unwrap();
+        let second = within_test_timeout(client.discover_capabilities())
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.advertised(), ["completion", "tools", "vision"]);
+        assert!(matches!(first.image_input, CapabilityStatus::Supported));
+        assert!(matches!(first.audio_output, CapabilityStatus::Unsupported));
+        assert!(matches!(
+            first.audio_input,
+            CapabilityStatus::Unknown { .. }
+        ));
+        assert!(client.supports_images());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/api/show")
+                .count(),
+            1,
+            "the session should reuse the first /api/show record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_vision_claim_cannot_override_contradictory_show_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "capabilities": ["completion"]
+            })))
+            .mount(&server)
+            .await;
+        // `Vision` mirrors the legacy compatibility spelling: it is not an
+        // affirmative capability claim. The backend response remains final.
+        let client = OllamaClient::new(
+            OllamaConfig::new_with_image_support(
+                &server.uri(),
+                "contradictory-model",
+                ImageInputSupport::Vision,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capabilities = within_test_timeout(client.discover_capabilities())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            capabilities.image_input,
+            CapabilityStatus::Unsupported
+        ));
+        assert_eq!(client.image_input_support(), ImageInputSupport::TextOnly);
+        assert!(!client.supports_images());
+    }
+
+    #[tokio::test]
+    async fn omitted_show_capabilities_remain_unknown_and_keep_camera_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "older-model").unwrap()).unwrap();
+
+        let capabilities = within_test_timeout(client.discover_capabilities())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            capabilities.image_input,
+            CapabilityStatus::Unknown { .. }
+        ));
+        let result = client.answer(&[], "What is visible?", &[b"fixture"]).await;
+        assert!(matches!(
+            result,
+            Err(ThinkError::ImageCapabilitiesUnknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_show_metadata_is_cached_as_unknown_and_keeps_camera_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": "metadata unavailable"
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "offline-model").unwrap()).unwrap();
+
+        assert!(
+            within_test_timeout(client.discover_capabilities())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            client.capabilities().image_input,
+            CapabilityStatus::Unknown { .. }
+        ));
+        assert!(matches!(
+            client.answer(&[], "What is visible?", &[b"fixture"]).await,
+            Err(ThinkError::ImageCapabilitiesUnknown { .. })
+        ));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "unknown capability should be cached");
     }
 
     #[tokio::test]
@@ -691,6 +1120,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        client.set_capabilities_for_test(&[]);
 
         let result = client
             .answer(&[], "What is visible?", &[b"not an image"])

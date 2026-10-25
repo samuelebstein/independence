@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio_to_audio;
 pub mod controller;
 pub mod dictation;
 pub mod launch;

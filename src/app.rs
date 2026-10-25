@@ -26,13 +26,13 @@ use crate::{
         audio::CpalRecorder,
         transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
     },
-    launch::VoiceLaunchOptions,
+    launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline},
     listen::{
         self,
         controls::{VoiceControlEvent, VoiceInputEvent, VoiceInputSource},
         evdev::{self, EvdevButtonInputSource},
     },
-    profile::{self, CameraBackendSelection, ResolvedVoiceInput},
+    profile::{self, CameraBackendSelection, ResolvedVoiceInput, ResolvedVoiceProfile},
     protocol::{
         CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
@@ -323,8 +323,51 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 /// one `VoiceRuntime`; neither gets a special controller path.
 pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), AppError> {
     let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
-    let client = OllamaClient::new(resolved.ollama)?;
-    discover_model_capabilities(&client).await;
+    match resolved.pipeline {
+        VoicePipeline::TranscribeAndSpeak => {
+            // Profile resolution rejects the model-less fixture backend for
+            // this pipeline. Keep the invariant local to configuration rather
+            // than allowing the text path to silently choose a backend.
+            let client = OllamaClient::new(
+                resolved
+                    .ollama
+                    .clone()
+                    .expect("text pipeline requires the resolved Ollama backend"),
+            )?;
+            discover_model_capabilities(&client).await;
+            run_transcribe_and_speak(resolved, client).await
+        }
+        VoicePipeline::AudioToAudio => {
+            // The fixture backend is specifically a microphone→backend→speaker
+            // plumbing check. It must not start an Ollama client or probe a
+            // model. The explicit `ollama` backend receives cached metadata
+            // first and will reject unsupported/unknown direct-audio support.
+            let client = if resolved.backend == ModelBackend::Ollama {
+                let client = OllamaClient::new(
+                    resolved
+                        .ollama
+                        .clone()
+                        .expect("Ollama backend requires resolved Ollama configuration"),
+                )?;
+                discover_model_capabilities(&client).await;
+                Some(client)
+            } else {
+                None
+            };
+            crate::audio_to_audio::run(resolved, client)
+                .await
+                .map_err(AppError::AudioToAudio)
+        }
+    }
+}
+
+/// The established transcript → text-model → Piper path. It receives already
+/// resolved configuration so `run_voice_with_options` can select the isolated
+/// direct-audio path without starting Whisper or Piper first.
+async fn run_transcribe_and_speak(
+    resolved: ResolvedVoiceProfile,
+    client: OllamaClient,
+) -> Result<(), AppError> {
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
         mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -352,6 +395,8 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     if let Some(profile) = resolved.profile {
         speak::process("hardware_profile", profile.label());
     }
+    speak::process("voice_pipeline", resolved.pipeline.label());
+    speak::process("model_backend", resolved.backend.label());
     speak::process("voice_camera_backend", resolved.camera_backend.label());
     speak::process(
         "voice_model",
@@ -622,6 +667,16 @@ impl TurnRuntime {
     ) -> RuntimeEffectResult {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
+            // Direct-audio effects are consumed exclusively by the isolated
+            // audio-to-audio runtime. Keeping this branch explicit prevents
+            // the established text runtime from accidentally initializing a
+            // second pipeline or treating audio bytes as dialogue.
+            Effect::StartAudioTurn(_) | Effect::PlayAudio { .. } => {
+                speak::warning(
+                    "unexpected_direct_audio_effect",
+                    "direct-audio effect reached the text runtime and was ignored",
+                );
+            }
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
@@ -2204,6 +2259,9 @@ pub enum AppError {
 
     #[error("could not run local dictation: {0}")]
     Dictation(#[from] dictation::DictationError),
+
+    #[error("could not run the direct audio-to-audio experiment: {0}")]
+    AudioToAudio(#[source] crate::audio_to_audio::AudioToAudioError),
 }
 
 #[cfg(test)]

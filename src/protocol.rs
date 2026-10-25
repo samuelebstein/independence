@@ -56,21 +56,56 @@ impl RecordingId {
     }
 }
 
-/// Validated audio for the local recognizer: mono f32 PCM at 16 kHz.
+/// A bounded, validated microphone recording: mono f32 PCM at the actual
+/// capture sample rate.
 ///
-/// The samples are deliberately opaque at the protocol boundary. Debug output
-/// reports only a count, so diagnostics cannot leak a recording's contents.
+/// CPAL converts the device's sample representation and downmixes channels at
+/// the callback boundary, but it deliberately preserves the negotiated sample
+/// rate here.  Whisper's 16 kHz conversion happens later at its own boundary;
+/// an audio-to-audio backend can therefore request its own conversion instead
+/// of receiving audio that was silently tailored for Whisper.
+///
+/// The samples remain opaque at this protocol boundary. Debug output reports
+/// format and count only, so diagnostics cannot leak a recording's contents.
+#[derive(Clone, PartialEq)]
 pub struct CapturedAudio {
     samples: Vec<f32>,
+    sample_rate_hz: u32,
 }
 
+// `CapturedAudio` is constructed only after rejecting non-finite samples, so
+// bitwise f32 equality cannot encounter NaN's non-reflexive behaviour here.
+impl Eq for CapturedAudio {}
+
 impl CapturedAudio {
+    /// Test/default constructor for already-normalized Whisper fixtures.
+    #[cfg(test)]
     pub(crate) fn new(samples: Vec<f32>) -> Self {
-        Self { samples }
+        Self {
+            samples,
+            sample_rate_hz: 16_000,
+        }
+    }
+
+    /// Builds a recording from the mono f32 representation produced by the
+    /// CPAL adapter. Callers must retain the actual negotiated sample rate.
+    pub(crate) fn with_sample_rate(samples: Vec<f32>, sample_rate_hz: u32) -> Self {
+        Self {
+            samples,
+            sample_rate_hz,
+        }
     }
 
     pub(crate) fn samples(&self) -> &[f32] {
         &self.samples
+    }
+
+    pub(crate) fn sample_rate_hz(&self) -> u32 {
+        self.sample_rate_hz
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<f32>, u32) {
+        (self.samples, self.sample_rate_hz)
     }
 
     #[cfg(test)]
@@ -84,6 +119,7 @@ impl fmt::Debug for CapturedAudio {
         formatter
             .debug_struct("CapturedAudio")
             .field("sample_count", &self.samples.len())
+            .field("sample_rate_hz", &self.sample_rate_hz)
             .finish()
     }
 }
@@ -219,12 +255,20 @@ pub enum Event {
         source: CameraPhotoSource,
     },
     TurnFinished(TurnFinished),
+    AudioTurnFinished(AudioTurnFinished),
 }
 
 /// A parsed terminal input or terminal lifecycle signal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Input {
     Ask(String),
+    /// A completed microphone recording for the deliberately separate
+    /// audio-to-audio experiment. This does not create text conversation
+    /// history or give the recording terminal-command authority.
+    AskAudio {
+        recording_id: RecordingId,
+        audio: CapturedAudio,
+    },
     /// A literal question accompanied by already validated, in-memory photos.
     ///
     /// This is constructed only by the hold-to-talk voice coordinator. It is
@@ -260,6 +304,31 @@ pub struct TurnRequest {
     pub question: String,
     pub history: Vec<ConversationTurn>,
     pub visual: VisualRequest,
+}
+
+/// A controller-authorized direct-audio request. The existing `TurnId`
+/// remains the single authorization generation across text and audio work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTurnRequest {
+    pub id: TurnId,
+    pub recording_id: RecordingId,
+    pub audio: CapturedAudio,
+}
+
+/// A direct-audio worker completion. As with text turns, a worker only
+/// returns bytes; the controller determines whether they remain current and
+/// may reach playback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTurnFinished {
+    pub id: TurnId,
+    pub result: AudioTurnResult,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioTurnResult {
+    Audio { wav: Vec<u8> },
+    Failed { message: String },
+    Cancelled,
 }
 
 /// Whether a turn continues the accepted scene or stages a proposed replacement.
@@ -301,9 +370,17 @@ pub enum TurnResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     StartTurn(TurnRequest),
+    StartAudioTurn(AudioTurnRequest),
     PrepareCamera(CameraPreparation),
     ListCameras,
     CancelTurn(TurnId),
+    /// The controller accepted this current direct-audio result. The runtime
+    /// sends it to its existing playback adapter; the controller never opens
+    /// a device or plays audio itself.
+    PlayAudio {
+        id: TurnId,
+        wav: Vec<u8>,
+    },
     Display(Output),
     Exit,
 }

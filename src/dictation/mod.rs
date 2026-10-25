@@ -282,7 +282,7 @@ impl DictationRuntime {
             DictationEffect::StartTranscription {
                 recording_id,
                 audio,
-            } => self.start_transcription(recording_id, audio),
+            } => self.start_transcription(recording_id, audio).await,
             DictationEffect::CancelTranscription { recording_id } => {
                 if let Some(transcription) = self.active_transcription.as_ref()
                     && transcription.id == recording_id
@@ -373,18 +373,67 @@ impl DictationRuntime {
         }
     }
 
-    fn start_transcription(&mut self, recording_id: RecordingId, audio: CapturedAudio) {
+    async fn start_transcription(&mut self, recording_id: RecordingId, audio: CapturedAudio) {
         if self.active_transcription.is_some() {
             // This should be unreachable under the controller's state machine.
             // Dropping `audio` preserves the one-active-recognizer invariant.
             return;
         }
 
+        // The capture boundary intentionally preserves its negotiated sample
+        // rate for direct-audio consumers. Whisper alone requires 16 kHz mono
+        // f32, so conversion lives immediately before this recognizer rather
+        // than silently happening in the CPAL capture owner.
+        let interaction = self.recording_interactions.get(&recording_id).cloned();
+        let (samples, source_sample_rate) = audio.into_parts();
+        let preparation = interaction.as_ref().map(|interaction| {
+            interaction.stage(
+                "audio.prepare_resample",
+                telemetry::fields([
+                    (
+                        "source_sample_rate_hz",
+                        serde_json::json!(source_sample_rate),
+                    ),
+                    ("input_samples", serde_json::json!(samples.len())),
+                    (
+                        "whisper_sample_rate_hz",
+                        serde_json::json!(audio::WHISPER_SAMPLE_RATE),
+                    ),
+                ]),
+            )
+        });
+        let audio = match audio::prepare_for_whisper(samples, source_sample_rate) {
+            Ok(audio) => {
+                if let Some(stage) = preparation {
+                    stage.finish(
+                        "completed",
+                        telemetry::fields([(
+                            "output_samples",
+                            serde_json::json!(audio.samples().len()),
+                        )]),
+                    );
+                }
+                audio
+            }
+            Err(message) => {
+                if let Some(stage) = preparation {
+                    stage.finish("failed", telemetry::Fields::new());
+                }
+                let _ = self
+                    .event_sender
+                    .send(DictationEvent::TranscriptionFailed {
+                        recording_id,
+                        message,
+                    })
+                    .await;
+                return;
+            }
+        };
+
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
         let transcriber = self.transcriber.clone();
         let event_sender = self.event_sender.clone();
-        let interaction = self.recording_interactions.get(&recording_id).cloned();
         let enqueued = Instant::now();
         let in_flight = interaction
             .as_ref()

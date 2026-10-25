@@ -18,6 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::protocol::{DictationOutput, Output};
 
+pub mod audio;
 pub mod playback;
 pub mod tts;
 pub mod worker;

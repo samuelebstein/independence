@@ -3,7 +3,8 @@
 //! CPAL owns the platform input stream. The callback does only format
 //! conversion, mono downmixing, and bounded buffering; it never transcribes or
 //! touches application state. Once capture ends, the stream is dropped before
-//! Rubato resamples the retained in-memory samples for Whisper.
+//! a selected consumer converts the retained in-memory samples. Whisper asks
+//! for 16 kHz; a direct audio backend receives the actual capture rate.
 
 use std::{
     env,
@@ -326,7 +327,8 @@ impl CpalRecorder {
         );
 
         // Dropping CPAL's stream ends its callback and releases the device
-        // before we inspect samples, resample, or invoke whisper.cpp.
+        // before we inspect samples, convert them for a consumer, or invoke
+        // any recognizer/backend.
         drop(stream);
         let recording_duration = started.elapsed();
         if let Some(interaction) = interaction {
@@ -358,14 +360,14 @@ impl CpalRecorder {
         let input_samples = samples.len();
         let preparation = interaction.map(|interaction| {
             interaction.stage(
-                "audio.prepare_resample",
+                "audio.capture.validate",
                 telemetry::fields([
                     ("source_sample_rate_hz", serde_json::json!(sample_rate)),
                     ("input_samples", serde_json::json!(input_samples)),
                 ]),
             )
         });
-        let audio = match prepare_for_whisper(samples, sample_rate) {
+        let audio = match prepare_captured_audio(samples, sample_rate) {
             Ok(audio) => audio,
             Err(error) => {
                 if let Some(stage) = preparation {
@@ -378,16 +380,12 @@ impl CpalRecorder {
             stage.finish(
                 "completed",
                 telemetry::fields([
-                    (
-                        "whisper_sample_rate_hz",
-                        serde_json::json!(WHISPER_SAMPLE_RATE),
-                    ),
                     ("output_samples", serde_json::json!(audio.samples().len())),
                     (
                         "audio_duration_ms",
                         serde_json::json!(
                             (audio.samples().len() as u64).saturating_mul(1_000)
-                                / u64::from(WHISPER_SAMPLE_RATE)
+                                / u64::from(audio.sample_rate_hz())
                         ),
                     ),
                 ]),
@@ -694,9 +692,9 @@ fn bounded_raw_sample_limit(sample_rate: u32) -> Result<usize, String> {
     Ok(required)
 }
 
-/// Converts an in-memory mono clip to exactly what whisper.cpp expects.
-/// This happens after the CPAL stream has been dropped.
-pub(crate) fn prepare_for_whisper(
+/// Validates a completed mono f32 capture while retaining its actual sample
+/// rate. This is shared by the text and direct-audio pipelines.
+pub(crate) fn prepare_captured_audio(
     samples: Vec<f32>,
     source_sample_rate: u32,
 ) -> Result<CapturedAudio, String> {
@@ -706,6 +704,28 @@ pub(crate) fn prepare_for_whisper(
     if source_sample_rate == 0 {
         return Err("recording reported a zero sample rate".into());
     }
+    if !samples.iter().all(|sample| sample.is_finite()) {
+        return Err("recording contained non-finite audio samples".into());
+    }
+    if !samples
+        .iter()
+        .any(|sample| sample.abs() >= MINIMUM_AUDIBLE_PEAK)
+    {
+        return Err("recording was silent or too quiet to process".into());
+    }
+
+    Ok(CapturedAudio::with_sample_rate(samples, source_sample_rate))
+}
+
+/// Converts an in-memory mono clip to exactly what whisper.cpp expects.
+/// This happens after the CPAL stream has been dropped, immediately before
+/// the Whisper boundary rather than at microphone capture time.
+pub(crate) fn prepare_for_whisper(
+    samples: Vec<f32>,
+    source_sample_rate: u32,
+) -> Result<CapturedAudio, String> {
+    let audio = prepare_captured_audio(samples, source_sample_rate)?;
+    let (samples, source_sample_rate) = audio.into_parts();
 
     let resampled = if source_sample_rate == WHISPER_SAMPLE_RATE {
         samples
@@ -716,14 +736,10 @@ pub(crate) fn prepare_for_whisper(
     if resampled.len() > MAX_WHISPER_SAMPLES {
         return Err("recording exceeded the 30-second transcription limit after resampling".into());
     }
-    if !resampled
-        .iter()
-        .any(|sample| sample.is_finite() && sample.abs() >= MINIMUM_AUDIBLE_PEAK)
-    {
-        return Err("recording was silent or too quiet to transcribe".into());
-    }
-
-    Ok(CapturedAudio::new(resampled))
+    Ok(CapturedAudio::with_sample_rate(
+        resampled,
+        WHISPER_SAMPLE_RATE,
+    ))
 }
 
 fn resample_mono(samples: Vec<f32>, source_sample_rate: u32) -> Result<Vec<f32>, String> {

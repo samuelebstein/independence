@@ -6,8 +6,8 @@
 
 use crate::{
     protocol::{
-        CameraPreparation, CameraRequestId, Effect, Event, Input, Output, TurnFinished, TurnId,
-        TurnRequest, TurnResult, VisualRequest,
+        AudioTurnFinished, AudioTurnRequest, AudioTurnResult, CameraPreparation, CameraRequestId,
+        Effect, Event, Input, Output, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
     },
     see::Photo,
     think::ConversationTurn,
@@ -35,7 +35,27 @@ struct Session {
 }
 
 #[derive(Debug)]
-struct ActiveTurn {
+enum ActiveTurn {
+    Text(TextTurn),
+    /// Direct audio turns deliberately do not create text history or modify
+    /// the accepted scene. They still use the controller's one-current-turn
+    /// rule, so a stale worker result cannot reach playback.
+    Audio {
+        id: TurnId,
+    },
+}
+
+impl ActiveTurn {
+    fn id(&self) -> TurnId {
+        match self {
+            Self::Text(turn) => turn.id,
+            Self::Audio { id } => *id,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TextTurn {
     id: TurnId,
     question: String,
     scene_commit: SceneCommit,
@@ -81,6 +101,7 @@ impl Controller {
                 self.handle_camera_capture_ready(id, source)
             }
             Event::TurnFinished(finished) => self.handle_turn_finished(finished),
+            Event::AudioTurnFinished(finished) => self.handle_audio_turn_finished(finished),
         }
     }
 
@@ -125,6 +146,10 @@ impl Controller {
                     SceneCommit::AppendKnown(accepted_and_new),
                 )
             }
+            Input::AskAudio {
+                recording_id,
+                audio,
+            } => self.start_audio_turn(recording_id, audio),
             Input::Look { path, question } => self.start_turn(
                 question,
                 VisualRequest::ProposeNew(path),
@@ -195,16 +220,40 @@ impl Controller {
             self.session.history.clone()
         };
 
-        self.active = Some(ActiveTurn {
+        self.active = Some(ActiveTurn::Text(TextTurn {
             id,
             question: question.clone(),
             scene_commit,
-        });
+        }));
         effects.push(Effect::StartTurn(TurnRequest {
             id,
             question,
             history,
             visual,
+        }));
+        effects
+    }
+
+    fn start_audio_turn(
+        &mut self,
+        recording_id: crate::protocol::RecordingId,
+        audio: crate::protocol::CapturedAudio,
+    ) -> Vec<Effect> {
+        // An audio recording is an isolated experiment, but it shares the
+        // controller's cancellation/authorization generation with ordinary
+        // turns. It intentionally leaves accepted history and photos alone.
+        self.pending_camera = None;
+        let mut effects = self.cancel_active();
+        let id = TurnId::new(self.next_turn_id);
+        self.next_turn_id = self
+            .next_turn_id
+            .checked_add(1)
+            .expect("turn identifiers exhausted");
+        self.active = Some(ActiveTurn::Audio { id });
+        effects.push(Effect::StartAudioTurn(AudioTurnRequest {
+            id,
+            recording_id,
+            audio,
         }));
         effects
     }
@@ -227,7 +276,7 @@ impl Controller {
     fn cancel_active(&mut self) -> Vec<Effect> {
         self.active
             .take()
-            .map(|active| vec![Effect::CancelTurn(active.id)])
+            .map(|active| vec![Effect::CancelTurn(active.id())])
             .unwrap_or_default()
     }
 
@@ -273,7 +322,7 @@ impl Controller {
         id: TurnId,
         camera: crate::see::camera::CameraDescriptor,
     ) -> Vec<Effect> {
-        if self.active.as_ref().map(|active| active.id) != Some(id) {
+        if self.active.as_ref().map(ActiveTurn::id) != Some(id) {
             return Vec::new();
         }
 
@@ -289,7 +338,7 @@ impl Controller {
         id: TurnId,
         source: crate::see::camera::CameraPhotoSource,
     ) -> Vec<Effect> {
-        if self.active.as_ref().map(|active| active.id) != Some(id) {
+        if self.active.as_ref().map(ActiveTurn::id) != Some(id) {
             return Vec::new();
         }
 
@@ -307,11 +356,15 @@ impl Controller {
         // A result is eligible only while its ID is the controller's active ID.
         // This makes a late completion from a stopped, reset, or superseded
         // turn harmless.
-        if self.active.as_ref().map(|active| active.id) != Some(finished.id) {
+        if !matches!(self.active.as_ref(), Some(ActiveTurn::Text(active)) if active.id == finished.id)
+        {
             return Vec::new();
         }
 
-        let active = self.active.take().expect("active turn was checked above");
+        let ActiveTurn::Text(active) = self.active.take().expect("active turn was checked above")
+        else {
+            unreachable!("text-turn match was checked above");
+        };
 
         match finished.result {
             TurnResult::Cancelled => Vec::new(),
@@ -323,9 +376,33 @@ impl Controller {
         }
     }
 
+    fn handle_audio_turn_finished(&mut self, finished: AudioTurnFinished) -> Vec<Effect> {
+        // Audio bytes gain no playback authority until they pass this same
+        // current-turn check as a text-model result.
+        if !matches!(self.active.as_ref(), Some(ActiveTurn::Audio { id }) if *id == finished.id) {
+            return Vec::new();
+        }
+        self.active.take();
+        match finished.result {
+            AudioTurnResult::Audio { wav } if wav.is_empty() => {
+                vec![Effect::Display(Output::Diagnostic(
+                    "audio backend returned no playable audio; no output was accepted".into(),
+                ))]
+            }
+            AudioTurnResult::Audio { wav } => vec![Effect::PlayAudio {
+                id: finished.id,
+                wav,
+            }],
+            AudioTurnResult::Failed { message } => vec![Effect::Display(Output::Diagnostic(
+                format!("direct audio request failed: {message}"),
+            ))],
+            AudioTurnResult::Cancelled => Vec::new(),
+        }
+    }
+
     fn accept_answer(
         &mut self,
-        active: ActiveTurn,
+        active: TextTurn,
         answer: String,
         proposed_scene: Option<Photo>,
     ) -> Vec<Effect> {

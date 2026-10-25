@@ -58,6 +58,8 @@ Read these files in this order:
    choices behind it.
 9. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
    text-only local installation path.
+10. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
+    microphone-to-backend-to-speaker experiment and its current limits.
 
 ## Run it on the same laptop
 
@@ -711,6 +713,10 @@ application code.
   an installed Pi camera stack. Unusual V4L2 drivers or unavailable Pi camera
   tooling may not be listed as usable.
 - Non-streaming Ollama responses; no partial answer is printed.
+- `--voice --pipeline audio-to-audio` is an isolated, one-recording/one-WAV
+  experiment. Its default fixture proves microphone-to-speaker plumbing but is
+  not a conversational model; it does not use Whisper, Piper, a camera, or
+  text conversation history.
 - Six accepted exchanges per scene/session; this is a simple context cap, not
   exact token budgeting. Start a new scene with `/look` or use `/reset`.
 - No persistent memory, database, vector store, agent framework, plugins,
@@ -970,6 +976,7 @@ src/
   launch.rs                parses explicit launch/profile/device choices
   profile.rs               resolves laptop/Pi defaults and local overrides
   app.rs                   application event loops and worker lifetimes
+  audio_to_audio.rs        isolated recording -> direct-audio -> WAV runtime
   telemetry.rs             redacted correlations, JSONL, OTLP spans/metrics
   protocol.rs              typed events, effects, IDs, and requests/results
   controller.rs            accepted scene/history and TurnId authorization
@@ -996,6 +1003,7 @@ src/
 
   speak/
     mod.rs                 tracing logger and authorized dialogue boundary
+    audio.rs               bounded direct-WAV playback worker (no Piper)
     tts.rs                 Piper CLI adapter (text -> in-memory WAV)
     playback.rs            generic output listing/selection and Rodio playback
     worker.rs              ordered cancellable speech worker
@@ -1008,7 +1016,7 @@ camera call, microphone transcription in normal typed mode, wake word,
 continuous vision, persistent memory, cloud fallback, agent/tool framework,
 speech streaming, TTS-driven turn-taking, or echo cancellation.
 
-### Latest: Raspberry Pi hardware adapters and keyboard-as-buttons
+### Previous milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
 
 The Pi work adds adapters around the existing voice runtime; it does not add a
 second controller or a different conversation model. Both input sources turn
@@ -1056,12 +1064,76 @@ cargo run --release -- --voice --profile raspberry-pi \
   --audio-output 'Exact CPAL output id'
 ```
 
-The profile defaults to `gemma3:1b`, which Independence marks **text-only**.
-That is intentional: a `P` press reports that capture remains off instead of
-silently taking a photograph the selected model cannot use. A deliberately
-verified local vision model needs both `OLLAMA_MODEL=...` and
-`INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision` for one launch. The Pi profile also
-selects `rpicam-still`; its direct child process writes one bounded JPEG to
-memory, is validated, and is released before Ollama is asked. Details,
-permissions, and the physical acceptance sequence are in
-[the Raspberry Pi guide](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
+The profile defaults to `gemma3:1b`, which `/api/show` must verify before any
+image work can begin. That is intentional: a `P` press reports that capture
+remains off instead of silently taking a photograph the selected model cannot
+use. Select a vision model with `--model` or `OLLAMA_MODEL`; the Ollama
+backend's own `/api/show` metadata is the authority for camera use. There is
+no application image-support override. The Pi profile also selects
+`rpicam-still`; its direct child process writes one bounded JPEG to memory, is
+validated, and is released before Ollama is asked. Details, permissions, and
+the physical acceptance sequence are in [the Raspberry Pi guide](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
+
+### Latest: pipelines, model backends, and isolated audio-to-audio plumbing
+
+This milestone keeps the deliberately separate pipeline choice, and makes the
+model runtime a separate choice too. It does **not** replace the working
+button-controlled conversation path:
+
+```text
+TalkPressed -> CPAL captures bounded mono f32 at its actual rate
+TalkReleased -> recording is complete and microphone is released
+                                  |
+                         --pipeline selects flow
+                          /                 \
+       transcribe-and-speak                  audio-to-audio
+       Whisper -> text Ollama                direct audio backend
+       -> Piper -> Rodio                     -> returned WAV -> Rodio
+
+--backend selects runtime: ollama (default) | fixture (direct-audio test)
+--model selects a model within that runtime
+```
+
+The standard `transcribe-and-speak` path remains the default and preserves
+Whisper, text conversation/history, optional `P` photographs, Ollama, and
+Piper/HAL output. The new direct path has one recording and one controller-
+authorized WAV response only: no transcript, Piper, HAL cue, camera service,
+photograph, text history, streaming, or automatic turn-taking.
+
+Run the fixture proof from the repository root:
+
+```bash
+cargo run --release -- --voice \
+  --pipeline audio-to-audio \
+  --backend fixture
+```
+
+Hold Enter, speak or make a sound, then release Enter. The fixture receives
+the bounded capture and returns a short generated test tone through the chosen
+speaker. Escape cancels capture/backend/playback; a new Enter press invalidates
+the old result; `P` is ignored and cannot activate a camera. This proves local
+plumbing, not a voice model.
+
+`src/launch.rs` now parses `--model`, `--backend`, and `--pipeline` as three
+independent choices. Backend precedence is `--backend`, then
+`INDEPENDENCE_BACKEND`, then the `ollama` default. Model precedence is
+`--model`, then `INDEPENDENCE_MODEL`, then the compatible `OLLAMA_MODEL`, then
+the profile default. Hardware profiles still choose only physical-device
+defaults.
+
+When the Ollama backend is selected,
+`think::OllamaClient::discover_capabilities` calls `/api/show` once and caches
+explicit capability metadata. Camera capture requires advertised `vision`;
+unknown or absent metadata keeps it off. There is no image-support environment
+override. Capability metadata alone does not authorize a pipeline: its backend
+must also implement that operation's documented request/response format.
+
+`--backend ollama` currently reports an honest unsupported direct-audio
+exchange before opening a microphone or sending audio when no verified
+recording-to-WAV contract exists for the chosen model. Independence does not
+fall back to Whisper plus Piper in that mode. `fixture` is intentionally
+model-less and only valid with `--pipeline audio-to-audio`; use it explicitly
+to test local microphone → backend → speaker plumbing.
+No Qwen3-Omni model or alternate runtime was installed or downloaded. See
+[the audio-to-audio guide](docs/audio-to-audio.md) for Pi/button examples,
+privacy bounds, test scope, and the next real-backend evaluation boundary.

@@ -26,13 +26,13 @@ use crate::{
         audio::CpalRecorder,
         transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
     },
-    launch::VoiceLaunchOptions,
+    launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline},
     listen::{
         self,
         controls::{VoiceControlEvent, VoiceInputEvent, VoiceInputSource},
         evdev::{self, EvdevButtonInputSource},
     },
-    profile::{self, CameraBackendSelection, ResolvedVoiceInput},
+    profile::{self, CameraBackendSelection, ResolvedVoiceInput, ResolvedVoiceProfile},
     protocol::{
         CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
@@ -43,7 +43,7 @@ use crate::{
     },
     speak,
     telemetry::{self, Interaction},
-    think::{OllamaClient, ThinkError},
+    think::{ModelCapabilities, OllamaClient, ThinkError},
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 32;
@@ -127,6 +127,7 @@ impl MainEventResult {
 /// Runs the interactive terminal application until `/quit`, EOF, or Ctrl+C.
 pub async fn run() -> Result<(), AppError> {
     let client = OllamaClient::from_environment()?;
+    discover_model_capabilities(&client).await;
     let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     listen::spawn_stdin_reader(event_sender.clone()).map_err(AppError::InputAdapter)?;
 
@@ -150,6 +151,36 @@ pub async fn run() -> Result<(), AppError> {
 
     runtime.shutdown().await;
     Ok(())
+}
+
+/// Obtains one cached `/api/show` record for the selected local model. A
+/// failed probe does not stop text-only startup, but leaves camera and any
+/// future direct-audio capability gated as explicitly unknown.
+async fn discover_model_capabilities(client: &OllamaClient) {
+    match client.discover_capabilities().await {
+        Ok(ModelCapabilities {
+            image_input,
+            audio_input,
+            audio_output,
+            ..
+        }) => speak::process(
+            "ollama_model_capabilities",
+            format!(
+                "model={} image_input={} audio_input={} audio_output={}",
+                client.model(),
+                image_input.label(),
+                audio_input.label(),
+                audio_output.label()
+            ),
+        ),
+        Err(error) => speak::warning(
+            "ollama_model_capabilities_unknown",
+            format!(
+                "could not discover capabilities for model `{}`: {error}; text-only requests remain available, but camera/direct-audio support is disabled until a later launch can verify metadata",
+                client.model()
+            ),
+        ),
+    }
 }
 
 /// Runs standalone local dictation without constructing Ollama or camera
@@ -292,7 +323,54 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 /// one `VoiceRuntime`; neither gets a special controller path.
 pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), AppError> {
     let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
-    let client = OllamaClient::new(resolved.ollama)?;
+    match (resolved.pipeline, resolved.backend) {
+        (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
+            let client = configured_ollama_client(&resolved)?;
+            discover_model_capabilities(&client).await;
+            run_transcribe_and_speak(resolved, client).await
+        }
+        (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
+            backend: backend.label(),
+            pipeline: VoicePipeline::TranscribeAndSpeak.label(),
+        }),
+        (VoicePipeline::AudioToAudio, backend) => {
+            // The fixture backend is specifically a microphone→backend→speaker
+            // plumbing check. It must not start an Ollama client or probe a
+            // model. The explicit `ollama` backend receives cached metadata
+            // first and will reject unsupported/unknown direct-audio support.
+            let client = match backend {
+                ModelBackend::Ollama => {
+                    let client = configured_ollama_client(&resolved)?;
+                    discover_model_capabilities(&client).await;
+                    Some(client)
+                }
+                ModelBackend::Fixture => None,
+            };
+            crate::audio_to_audio::run(resolved, client)
+                .await
+                .map_err(AppError::AudioToAudio)
+        }
+    }
+}
+
+/// Creates an Ollama client only after runtime pipeline selection chose the
+/// Ollama adapter. Profile resolution intentionally does not decide whether a
+/// model can perform the selected operation.
+fn configured_ollama_client(resolved: &ResolvedVoiceProfile) -> Result<OllamaClient, AppError> {
+    let config = resolved
+        .ollama
+        .clone()
+        .ok_or(AppError::MissingBackendConfiguration { backend: "ollama" })?;
+    Ok(OllamaClient::new(config)?)
+}
+
+/// The established transcript → text-model → Piper path. It receives already
+/// resolved configuration so `run_voice_with_options` can select the isolated
+/// direct-audio path without starting Whisper or Piper first.
+async fn run_transcribe_and_speak(
+    resolved: ResolvedVoiceProfile,
+    client: OllamaClient,
+) -> Result<(), AppError> {
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
         mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -320,13 +398,15 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     if let Some(profile) = resolved.profile {
         speak::process("hardware_profile", profile.label());
     }
+    speak::process("voice_pipeline", resolved.pipeline.label());
+    speak::process("model_backend", resolved.backend.label());
     speak::process("voice_camera_backend", resolved.camera_backend.label());
     speak::process(
         "voice_model",
         format!(
-            "{} ({})",
+            "{} (image_input={})",
             client.model(),
-            client.image_input_support().label()
+            client.capabilities().image_input.label()
         ),
     );
 
@@ -590,6 +670,16 @@ impl TurnRuntime {
     ) -> RuntimeEffectResult {
         match effect {
             Effect::StartTurn(request) => self.start(request).await,
+            // Direct-audio effects are consumed exclusively by the isolated
+            // audio-to-audio runtime. Keeping this branch explicit prevents
+            // the established text runtime from accidentally initializing a
+            // second pipeline or treating audio bytes as dialogue.
+            Effect::StartAudioTurn(_) | Effect::PlayAudio { .. } => {
+                speak::warning(
+                    "unexpected_direct_audio_effect",
+                    "direct-audio effect reached the text runtime and was ignored",
+                );
+            }
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
@@ -647,8 +737,8 @@ impl TurnRuntime {
                     id,
                     result: TurnResult::Failed {
                         message: format!(
-                            "configured model `{}` is text-only; choose a verified vision model and set INDEPENDENCE_IMAGE_MODEL_SUPPORT=vision before submitting photographs",
-                            self.client.model()
+                            "camera/photo request was not started: {}",
+                            self.client.image_input_restriction()
                         ),
                     },
                 }))
@@ -702,13 +792,12 @@ impl TurnRuntime {
     fn prepare_camera(&self, preparation: CameraPreparation) {
         if !self.client.supports_images() {
             let event_sender = self.event_sender.clone();
+            let reason = self.client.image_input_restriction();
             tokio::spawn(async move {
                 let _ = event_sender
                     .send(Event::CameraPrepared {
                         id: preparation.id,
-                        result: Err(
-                            "the configured model is text-only; camera capture remains off until a verified vision model is configured".into(),
-                        ),
+                        result: Err(format!("camera capture remains off: {reason}")),
                     })
                     .await;
             });
@@ -1476,7 +1565,7 @@ impl VoiceRuntime {
         if !self.turns.supports_images() {
             speak::warning(
                 "photo_capture_unavailable",
-                "the configured model is text-only; camera capture remains off until a verified vision model is configured",
+                self.turns.client.image_input_restriction(),
             );
             return;
         }
@@ -2173,6 +2262,18 @@ pub enum AppError {
 
     #[error("could not run local dictation: {0}")]
     Dictation(#[from] dictation::DictationError),
+
+    #[error("could not run the direct audio-to-audio experiment: {0}")]
+    AudioToAudio(#[source] crate::audio_to_audio::AudioToAudioError),
+
+    #[error("backend `{backend}` does not implement pipeline `{pipeline}`")]
+    UnsupportedPipeline {
+        backend: &'static str,
+        pipeline: &'static str,
+    },
+
+    #[error("backend `{backend}` did not provide its required local configuration")]
+    MissingBackendConfiguration { backend: &'static str },
 }
 
 #[cfg(test)]
@@ -2224,16 +2325,18 @@ mod tests {
                 CameraService,
             },
         },
-        think::{ImageInputSupport, OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
+        think::{OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
     };
 
-    use super::{TurnRuntime, VoiceRuntime, run_turn};
+    use super::{AppError, TurnRuntime, VoiceRuntime, run_turn, run_voice_with_options};
+    use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
     use crate::speak::{SpeechEvent, SpeechOutcome, SpeechOwner, SpeechService};
 
     fn client(server: &MockServer) -> Arc<OllamaClient> {
-        Arc::new(
-            OllamaClient::new(OllamaConfig::new(&server.uri(), "test-model").unwrap()).unwrap(),
-        )
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "test-model").unwrap()).unwrap();
+        client.set_capabilities_for_test(&["vision"]);
+        Arc::new(client)
     }
 
     async fn within_test_timeout<T>(future: impl Future<Output = T>) -> T {
@@ -2531,6 +2634,7 @@ mod tests {
         );
         let client =
             OllamaClient::new(OllamaConfig::new(&server.uri(), "test-model").unwrap()).unwrap();
+        client.set_capabilities_for_test(&["vision"]);
 
         VoiceHarness {
             runtime: VoiceRuntime::new(
@@ -2853,17 +2957,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_only_model_rejects_camera_preparation_before_device_access() {
+    async fn unsupported_pipeline_backend_is_reported_at_runtime_before_device_setup() {
+        let result = run_voice_with_options(VoiceLaunchOptions {
+            backend: Some(ModelBackend::Fixture),
+            pipeline: Some(VoicePipeline::TranscribeAndSpeak),
+            ..VoiceLaunchOptions::default()
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::UnsupportedPipeline {
+                backend: "fixture",
+                pipeline: "transcribe-and-speak",
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_without_advertised_vision_rejects_camera_preparation_before_device_access() {
         let server = MockServer::start().await;
-        let client = OllamaClient::new(
-            OllamaConfig::new_with_image_support(
-                &server.uri(),
-                "text-only-model",
-                ImageInputSupport::TextOnly,
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let client =
+            OllamaClient::new(OllamaConfig::new(&server.uri(), "text-model").unwrap()).unwrap();
+        client.set_capabilities_for_test(&[]);
         let list_calls = Arc::new(AtomicUsize::new(0));
         let capture_calls = Arc::new(AtomicUsize::new(0));
         let camera = CameraService::with_backend(Arc::new(UnexpectedCameraBackend {
@@ -2885,7 +3001,7 @@ mod tests {
             Event::CameraPrepared {
                 result: Err(message),
                 ..
-            } if message.contains("text-only")
+            } if message.contains("does not advertise vision")
         ));
         assert_eq!(list_calls.load(Ordering::SeqCst), 0);
         assert_eq!(capture_calls.load(Ordering::SeqCst), 0);

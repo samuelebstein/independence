@@ -1,8 +1,8 @@
 # Security threat model
 
-> **Status:** Milestone 5.5 design artifact — awaiting owner approval. This is
-> not evidence that encryption, authentication, locked storage, recovery, or
-> secure memory has been implemented.
+> **Status:** Milestone 5.5 design artifact plus Milestone 6.1 foundation.
+> The current code implements an Ephemeral Mode/lifecycle boundary, but not
+> encryption, authentication, locked storage, recovery, or secure memory.
 
 ## Purpose and method
 
@@ -24,9 +24,16 @@ requirements.
 The current code has useful privacy boundaries, but no cryptographic private
 storage boundary:
 
-- `Controller` keeps accepted conversation turns and `Photo` bytes in process
-  memory only (`src/controller.rs`). `/reset` clears that in-memory session;
-  process exit loses it.
+- `SecurityManager` (`src/security.rs`) owns a process-local lifecycle policy
+  and an opaque Ephemeral Mode lease. Production startup is `Uninitialized`;
+  there is no production route to `Unlocked` or Private Mode yet.
+- The default Ephemeral `Controller` keeps accepted conversation turns and
+  freshly captured `Photo` bytes in process memory only (`src/controller.rs`).
+  It starts empty; `/reset` and orderly runtime shutdown clear application-owned
+  context; process exit loses it.
+- Ephemeral Mode rejects `/look` before file I/O, so it does not load an
+  arbitrary saved photo or personal file. Explicit fresh camera capture remains
+  available under the existing consent/control path and stays in memory.
 - Captured microphone samples, Whisper work, camera JPEGs, and Piper WAVs are
   bounded in memory for an interaction. The application does not intentionally
   save camera stills or recordings (`src/dictation/`, `src/see/`, `src/speak/`).
@@ -35,16 +42,27 @@ storage boundary:
   forward that port to a separate owner-controlled machine.
 - Typed and spoken input are not passed through a shell. A spoken slash command
   remains question text.
-- Optional JSONL and OTLP telemetry are intended to be redacted and are only
-  enabled by configuration (`src/telemetry.rs`). Terminal dialogue logging is
-  intentionally different: it currently includes recognized text and answers
-  in terminal scrollback/stdout (`src/speak/mod.rs`).
+- Optional JSONL telemetry is redacted and OTLP is only enabled by explicit
+  configuration (`src/telemetry.rs`). `src/speak/mod.rs` additionally filters
+  terminal `dialogue` events from OTLP. Terminal dialogue logging is
+  intentionally different: it includes recognized text and answers in terminal
+  scrollback/stdout.
 
 There is currently no PIN, recovery phrase, master key, encrypted database,
-lock/unlock state, secure enclave integration, encrypted backup, or access
-control. Treat every current local user/process that can inspect the app's
-memory, terminal, files, child processes, or device nodes as potentially able
-to observe interaction material.
+persistent lock/unlock state, secure enclave integration, encrypted backup, or
+private storage. Treat every current local user/process that can inspect the
+app's memory, terminal, files, child processes, or device nodes as potentially
+able to observe interaction material.
+
+### What Milestone 6.1 changes—and does not change
+
+The lifecycle boundary prevents a controller/UI/CLI selection from asserting
+that private data is available. It makes an unauthenticated temporary session
+the only production session and prevents local-file photo loading in that
+session. It does **not** protect plaintext while it is in application memory,
+force another local process to forget input, erase terminal scrollback, or
+securely erase OS/allocator/swap/crash-dump copies. The local Ollama server is
+also outside the application's memory-clearing guarantee.
 
 ## Assets to protect
 
@@ -115,9 +133,10 @@ Whisper/whisper.cpp   Ollama process/API      Piper/rpicam-still/CPAL/Rodio
 ```
 
 The future security manager is the only intended boundary that owns a DEK.
-The controller owns accepted conversation state, but must receive it only after
-the manager opens private storage. The existing controller and workers are not
-the key-management authority.
+The current manager already owns lifecycle/mode policy but has no DEK. The
+controller owns accepted temporary conversation state; a future private
+controller path must receive persistent history only after the manager opens
+private storage. Existing controller/workers are not key-management authority.
 
 Important external boundaries include:
 

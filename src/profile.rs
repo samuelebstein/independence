@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::{
     launch::{HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline},
+    security::OperatingMode,
     speak::tts::{DEFAULT_HAL_MODEL, DEFAULT_PIPER_COMMAND, PiperConfig},
     think::{OllamaConfig, ThinkError},
 };
@@ -79,6 +80,7 @@ pub(crate) struct ResolvedVoiceProfile {
     pub camera_backend: CameraBackendSelection,
     pub pipeline: VoicePipeline,
     pub backend: ModelBackend,
+    pub operating_mode: OperatingMode,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -232,6 +234,7 @@ fn resolve_with_environment(
         camera_backend,
         pipeline,
         backend,
+        operating_mode: options.mode.unwrap_or(OperatingMode::Ephemeral),
     })
 }
 
@@ -258,6 +261,7 @@ mod tests {
     use crate::launch::{
         HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline,
     };
+    use crate::security::OperatingMode;
 
     use super::{
         CameraBackendSelection, EnvironmentOverrides, ResolvedVoiceInput, defaults_for,
@@ -294,6 +298,7 @@ mod tests {
         assert_eq!(resolved.audio_output.as_deref(), Some("alsa:usb-speaker"));
         assert_eq!(resolved.microphone.as_deref(), Some("alsa:usb-microphone"));
         assert!(matches!(resolved.input, ResolvedVoiceInput::Buttons(_)));
+        assert_eq!(resolved.operating_mode, OperatingMode::Ephemeral);
     }
 
     #[test]

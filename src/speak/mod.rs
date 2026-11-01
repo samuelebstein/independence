@@ -12,9 +12,9 @@ use std::{
     sync::Once,
 };
 
-use tracing::{error, info, warn};
+use tracing::{Metadata, error, info, warn};
 use tracing_subscriber::fmt::writer::MakeWriter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::protocol::{DictationOutput, Output};
 
@@ -27,10 +27,10 @@ pub use worker::{
     SpeechEvent, SpeechHandle, SpeechOutcome, SpeechOwner, SpeechService, UtteranceId,
 };
 
-pub const HELP: &str = r#"Independence local observation prototype
+pub const HELP: &str = r#"Independence local observation prototype — Ephemeral Mode
 
 Type a question to ask the local Ollama model.
-/look <path> | <question>  load one explicit JPEG/PNG and ask about it
+/look <path> | <question>  unavailable in Ephemeral Mode (does not read local files)
 /cameras                    list usable local V4L2 camera identifiers
 /camera | <question>        capture from the only listed camera and ask
 /camera <id> | <question>   capture from one explicitly selected camera
@@ -43,18 +43,20 @@ Paths are literal text, never shell commands. Relative paths resolve from the
 directory where Independence was started; spaces are allowed. `|` separates a
 path from its question, so a path containing `|` is not supported.
 
-Only the last successfully accepted scene is used for follow-ups. A /look or
+Only the last successfully accepted camera scene is used for follow-ups. A
 /camera photo replaces that scene only after its answer succeeds. Camera
 selection is checked before it supersedes active work. If multiple cameras are
 listed, /camera requires an ID; it never guesses a /dev/video node. A camera
 capture briefly opens the selected device, discards up to two warm-up frames,
 keeps one validated JPEG in memory, then releases the device before Ollama is
-contacted. Photos must be JPEG or PNG and at most 10 MiB. History is in memory
-only and caps at six accepted exchanges; use /reset or /look to begin a new
-scene.
+contacted. Photos must be JPEG or PNG and at most 10 MiB. History and captured
+photos are in memory only and cap at six accepted exchanges; use /reset to
+clear this temporary session.
 
-Camera captures are not saved by Independence, but the original source file
-for /look remains where it was.
+Ephemeral Mode never loads saved conversations, preferences, photographs, or
+other local files, and Independence does not persist its temporary history,
+captured camera photos, or microphone recordings. Terminal scrollback or
+redirected stdout may still retain what was displayed.
 This observation mode has keyboard input and terminal output only: no
 microphone, speech synthesis, persistent memory, continuous vision, streaming,
 or autonomous tools. /stop cancels this application's request task, but cannot
@@ -88,12 +90,28 @@ pub fn init_logging() {
         // layer: readable dialogue logs intentionally contain text, while
         // exported machine records never do.
         let otel = tracing_opentelemetry::layer()
-            .with_tracer(opentelemetry::global::tracer("independence"));
+            .with_tracer(opentelemetry::global::tracer("independence"))
+            // Dialogue fields intentionally contain the user-visible text.
+            // They stay in the terminal stream, but are never forwarded by
+            // this tracing layer to an optionally configured OTLP exporter.
+            .with_filter(filter_fn(telemetry_accepts_metadata));
         tracing_subscriber::registry()
             .with(terminal)
             .with(otel)
             .init();
     });
+}
+
+/// OTLP is an explicit external-destination boundary.  Keep all deliberate
+/// conversation events on the terminal-only side of it.  JSONL telemetry has
+/// its own redaction path in `telemetry`; this predicate protects the tracing
+/// exporter independently so a future event field cannot bypass that path.
+fn telemetry_accepts_metadata(metadata: &Metadata<'_>) -> bool {
+    telemetry_accepts_target(metadata.target())
+}
+
+fn telemetry_accepts_target(target: &str) -> bool {
+    target != "dialogue"
 }
 
 #[derive(Clone, Copy)]
@@ -329,5 +347,18 @@ pub fn emit_dictation(output: DictationOutput) {
         ),
         DictationOutput::Transcript(text) => user_transcript("final", &text),
         DictationOutput::Diagnostic(message) => warning("dictation", message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::telemetry_accepts_target;
+
+    #[test]
+    fn dialogue_events_are_terminal_only_while_operational_events_remain_exportable() {
+        assert!(!telemetry_accepts_target("dialogue"));
+        assert!(telemetry_accepts_target("process"));
+        assert!(telemetry_accepts_target("telemetry"));
+        assert!(telemetry_accepts_target("speech"));
     }
 }

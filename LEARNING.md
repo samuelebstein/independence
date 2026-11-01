@@ -4,18 +4,21 @@ This is a guide to the small amount of Rust architecture in the current
 prototype. It explains why each boundary exists, not just what its file is
 called.
 
-## Follow one `/look` request
+## Ephemeral Mode and a `/look` request
 
 ```text
 keyboard line
   -> listen parses `/look path | question` into Input::Look
-  -> controller stages a TurnRequest, retaining old accepted state
-  -> app worker loads and validates the selected photo
-  -> think encodes its bytes and POSTs /api/chat to Ollama
-  -> worker returns TurnFinished
-  -> controller either accepts it or ignores it by turn ID
-  -> speak logs only an accepted answer (and --voice may queue it for local audio)
+  -> default Ephemeral Controller rejects it before file I/O
+  -> diagnostic reaches the terminal; no photo/model worker starts
 ```
+
+This is a deliberate security boundary, not a parser limitation. An arbitrary
+path may point at a saved personal photograph or file. Until real Private Mode
+exists, normal production launches must not load it merely because a user typed
+`/look`. The bounded JPEG/PNG validator and proposed-scene path remain useful
+code and test fixtures for future authenticated storage work, but are not a
+production Ephemeral capability.
 
 The arrow labels are deliberately different:
 
@@ -225,10 +228,11 @@ The key invariant is simple: a result is accepted only when its `TurnId` is
 still active. Starting a new valid question, `/stop`, `/reset`, EOF, and Ctrl+C
 remove the old ID first. A late completion then becomes a harmless no-op.
 
-A `/look` is different from a regular question. Its photo is only a proposal
-until both loading and inference succeed. On success it replaces the accepted
-scene and starts that new scene's history with the accepted exchange. On a
-failure or cancellation, the prior scene and history remain intact.
+A future authenticated `/look` is different from a regular question. Its photo
+will be only a proposal until both loading and inference succeed. On success it
+would replace the accepted scene and start that new scene's history with the
+accepted exchange. In current Ephemeral Mode, it stops at the earlier
+file-isolation diagnostic.
 
 `/camera` has those same accepted-scene rules. It is never a live view: a
 follow-up uses the successfully accepted still photo and does not re-open the
@@ -353,18 +357,8 @@ cargo run
 Ask a text question, then type another before the first finishes. Only the
 newer turn is allowed to answer. Type `/stop` during a slow turn; there should
 be no accepted answer from it. Type `/reset`, then give an invalid `/look`
-path; the diagnostic should appear without restoring or erasing other state.
-
-For a photo, use a path you intentionally selected:
-
-```text
-/look data/tree.jpg | What features can I observe before trying to identify this tree?
-What other angle would help?
-```
-
-The first line stages the image; the second uses it only after the first answer
-was accepted. The model's answer is not proof of an identification—use the
-suggested observations and independent references to verify it.
+path; Ephemeral Mode should report its file-isolation policy without opening
+the path or starting inference.
 
 For the local camera, first type `/cameras`. If it prints more than one entry,
 choose one numeric ID explicitly:
@@ -648,70 +642,80 @@ preservation, malformed-audio rejection, and stale-result cancellation. See
 configuration precedence, and why a backend must verify both a model's
 capabilities and the request/response format before direct audio can run.
 
-## Latest milestone: security architecture before security code
+## Latest milestone: security foundation and Ephemeral Mode
 
-The security milestone deliberately changes no Rust behavior. That is useful:
-cryptography is not something to “add later” as an incidental wrapper around a
-database. It changes who is allowed to read state, when private material exists
-in memory, how recovery works, and what a person can honestly expect after a
-device is stolen.
-
-The proposed future shape is:
+Milestone 6.1 turns one security design idea into a small, testable code
+boundary without pretending encryption exists. The new
+[`src/security.rs`](src/security.rs) owns lifecycle policy; the controller
+does not get to decide that an operating mode is authenticated.
 
 ```text
-PIN ----------------> Argon2id --------> PIN wrapping key -----\
-                                                                  \
-random 24-word BIP-39 phrase -> standard seed -> HKDF -> recovery key -> two encrypted envelopes
-                                                                        /
-same random master DEK -----------------------------------------------/
-                       |
-                       +-> HKDF purpose keys -> encrypted private data / backup
+SecurityState (process-local today)        OperatingMode (current session)
+
+Uninitialized                              Ephemeral
+SetupInProgress                              - temporary
+Locked                                       - allowed from Uninitialized,
+Unlocked                                       Locked, RecoveryRequired
+RecoveryRequired                             - does not change lifecycle
+
+Private
+  - requires Unlocked
+  - no production way to enter it yet
 ```
 
-The key idea is **wrapping**, not encrypting everything again. The random DEK
-protects the data. A PIN change only changes the small PIN envelope that wraps
-that DEK, so a password change need not rewrite every photo and conversation.
-The recovery phrase provides a separate wrapping path, but it is not a backup:
-the phrase plus a copied encrypted device/backup can recover data; the phrase
-alone cannot recreate data that was lost.
+The important Rust idea here is an **opaque capability**. `SecurityManager`
+can return an `EphemeralSession` lease to the runtime, but no production code
+can construct the future `PrivateSession` or `PrivateStorageAccess` type. That
+does not encrypt anything today; it prevents a controller, UI, or command-line
+flag from smuggling a fake “authenticated” session into future storage code.
 
-This architecture is intentionally not a promise that an unlocked computer is
-safe from malicious software. A future `SecurityManager` can withhold the DEK
-and private storage from the controller while Locked, but a compromised
-operating system can still observe a process while it is Unlocked. Zeroizing a
-Rust value is good cleanup hygiene; it does not turn normal RAM into a secure
-enclave or prevent a suspended machine from writing memory to disk.
-
-The most important behavior change later will be a **boundary of authority**:
+Every normal application path therefore does this:
 
 ```text
-Locked
-  -> controller has no private session/history capability
-  -> microphone/camera/model results cannot restore it
-
-successful PIN or recovery authorization
-  -> SecurityManager grants narrow private-storage capability
-  -> controller can load accepted history / future memories
-
-lock, sleep, shutdown, or cancellation
-  -> revoke capability, clear app caches best-effort, return to Locked
+main / app launch
+  -> SecurityManager::new()               Uninitialized, process-local
+  -> enter_ephemeral()                    opaque EphemeralSession lease
+  -> Controller::new_ephemeral()          empty history + no photos
+  -> normal typed/voice/camera work
+  -> cancel/join owned workers
+  -> Controller::clear_ephemeral_session()
+  -> SecurityManager::end_ephemeral()
 ```
 
-No part of that state machine exists in the application yet. The documents make
-the next decisions visible rather than burying them in implementation:
+The clearing step drops application-owned references. It cannot honestly erase
+all copies from the allocator, OS memory, swap, crash dumps, terminal
+scrollback, device drivers, or local Ollama internals. It does, however,
+prevent the *next application controller request* from receiving old history:
+Ollama chat requests carry history explicitly, and a fresh/cleared controller
+has none to send.
 
-- [Security threat model](docs/security/THREAT_MODEL.md) names attackers,
-  assets, trust boundaries, and the limits of local processing.
-- [Proposed security architecture](docs/security/ARCHITECTURE.md) explains
-  PINs, BIP-39, Argon2id, HKDF, authenticated encryption, recovery, backups,
-  Linux/Pi differences, and library choices.
-- [Milestone 5.5 decision record](docs/milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md)
-  lists the owner approvals needed before any key or storage code begins.
-- [Security review checklist](docs/security/REVIEW_CHECKLIST.md) is the gate
-  every later audio, vision, networking, storage, or authentication milestone
-  must pass.
+Ephemeral Mode's most visible data-isolation choice is `/look`: it is rejected
+before it opens a local path. An explicit fresh `/camera` still works and
+remains in memory only. Terminal transcript/answer output remains visible to
+the person using the terminal; it is not forwarded through the OpenTelemetry
+tracing layer, and JSONL telemetry keeps its existing redaction rules.
 
-The current status is **awaiting owner approval**, not “security complete.”
-That is the honest result: the architecture is ready for discussion, but PIN
-policy, storage engine, backup rules, lock behavior, and hardware-authenticator
-scope are still meaningful choices.
+On the Raspberry Pi button profile, the existing Talk/Enter evdev input is a
+physical entry gesture: hold for five seconds and release before the normal
+voice runtime starts. The gate opens no microphone/camera/model/Piper resource
+and consumes that release, so a fresh press is required to record. This is
+intentional entry, not authentication.
+
+Try this from the repository root:
+
+```bash
+cargo run
+```
+
+You should see an uninitialized lifecycle message and then Ephemeral Mode.
+Ask a question and a follow-up, exit with `/quit`, restart, and ask whether it
+knows the prior question. The application sends no prior context. Then run:
+
+```bash
+cargo run -- --mode private
+```
+
+It should refuse before starting model/device work. That refusal is safer and
+more honest than a placeholder PIN. The next milestone remains **6.2 only
+after owner approval** of the key/recovery-format choices in the security
+documents.

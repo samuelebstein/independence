@@ -4,11 +4,12 @@ Independence is an experiment in a local only, airgapped computer for noticing a
 learning about the physical world. This repository currently contains a narrow
 terminal prototype—not a finished product.
 
-It can:
+It currently runs its user-facing interactions in **Ephemeral Mode**: a fresh,
+unauthenticated, in-memory-only session. It can:
 
 - take keyboard input as its `listen` capability;
-- send a text question, or an ordered in-memory JPEG/PNG context plus a
-  question, to a local Ollama model as `think`;
+- send a text question, or ordered fresh in-memory camera JPEG/PNG context
+  plus a question, to a local Ollama model as `think`;
 - list local Linux V4L2 cameras (or a Raspberry Pi `rpicam-still` camera
   module when explicitly profiled) and explicitly capture one still image as
   `see` input;
@@ -35,7 +36,9 @@ It also has two explicit local microphone modes:
 
 The default observation mode (`cargo run`) does not access a microphone or
 speaker. No current mode persists a conversation, streams tokens, calls tools
-autonomously, or uses a cloud model.
+autonomously, or uses a cloud model. It also does not load saved local files
+with `/look`: that capability is deferred until authenticated Private Mode
+exists.
 
 ## Start here
 
@@ -66,9 +69,11 @@ Read these files in this order:
    text-only local installation path.
 13. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
    microphone-to-backend-to-speaker experiment and its current limits.
-14. [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md) and
+14. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
+   [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md), and
    [`docs/security/ARCHITECTURE.md`](docs/security/ARCHITECTURE.md) — the
-   reviewed security design for future work; neither is implemented yet.
+   current Ephemeral Mode boundary and the still-unimplemented cryptographic
+   design.
 15. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
    gates, and the next intentionally small milestones.
 
@@ -82,7 +87,9 @@ cargo run
 ```
 
 This compiles the Rust package (writing only `target/`) and starts the
-terminal app. It uses `http://127.0.0.1:11434` and the local non-thinking
+terminal app in Ephemeral Mode. It logs that the process lifecycle is
+`Uninitialized`, then activates a temporary session with no private storage.
+It uses `http://127.0.0.1:11434` and the local non-thinking
 vision model `qwen3-vl:4b-instruct` unless you set environment variables for
 that one command:
 
@@ -105,6 +112,93 @@ project. For example, `ollama pull qwen3-vl:4b-instruct` uses the network and
 consumes local disk space; it is not run automatically by this application.
 Starting `ollama serve` starts a local service and binds its configured local
 endpoint.
+
+`--mode private` is intentionally not a bypass or a preview login. It fails
+before opening model/device resources because PIN/recovery authentication does
+not exist yet:
+
+```bash
+cargo run -- --mode private
+```
+
+Use the ordinary default command to enter Ephemeral Mode. It is usable while
+the lifecycle is uninitialized, locked, or recovery-required in the future;
+the current process-local implementation starts uninitialized every time.
+
+## Launch command reference
+
+Run these examples from the repository root. `--mode ephemeral` is written
+explicitly below for clarity, but it is the current default. Private Mode is
+not available until a later authentication milestone.
+
+### Laptop or desktop
+
+| What you want to do | Command | Model and device behavior |
+| --- | --- | --- |
+| Typed local conversation, with an optional fresh V4L2 camera still | `cargo run -- --mode ephemeral` | Uses the configured/default local Ollama model: currently `qwen3-vl:4b-instruct` unless `OLLAMA_MODEL` is set for that launch. |
+| Transcribe only; never contact Ollama | `cargo run -- --dictate` | Uses the default or explicitly configured microphone and local Whisper. |
+| Hold-to-talk voice conversation | `cargo run -- --voice --mode ephemeral --input terminal --model qwen3-vl:4b-instruct` | Uses the terminal Enter/P/Escape controls, local Whisper, local Ollama, and Piper when configured. The default microphone and speaker are used unless selected explicitly. |
+
+For a specific laptop microphone or speaker, append the exact IDs reported by
+the device-list commands:
+
+```bash
+cargo run -- --audio-input-devices
+cargo run -- --audio-devices
+
+cargo run -- --voice --mode ephemeral --input terminal \
+  --audio-input 'Exact CPAL input id' \
+  --audio-output 'Exact CPAL output id' \
+  --model qwen3-vl:4b-instruct
+```
+
+The voice command's `--model` applies only to that launch. For the typed
+terminal command, use `OLLAMA_MODEL=... cargo run` because the typed prototype
+does not currently accept a `--model` flag.
+
+### Raspberry Pi: text-first Gemma profile
+
+For a Pi text-only terminal run after building the release binary, use:
+
+```bash
+OLLAMA_MODEL=gemma3:1b \
+  ./target/release/independence --mode ephemeral
+```
+
+For the attached-keyboard button controller, USB microphone/speaker, local
+Whisper, and Piper, use this explicit Gemma command. Replace the input-device
+path and ALSA IDs with your own selected values; prefer a stable
+`/dev/input/by-id/...` or `/dev/input/independence/button-kbd` path rather than
+assuming `/dev/input/event7` stays the same after reconnecting hardware.
+
+```bash
+INDEPENDENCE_PIPER_COMMAND="$HOME/.local/share/independence/piper-venv/bin/piper" \
+./target/release/independence \
+  --voice \
+  --mode ephemeral \
+  --profile raspberry-pi \
+  --input buttons \
+  --input-device /dev/input/independence/button-kbd \
+  --audio-input 'alsa:plughw:CARD=Device,DEV=0' \
+  --audio-output 'alsa:plughw:CARD=Device,DEV=0' \
+  --backend ollama \
+  --pipeline transcribe-and-speak \
+  --model gemma3:1b
+```
+
+`gemma3:1b` is the Pi's text-first choice. It is not a vision model, so a
+button `P` press will be rejected before camera capture rather than silently
+capturing an image Gemma cannot inspect. To experiment with the Pi camera,
+replace only the final model argument with a locally installed
+vision-capable model, such as `--model qwen3-vl:2b`; expect substantially more
+memory use and slower responses.
+
+In Pi button mode, launch from SSH if convenient, then use the **physically
+attached** keyboard: hold Enter for five seconds and release to enter
+Ephemeral Mode, then hold Enter again to record. SSH Enter, `P`, and Escape do
+not control the device. See the [Raspberry Pi guide](docs/rasberry-pi.md) for
+build prerequisites, permissions, stable input-device setup, and independent
+microphone/speaker/camera tests.
 
 ## Dictation and voice modes
 
@@ -389,9 +483,6 @@ resolve deliberately outside this repository.
 ```text
 What is the primary gas in Earth's atmosphere?
 
-/look data/tree.jpg | What might this tree be?
-What detail would help distinguish it from an oak?
-
 /cameras
 /camera 0 | What visible features should I notice?
 What should I inspect next?
@@ -402,15 +493,12 @@ What should I inspect next?
 /quit
 ```
 
-`/look` takes literal text before the first `|` as a path; it is never sent to
-a shell. Spaces in paths work. A relative path is resolved from the directory
-where Independence started. A literal `|` in the path is not supported because
-it is the command delimiter.
-
-The app reads at most 10 MiB, recognizes JPEG/PNG by content, and fully
-decode-validates the image before any model request. It keeps the bytes only
-in memory. A failed, cancelled, missing, oversized, or unsupported `/look`
-does not replace the last accepted photograph or history.
+`/look <path> | <question>` remains recognized as a literal, non-shell command
+syntax, but Ephemeral Mode rejects it before opening its path. This prevents an
+unauthenticated session from accidentally sending a saved personal file to a
+model. The bounded JPEG/PNG file-validation code remains covered by private
+controller test fixtures and is reserved for future authenticated Private
+Mode; it is not a current production feature.
 
 ### Camera commands (Linux V4L2)
 
@@ -445,8 +533,8 @@ contacts Ollama. YUYV frames are encoded as JPEG in memory; MJPEG frames are
 fully validated as JPEG. No capture is written to disk or logged as payload
 data.
 
-Like `/look`, `/camera` stages a proposed new scene. The camera image and its
-new history replace the accepted scene only after Ollama returns an accepted
+`/camera` stages a proposed new temporary scene. The camera image and its new
+history replace the accepted scene only after Ollama returns an accepted
 answer. A failure or cancellation retains the previously accepted photo and
 history. Follow-up questions use the last accepted camera image; they do not
 activate the camera again.
@@ -463,15 +551,8 @@ kind of driver failure.
 
 ### Small manual experiments
 
-Start the app with `cargo run` from the repository root. For an explicit file
-photo and follow-up, type:
-
-```text
-/look /home/samebstein/Downloads/testtree.jpeg | What visible features can help identify this tree?
-What part of the image should I inspect next?
-```
-
-For a camera still, use the ID `/cameras` reported, then type:
+Start the app with `cargo run` from the repository root. For a camera still,
+use the ID `/cameras` reported, then type:
 
 ```text
 /camera 0 | What visible features should I notice?
@@ -481,12 +562,17 @@ What observation would reduce uncertainty?
 To test cancellation, submit a camera question and type `/stop` while the
 capture or local inference is active. The application should not print an
 accepted answer or add an exchange. The camera may remain busy for up to the
-three-second bounded acquisition window while its worker closes. To test an
-error that must not alter an accepted scene, use a deliberately invalid file:
+three-second bounded acquisition window while its worker closes. To confirm
+that Ephemeral Mode cannot load local files, type a deliberately invalid or
+real file path:
 
 ```text
 /look /definitely/not/a/photo.jpeg | What is this?
 ```
+
+Expected result: Independence reports that Ephemeral Mode does not load local
+files. It must not read the path, capture a camera image, or send an inference
+request.
 
 `/stop` cancels the application-owned request task without adding a model
 answer to history. It cannot prove that the independent Ollama server stopped
@@ -728,14 +814,16 @@ application code.
   experiment. Its default fixture proves microphone-to-speaker plumbing but is
   not a conversational model; it does not use Whisper, Piper, a camera, or
   text conversation history.
-- Six accepted exchanges per scene/session; this is a simple context cap, not
-  exact token budgeting. Start a new scene with `/look` or use `/reset`.
+- Six accepted exchanges per temporary session; this is a simple context cap,
+  not exact token budgeting. Use `/reset` to clear it. Ephemeral Mode rejects
+  `/look` before it reads a local file.
 - No persistent memory, database, vector store, agent framework, plugins,
   containers, or cloud fallback.
-- No authentication, lock state, encrypted application storage, recovery
-  phrase, encrypted backup, or security-manager implementation yet. The
-  future design and its limits are documented in
-  [`docs/security/`](docs/security/), not claimed as current protection.
+- A process-local SecurityManager and Ephemeral Mode boundary exist, but there
+  is no authentication, production unlock, encrypted application storage,
+  recovery phrase, or encrypted backup. The cryptographic design and its
+  limits are documented in [`docs/security/`](docs/security/), not claimed as
+  current protection.
 - The client uses a 2-second connect timeout and a 120-second request timeout,
   disables redirects and ambient HTTP proxy use, and never logs image payloads
   or full requests.
@@ -747,41 +835,53 @@ application code.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
 
-### Latest: security architecture and threat model (design only)
+### Latest: Security Foundation and Ephemeral Mode (Milestone 6.1)
 
-This milestone did **not** add a login screen, encryption, a database, a
-recovery phrase, or any hidden runtime behavior. It established the reviewable
-design that must be approved before those things are implemented.
+Independence now has a small `SecurityManager`, but it is intentionally **not**
+a login system or cryptography implementation. It makes the current safety
+truth explicit: normal use is a temporary, unauthenticated Ephemeral session.
 
 ```text
-current prototype
-  in-memory session + local device/model processes
-  no durable private store or lock state
-                 |
-                 | future approved boundary
-                 v
-SecurityManager
-  Locked -> explicit PIN or recovery authorization -> Unlocked
-                 |
-                 v
-encrypted private storage capability -> existing Controller
+process starts: SecurityState::Uninitialized
+                         |
+                         | default launch / approved physical entry
+                         v
+              Ephemeral Mode lease
+                         |
+                         v
+    empty in-memory Controller history + fresh camera photos only
+                         |
+                 orderly exit / reset
+                         v
+            application-owned buffers cleared
 ```
 
-The proposed design generates one random master data-encryption key (DEK). A
-PIN-derived key and a 24-word BIP-39 recovery-derived key each encrypt a
-separate envelope containing that same DEK. The DEK then supplies
-domain-separated keys for private storage and backups. Changing a PIN rewrites
-only its envelope; recovery needs the phrase **and** an encrypted envelope or
-backup. A phrase alone cannot recreate data that has been lost.
+The lifecycle types also name `SetupInProgress`, `Locked`, `Unlocked`, and
+`RecoveryRequired`, and test their allowed transitions. That is a stable
+boundary for later work. It does **not** make the device cryptographically
+locked today: no PIN, recovery phrase, master key, encrypted storage, or
+production path to `Unlocked` exists. `cargo run -- --mode private` therefore
+refuses rather than pretending a CLI flag authenticated anyone.
 
-This is deliberately marked **awaiting owner approval**, because the project
-must decide its PIN policy, recovery-passphrase policy, encrypted-storage
-engine, backup destination/restore behavior, lock policy, hardware-rooted
-authentication scope, and release-review bar before code is written. Read
-[the threat model](docs/security/THREAT_MODEL.md),
-[the proposed architecture](docs/security/ARCHITECTURE.md), and
-[the Milestone 5.5 decision record](docs/milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md)
-before approving Milestone 6.1.
+Ephemeral Mode starts without saved conversation or preferences, rejects
+`/look` before it can open a local file, allows an explicit temporary camera
+capture, and clears controller-owned conversation/image buffers when the
+session ends. Current terminal dialogue is still visible in scrollback or
+redirected stdout; JSONL telemetry redacts content and dialogue events are
+filtered from optional OTLP export. Those are useful boundaries, not a claim
+of secure erasure from the OS, swap, crash dumps, or local model internals.
+
+On a Pi button launch, hold the attached controller's Talk/Enter button for
+five seconds and release it to enter Ephemeral Mode. This starts only the
+existing evdev input adapter, not microphone/camera/model work; a fresh press
+starts normal hold-to-talk recording. Terminal mode enters default Ephemeral
+Mode directly.
+
+Read [the Milestone 6.1 specification](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
+[the threat model](docs/security/THREAT_MODEL.md), and
+[the security architecture](docs/security/ARCHITECTURE.md) before proposing
+Milestone 6.2. Key formats, recovery policy, encrypted storage, and backup
+decisions remain owner-approval work.
 
 This is a map of what exists **now**. It shows three ways into the same local
 learning system: typed questions, transcript-only dictation, and integrated
@@ -819,7 +919,7 @@ flowchart TD
     Main --> Dictate["cargo run -- --dictate"]
     Main --> Voice["cargo run -- --voice"]
 
-    Typed --> TypedApp["app::run()"]
+    Typed --> TypedApp["app::run_with_mode(Ephemeral)"]
     Dictate --> DictationApp["app::run_dictation()"]
     Voice --> VoiceApp["app::run_voice()"]
 
@@ -830,7 +930,7 @@ flowchart TD
 
 | Mode | What it does | What it deliberately does not do |
 | --- | --- | --- |
-| `cargo run` | Typed questions, `/look`, `/camera`, accepted photo follow-ups | Use microphone input |
+| `cargo run` | Typed Ephemeral questions, `/camera`, accepted temporary-photo follow-ups | Use microphone input or load local files with `/look` |
 | `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
 | `cargo run -- --voice` | cue → hold-to-record → local Whisper → local Ollama → timestamped answer log → optional local Piper/HAL playback | Parse spoken commands, autonomously use a camera, or perform echo cancellation |
 
@@ -874,22 +974,10 @@ new question, /stop, /reset, EOF, or Ctrl+C
 /look path/to/photo.jpg | question
         |
         v
-listen/mod.rs parses a literal path; it never invokes a shell
+Ephemeral Controller rejects it before file I/O
         |
         v
-Controller stages a proposed new scene
-        |
-        v
-app.rs loads + validates Photo in src/see/mod.rs
-        |
-        v
-think/mod.rs base64-encodes bytes for Ollama /api/chat
-        |
-        v
-answer succeeds and is still the active TurnId
-        |
-        v
-Controller replaces accepted photo + starts that scene's history
+future authenticated Private Mode may use the separately tested file validator
 ```
 
 ```text
@@ -905,7 +993,7 @@ src/see/camera.rs lists/selects one V4L2 device
 one bounded capture -> validated in-memory JPEG -> device released
         |
         v
-same Ollama request and accepted-scene rule as /look
+Ollama request with temporary image; accepted-scene rule commits only on success
 ```
 
 A failed, cancelled, missing, or invalid new photo never replaces the last

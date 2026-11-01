@@ -6,6 +6,7 @@ pub mod launch;
 pub mod listen;
 pub mod profile;
 pub mod protocol;
+pub mod security;
 pub mod see;
 pub mod speak;
 pub mod telemetry;

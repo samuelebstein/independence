@@ -1,8 +1,14 @@
-# Proposed security architecture
+# Security architecture
 
-> **Status:** Milestone 5.5 recommendation — awaiting owner approval. Nothing
-> in this document is application behavior yet. It specifies the boundary that
-> Milestones 6.1–6.7 may implement after review.
+> **Status:** Milestone 5.5 design plus Milestone 6.1 foundation. The
+> cryptographic, authentication, recovery, storage, and backup sections remain
+> approval-required design; the lifecycle/ephemeral boundary is current code.
+
+> **Implementation status:** Milestone 6.1 now implements the process-local
+> `SecurityManager` lifecycle policy and default Ephemeral Mode described
+> below. It does **not** implement keys, PINs, recovery phrases, encryption,
+> private storage, or persistent authentication. Sections about those remain
+> approved design direction or recommendations, not current protection.
 
 ## Read this first: three kinds of statement
 
@@ -232,6 +238,58 @@ before any availability guarantee is claimed.
 
 ## 4. Security states and ownership boundary
 
+### Milestone 6.1 implemented foundation
+
+`src/security.rs` now owns a small, dependency-free `SecurityManager`. It is
+not a cryptographic manager yet: it has no key material, persistence, disk I/O,
+PIN input, recovery input, or model/device authority.
+
+| Item | Current implementation | Not implemented yet |
+| --- | --- | --- |
+| Lifecycle states | `Uninitialized`, `SetupInProgress`, `Locked`, `Unlocked`, `RecoveryRequired`, with tested transition checks | Persisting state or obtaining state from an enrolled device |
+| Default launch | Starts a process-local `Uninitialized` manager, then obtains an opaque Ephemeral Mode lease | Any automatic setup or unlock |
+| Ephemeral Mode | Allowed from `Uninitialized`, `Locked`, and `RecoveryRequired`; does not change lifecycle state | A durable profile, preferences, or personal-memory load |
+| Private Mode | Named explicitly and denied unless lifecycle is `Unlocked` | Any production way to become `Unlocked` |
+| Storage authority | An opaque future `PrivateStorageAccess` type exists behind the manager | A storage adapter, DEK, envelope, or actual data access |
+| Cleanup | Runtime cancels/joins work, then clears controller-owned temporary history/photos on orderly exit | Secure erasure outside normal Rust/application ownership |
+
+The deliberate current rule is: a CLI flag cannot authenticate someone.
+`--mode private` fails before model, microphone, camera, terminal-input, or
+Piper startup. Test-only lifecycle transitions use private marker types that
+are not compiled into production authorization paths; they test policy, not a
+fake PIN.
+
+Current production runs start `Uninitialized` every process because there is
+no protected metadata to persist. The manager still tests the Locked and
+RecoveryRequired rules so later storage/authentication work has a stable
+policy boundary. Calling the device “locked” today would be misleading: no
+private data store exists to lock.
+
+#### Ephemeral session policy
+
+The controller is constructed as an Ephemeral controller for typed and voice
+paths. It begins with empty history/photos; `/look` is rejected before file
+I/O; explicit fresh `/camera` capture remains available under existing user
+action/model-capability checks. Captured stills, microphone buffers, and
+conversation context remain in memory only. On orderly shutdown the runtime
+clears controller history/photos after its owned workers are cancelled or
+joined. `/reset` clears the current temporary context earlier.
+
+Ollama's current non-streaming API does not maintain an application session
+identifier: Independence sends accepted history explicitly on each request.
+After controller cleanup, the next request has no prior application history.
+Model residency (`keep_alive`) or opaque model-server internals are not proof
+of cryptographic or secure-memory clearing.
+
+#### Physical entry policy
+
+In Raspberry Pi `--voice --input buttons` mode, the selected exclusive evdev
+Talk/Enter button must be held for five seconds then released before the
+Ephemeral lease is obtained. The gate uses no microphone/camera/model/Piper
+work and consumes that first release; a fresh press begins normal recording.
+Terminal mode has no physical device to gate and enters default Ephemeral Mode
+directly. This is a usability/intent gesture, not authentication.
+
 ### Proposed state machine
 
     Uninitialized
@@ -287,7 +345,7 @@ silently erase data.
 
 | Component | Owns | Must not own |
 | --- | --- | --- |
-| SecurityManager (future) | State machine, DEK lifetime, envelope read/write, authenticator policy, lock/recovery transitions | Conversation decisions, model calls, sensor activation, ordinary terminal parsing |
+| SecurityManager (current foundation; future expanded) | Current lifecycle/mode policy and opaque session leases; later DEK lifetime, envelopes, authenticator policy, lock/recovery transitions | Conversation decisions, model calls, sensor activation, ordinary terminal parsing |
 | Private storage adapter (future) | Encrypted record serialization, authenticated read/write, bounded plaintext buffers | PIN/recovery UX, raw DEK copies outside granted capability |
 | Existing Controller | Accepted scene/history and current turn authorization after storage is open | PIN, recovery phrase, raw master key, envelope mutation |
 | Existing media/model workers | One explicit capture/transcription/inference/playback operation | Long-lived private history or any authorization secret |
@@ -586,14 +644,13 @@ Do not begin implementation until the owner chooses or delegates these:
    reproducible-build target, independent review/audit scope, and security
    disclosure process before a persistent private-data release.
 
-## 11. Recommended next implementation boundary
+## 11. Next implementation boundary
 
-The next authorized milestone should be 6.1 only: introduce a testable
-SecurityManager state machine and initialization boundary with no encryption or
-migration of existing app history. It should prove that the controller cannot
-obtain private storage while Locked, and that cancellation/exit does not leave
-an unlocked capability live. It should not add a PIN, mnemonic, key, database,
-or backup until the approval questions above are resolved.
+Milestone 6.1 is complete as the non-cryptographic lifecycle and Ephemeral
+Mode foundation. The next possible milestone is 6.2, but it is **not
+automatically authorized**. It must first resolve the key/envelope and recovery
+approval questions above. In particular, do not add a PIN, mnemonic, DEK,
+database, or backup merely because the state types now exist.
 
 ## References
 

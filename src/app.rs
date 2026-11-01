@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -36,6 +36,10 @@ use crate::{
     protocol::{
         CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
+    },
+    security::{
+        EphemeralEntryControl, EphemeralEntryGesture, EphemeralEntryOutcome, EphemeralSession,
+        OperatingMode, SecurityError, SecurityManager,
     },
     see::{
         Photo, PhotoSource,
@@ -126,30 +130,99 @@ impl MainEventResult {
 
 /// Runs the interactive terminal application until `/quit`, EOF, or Ctrl+C.
 pub async fn run() -> Result<(), AppError> {
-    let client = OllamaClient::from_environment()?;
-    discover_model_capabilities(&client).await;
-    let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    listen::spawn_stdin_reader(event_sender.clone()).map_err(AppError::InputAdapter)?;
+    run_with_mode(OperatingMode::Ephemeral).await
+}
 
-    let mut controller = Controller::new();
-    let mut runtime = TurnRuntime::new(client, CameraService::v4l(), event_sender);
-    speak::welcome();
+/// Runs the line-oriented application in the requested operating mode.
+///
+/// The default is Ephemeral Mode.  Private Mode is deliberately rejected in
+/// Milestone 6.1 before an Ollama client, terminal reader, camera, or private
+/// storage could be initialized: no authenticator exists yet.
+pub async fn run_with_mode(mode: OperatingMode) -> Result<(), AppError> {
+    let mut security = SecurityManager::new();
+    announce_security_lifecycle(&security);
+    let session = enter_requested_ephemeral_mode(&mut security, mode)?;
 
-    loop {
-        let event = tokio::select! {
-            _ = tokio::signal::ctrl_c() => Event::Input(Input::Interrupt),
-            event = event_receiver.recv() => event.unwrap_or(Event::Input(Input::EndOfInput)),
-        };
+    let result = async {
+        let client = OllamaClient::from_environment()?;
+        discover_model_capabilities(&client).await;
+        let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        listen::spawn_stdin_reader(event_sender.clone()).map_err(AppError::InputAdapter)?;
 
-        if !apply_main_event(&mut controller, &mut runtime, event, OutputMode::Line)
-            .await
-            .keep_running
-        {
-            break;
+        let mut controller = Controller::new_ephemeral();
+        let mut runtime = TurnRuntime::new(client, CameraService::v4l(), event_sender);
+        speak::welcome();
+
+        loop {
+            let event = tokio::select! {
+                _ = tokio::signal::ctrl_c() => Event::Input(Input::Interrupt),
+                event = event_receiver.recv() => event.unwrap_or(Event::Input(Input::EndOfInput)),
+            };
+
+            if !apply_main_event(&mut controller, &mut runtime, event, OutputMode::Line)
+                .await
+                .keep_running
+            {
+                break;
+            }
         }
-    }
 
-    runtime.shutdown().await;
+        runtime.shutdown().await;
+        controller.clear_ephemeral_session();
+        Ok(())
+    }
+    .await;
+
+    finish_ephemeral_session(&mut security, session)?;
+    result
+}
+
+/// Emits only lifecycle/mode facts, never personal content.  In this
+/// milestone lifecycle state is intentionally process-local: protected setup
+/// storage does not exist yet, so persisting a fake state would be misleading.
+fn announce_security_lifecycle(security: &SecurityManager) {
+    speak::process(
+        "security_lifecycle",
+        format!(
+            "{}; no authenticated private session is available",
+            security.state()
+        ),
+    );
+}
+
+/// Acquires the only production session type Milestone 6.1 can authorize.
+/// Keeping this decision in `SecurityManager` prevents the controller or a
+/// presentation adapter from treating a CLI selection as authentication.
+fn enter_requested_ephemeral_mode(
+    security: &mut SecurityManager,
+    requested: OperatingMode,
+) -> Result<EphemeralSession, AppError> {
+    match requested {
+        OperatingMode::Ephemeral => {
+            let session = security.enter_ephemeral().map_err(AppError::Security)?;
+            speak::process(
+                "operating_mode",
+                "Ephemeral Mode active — temporary context only; private data is unavailable",
+            );
+            Ok(session)
+        }
+        OperatingMode::Private => Err(AppError::PrivateModeUnavailable {
+            state: security.state(),
+        }),
+    }
+}
+
+fn finish_ephemeral_session(
+    security: &mut SecurityManager,
+    session: EphemeralSession,
+) -> Result<(), AppError> {
+    security
+        .end_ephemeral(session)
+        .map_err(AppError::Security)?;
+    speak::process(
+        "ephemeral_session_cleared",
+        "temporary conversation and image buffers were released",
+    );
     Ok(())
 }
 
@@ -186,7 +259,12 @@ async fn discover_model_capabilities(client: &OllamaClient) {
 /// Runs standalone local dictation without constructing Ollama or camera
 /// services. Its transcript deliberately stops at terminal display.
 pub async fn run_dictation() -> Result<(), AppError> {
-    dictation::run().await.map_err(AppError::Dictation)
+    let mut security = SecurityManager::new();
+    announce_security_lifecycle(&security);
+    let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)?;
+    let result = dictation::run().await.map_err(AppError::Dictation);
+    finish_ephemeral_session(&mut security, session)?;
+    result
 }
 
 /// Runs local dictation connected to the existing text-question controller.
@@ -323,32 +401,169 @@ pub async fn run_voice_with_output(audio_output_id: Option<String>) -> Result<()
 /// one `VoiceRuntime`; neither gets a special controller path.
 pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), AppError> {
     let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
-    match (resolved.pipeline, resolved.backend) {
-        (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
-            let client = configured_ollama_client(&resolved)?;
-            discover_model_capabilities(&client).await;
-            run_transcribe_and_speak(resolved, client).await
+
+    // Profile resolution reads only command-line/environment configuration.
+    // It intentionally happens before the security gate, while creating an
+    // Ollama client, opening an input device, loading Whisper, and opening an
+    // audio output all wait until the caller has entered Ephemeral Mode.
+    let mut security = SecurityManager::new();
+    announce_security_lifecycle(&security);
+    if resolved.operating_mode == OperatingMode::Private {
+        return Err(AppError::PrivateModeUnavailable {
+            state: security.state(),
+        });
+    }
+
+    let session = match &resolved.input {
+        // Terminal mode remains the existing laptop interaction: selecting
+        // the default safe mode enters it immediately. The terminal reader is
+        // created later by the actual voice runtime.
+        ResolvedVoiceInput::Terminal => {
+            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
         }
-        (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
-            backend: backend.label(),
-            pipeline: VoicePipeline::TranscribeAndSpeak.label(),
-        }),
-        (VoicePipeline::AudioToAudio, backend) => {
-            // The fixture backend is specifically a microphone→backend→speaker
-            // plumbing check. It must not start an Ollama client or probe a
-            // model. The explicit `ollama` backend receives cached metadata
-            // first and will reject unsupported/unknown direct-audio support.
-            let client = match backend {
-                ModelBackend::Ollama => {
-                    let client = configured_ollama_client(&resolved)?;
-                    discover_model_capabilities(&client).await;
-                    Some(client)
-                }
-                ModelBackend::Fixture => None,
-            };
-            crate::audio_to_audio::run(resolved, client)
-                .await
-                .map_err(AppError::AudioToAudio)
+        // A physical Pi controller uses its existing Talk button for a
+        // deliberate 5-second hold. This gate opens only the evdev device;
+        // it does not start microphone, camera, Whisper, Piper, or Ollama.
+        ResolvedVoiceInput::Buttons(path) => {
+            if matches!(
+                await_button_ephemeral_entry(path.clone()).await?,
+                EphemeralEntryResult::Shutdown
+            ) {
+                return Ok(());
+            }
+            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
+        }
+    };
+
+    let result = async {
+        match (resolved.pipeline, resolved.backend) {
+            (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
+                let client = configured_ollama_client(&resolved)?;
+                discover_model_capabilities(&client).await;
+                run_transcribe_and_speak(resolved, client).await
+            }
+            (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
+                backend: backend.label(),
+                pipeline: VoicePipeline::TranscribeAndSpeak.label(),
+            }),
+            (VoicePipeline::AudioToAudio, backend) => {
+                // The fixture backend is specifically a microphone→backend→speaker
+                // plumbing check. It must not start an Ollama client or probe a
+                // model. The explicit `ollama` backend receives cached metadata
+                // first and will reject unsupported/unknown direct-audio support.
+                let client = match backend {
+                    ModelBackend::Ollama => {
+                        let client = configured_ollama_client(&resolved)?;
+                        discover_model_capabilities(&client).await;
+                        Some(client)
+                    }
+                    ModelBackend::Fixture => None,
+                };
+                crate::audio_to_audio::run(resolved, client)
+                    .await
+                    .map_err(AppError::AudioToAudio)
+            }
+        }
+    }
+    .await;
+
+    // This always runs after an entered session, even if model or hardware
+    // startup failed.  It revokes the mode lease; individual runtimes clear
+    // their application-owned buffers during their own shutdown.
+    finish_ephemeral_session(&mut security, session)?;
+    result
+}
+
+/// Waits for physical entry into Ephemeral Mode without starting the ordinary
+/// voice runtime.  The selected evdev adapter is the sole input owner here;
+/// SSH/stdin and Crossterm are never opened for button mode.
+enum EphemeralEntryResult {
+    Entered,
+    Shutdown,
+}
+
+async fn await_button_ephemeral_entry(
+    path: std::path::PathBuf,
+) -> Result<EphemeralEntryResult, AppError> {
+    let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let mut input = EvdevButtonInputSource::open(path, sender).map_err(AppError::ButtonInput)?;
+    let mut gesture = EphemeralEntryGesture::new();
+    speak::process(
+        "ephemeral_entry_waiting",
+        "hold the physical Talk/Enter button for five seconds, then release to enter Ephemeral Mode",
+    );
+
+    loop {
+        let event = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                input.shutdown();
+                return Ok(EphemeralEntryResult::Shutdown);
+            }
+            event = receiver.recv() => event,
+        };
+        let Some(event) = event else {
+            input.shutdown();
+            return Err(AppError::EphemeralEntryInputClosed);
+        };
+
+        let control = match event {
+            VoiceInputEvent::Control(VoiceControlEvent::TalkPressed) => {
+                EphemeralEntryControl::TalkPressed
+            }
+            VoiceInputEvent::Control(VoiceControlEvent::TalkReleased) => {
+                EphemeralEntryControl::TalkReleased
+            }
+            VoiceInputEvent::Control(VoiceControlEvent::Cancel) | VoiceInputEvent::Interrupt => {
+                EphemeralEntryControl::Cancelled
+            }
+            VoiceInputEvent::Control(VoiceControlEvent::PhotoPressed) => {
+                EphemeralEntryControl::Other
+            }
+            VoiceInputEvent::SourceLost { source, message } => {
+                gesture.reset();
+                speak::warning(
+                    "ephemeral_entry_input_lost",
+                    format!("{source} was lost while waiting for Ephemeral Mode entry: {message}"),
+                );
+                continue;
+            }
+            VoiceInputEvent::SourceRecovered { source } => {
+                gesture.reset();
+                speak::process(
+                    "ephemeral_entry_input_recovered",
+                    format!("{source} is available again; hold Talk/Enter for five seconds"),
+                );
+                continue;
+            }
+            VoiceInputEvent::SourceFailed { source, message } => {
+                input.shutdown();
+                return Err(AppError::EphemeralEntryInputFailed {
+                    input_source: source,
+                    message,
+                });
+            }
+        };
+
+        match gesture.handle(control, Instant::now()) {
+            EphemeralEntryOutcome::Waiting => {}
+            EphemeralEntryOutcome::TooShort => speak::process(
+                "ephemeral_entry_not_confirmed",
+                "Talk/Enter was released before five seconds; no microphone or camera was started",
+            ),
+            EphemeralEntryOutcome::Cancelled => {
+                speak::process(
+                    "ephemeral_entry_cancelled",
+                    "entry gesture cancelled; hold Talk/Enter for five seconds to try again",
+                );
+            }
+            EphemeralEntryOutcome::Entered => {
+                input.shutdown();
+                speak::process(
+                    "ephemeral_entry_confirmed",
+                    "Ephemeral Mode selected; release consumed, press Talk/Enter again to record",
+                );
+                return Ok(EphemeralEntryResult::Entered);
+            }
         }
     }
 }
@@ -427,7 +642,7 @@ async fn run_transcribe_and_speak(
     );
 
     let mut runtime = VoiceRuntime::new(
-        Controller::new(),
+        Controller::new_ephemeral(),
         TurnRuntime::new(
             client,
             match resolved.camera_backend {
@@ -2004,6 +2219,10 @@ impl VoiceRuntime {
             interaction.mark("speech.final_answer.cleanup_completed");
             interaction.complete("accepted_text_speech_cancelled", telemetry::Fields::new());
         }
+        // Voice Mode always runs an Ephemeral controller in Milestone 6.1.
+        // Workers above have been cancelled/joined before these references are
+        // dropped, so a late result cannot repopulate the cleared session.
+        self.controller.clear_ephemeral_session();
     }
 }
 
@@ -2227,6 +2446,27 @@ pub enum AppError {
     #[error("could not configure local inference: {0}")]
     Configuration(#[from] ThinkError),
 
+    #[error("security lifecycle rejected the requested operation: {0}")]
+    Security(#[source] SecurityError),
+
+    #[error(
+        "Private Mode is not available because no authentication mechanism exists yet (security lifecycle: {state}); start without `--mode private` to use temporary Ephemeral Mode"
+    )]
+    PrivateModeUnavailable {
+        state: crate::security::SecurityState,
+    },
+
+    #[error("the physical input device closed while waiting for Ephemeral Mode entry")]
+    EphemeralEntryInputClosed,
+
+    #[error(
+        "the physical input device failed while waiting for Ephemeral Mode entry: {input_source}: {message}"
+    )]
+    EphemeralEntryInputFailed {
+        input_source: &'static str,
+        message: String,
+    },
+
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
 
@@ -2328,8 +2568,12 @@ mod tests {
         think::{OllamaClient, OllamaConfig, TEACHER_INSTRUCTIONS},
     };
 
-    use super::{AppError, TurnRuntime, VoiceRuntime, run_turn, run_voice_with_options};
+    use super::{
+        AppError, TurnRuntime, VoiceRuntime, enter_requested_ephemeral_mode,
+        finish_ephemeral_session, run_turn, run_voice_with_options,
+    };
     use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
+    use crate::security::{OperatingMode, SecurityManager, SecurityState};
     use crate::speak::{SpeechEvent, SpeechOutcome, SpeechOwner, SpeechService};
 
     fn client(server: &MockServer) -> Arc<OllamaClient> {
@@ -2337,6 +2581,23 @@ mod tests {
             OllamaClient::new(OllamaConfig::new(&server.uri(), "test-model").unwrap()).unwrap();
         client.set_capabilities_for_test(&["vision"]);
         Arc::new(client)
+    }
+
+    #[test]
+    fn application_mode_boundary_enters_ephemeral_but_rejects_private_without_authentication() {
+        let mut security = SecurityManager::new();
+        let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)
+            .expect("default application launch enters the temporary mode");
+        assert_eq!(security.state(), SecurityState::Uninitialized);
+        assert_eq!(security.active_mode(), Some(OperatingMode::Ephemeral));
+        finish_ephemeral_session(&mut security, session).unwrap();
+        assert_eq!(security.active_mode(), None);
+
+        let error = enter_requested_ephemeral_mode(&mut security, OperatingMode::Private)
+            .expect_err("a CLI selection cannot manufacture authentication");
+        assert!(matches!(error, AppError::PrivateModeUnavailable { .. }));
+        assert_eq!(security.state(), SecurityState::Uninitialized);
+        assert_eq!(security.active_mode(), None);
     }
 
     async fn within_test_timeout<T>(future: impl Future<Output = T>) -> T {
@@ -3083,7 +3344,7 @@ mod tests {
             .await;
 
         let client = client(&server);
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let first = start_request(controller.handle(Event::Input(Input::Look {
             path: photo_path,
             question: "What might this tree be?".into(),
@@ -3858,6 +4119,13 @@ mod tests {
 
         assert_eq!(harness.runtime.controller.accepted_history().len(), 2);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+        // The accepted exchange exists for this one live Ephemeral session,
+        // then runtime shutdown drops application-owned context. A fresh
+        // launch has no controller history to inherit.
+        harness.runtime.shutdown().await;
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+        assert!(harness.runtime.controller.accepted_photos().is_empty());
     }
 
     #[tokio::test]

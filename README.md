@@ -41,25 +41,36 @@ autonomously, or uses a cloud model.
 
 Read these files in this order:
 
-1. [`VISION.md`](VISION.md) — why the project exists.
-2. [`src/main.rs`](src/main.rs) — the tiny executable entry point.
-3. [`src/app.rs`](src/app.rs) — runs input, worker tasks, and shutdown.
-4. [`src/telemetry.rs`](src/telemetry.rs) — redacted interaction timelines,
+1. [`AGENTS.md`](AGENTS.md) — the permanent project, milestone, privacy, and
+   security instructions for future work.
+2. [`VISION.md`](VISION.md) — why the project exists.
+3. [`docs/PROJECT.md`](docs/PROJECT.md) — what Independence is for, its
+   local-first values, and what it should not become.
+4. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — the code-grounded map of
+   what the current prototype actually does and retains.
+5. [`src/main.rs`](src/main.rs) — the tiny executable entry point.
+6. [`src/app.rs`](src/app.rs) — runs input, worker tasks, and shutdown.
+7. [`src/telemetry.rs`](src/telemetry.rs) — redacted interaction timelines,
    JSONL, and optional OpenTelemetry export.
-5. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
+8. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
    [`src/dictation/controller.rs`](src/dictation/controller.rs) — the separate
    dictation event loop and state machine.
-6. [`src/controller.rs`](src/controller.rs) — the session state machine and
+9. [`src/controller.rs`](src/controller.rs) — the session state machine and
    result-acceptance rule.
-7. [`src/think/mod.rs`](src/think/mod.rs) and
+10. [`src/think/mod.rs`](src/think/mod.rs) and
    [`src/think/teacher.txt`](src/think/teacher.txt) — Ollama transport and
    editable teaching guidance.
-8. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
+11. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
-9. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
+12. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
    text-only local installation path.
-10. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
-    microphone-to-backend-to-speaker experiment and its current limits.
+13. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
+   microphone-to-backend-to-speaker experiment and its current limits.
+14. [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md) and
+   [`docs/security/ARCHITECTURE.md`](docs/security/ARCHITECTURE.md) — the
+   reviewed security design for future work; neither is implemented yet.
+15. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
+   gates, and the next intentionally small milestones.
 
 ## Run it on the same laptop
 
@@ -721,6 +732,10 @@ application code.
   exact token budgeting. Start a new scene with `/look` or use `/reset`.
 - No persistent memory, database, vector store, agent framework, plugins,
   containers, or cloud fallback.
+- No authentication, lock state, encrypted application storage, recovery
+  phrase, encrypted backup, or security-manager implementation yet. The
+  future design and its limits are documented in
+  [`docs/security/`](docs/security/), not claimed as current protection.
 - The client uses a 2-second connect timeout and a 120-second request timeout,
   disables redirects and ambient HTTP proxy use, and never logs image payloads
   or full requests.
@@ -731,6 +746,42 @@ application code.
 > update this section alongside the relevant README and learning documentation.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
+
+### Latest: security architecture and threat model (design only)
+
+This milestone did **not** add a login screen, encryption, a database, a
+recovery phrase, or any hidden runtime behavior. It established the reviewable
+design that must be approved before those things are implemented.
+
+```text
+current prototype
+  in-memory session + local device/model processes
+  no durable private store or lock state
+                 |
+                 | future approved boundary
+                 v
+SecurityManager
+  Locked -> explicit PIN or recovery authorization -> Unlocked
+                 |
+                 v
+encrypted private storage capability -> existing Controller
+```
+
+The proposed design generates one random master data-encryption key (DEK). A
+PIN-derived key and a 24-word BIP-39 recovery-derived key each encrypt a
+separate envelope containing that same DEK. The DEK then supplies
+domain-separated keys for private storage and backups. Changing a PIN rewrites
+only its envelope; recovery needs the phrase **and** an encrypted envelope or
+backup. A phrase alone cannot recreate data that has been lost.
+
+This is deliberately marked **awaiting owner approval**, because the project
+must decide its PIN policy, recovery-passphrase policy, encrypted-storage
+engine, backup destination/restore behavior, lock policy, hardware-rooted
+authentication scope, and release-review bar before code is written. Read
+[the threat model](docs/security/THREAT_MODEL.md),
+[the proposed architecture](docs/security/ARCHITECTURE.md), and
+[the Milestone 5.5 decision record](docs/milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md)
+before approving Milestone 6.1.
 
 This is a map of what exists **now**. It shows three ways into the same local
 learning system: typed questions, transcript-only dictation, and integrated

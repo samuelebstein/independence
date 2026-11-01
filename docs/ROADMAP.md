@@ -7,11 +7,13 @@ implementation commitment until the project owner approves it.
 ## Current status
 
 The repository is a working local terminal prototype with typed questions,
-explicit photo/camera input, local dictation and hold-to-talk voice input,
+explicit fresh-camera input, local dictation and hold-to-talk voice input,
 local Ollama inference, optional local Piper playback, telemetry, and Linux/
-Raspberry Pi hardware adapters. Its session data is process-local and
-ephemeral. It does **not** yet have user authentication, encrypted private
-storage, a lock state, recovery keys, or encrypted backups.
+Raspberry Pi hardware adapters. Milestone 6.1 adds a process-local security
+lifecycle boundary and makes **Ephemeral Mode** the default: temporary context
+is isolated in memory and cleared on ordinary shutdown. It does **not** yet
+have authentication, encrypted private storage, persistent lock state,
+recovery keys, or encrypted backups.
 
 ## Delivered capabilities evidenced by history
 
@@ -30,10 +32,12 @@ delivered capability and the relevant commits/docs instead.
 | Complete | Raspberry Pi setup guide, evdev button adapter, `rpicam-still` adapter | `48dba28`, `cff0ff6`, `docs/rasberry-pi.md` |
 | Complete | Runtime model capability discovery and isolated audio-to-audio fixture path | `e878e09`, `e12f267`, `d570372`, `docs/audio-to-audio.md` |
 | Complete | Current learning/vision essays | `a955012` and `docs/` |
+| Implemented; manual hardware check pending | 6.1 security lifecycle boundary and default Ephemeral Mode | `src/security.rs`, `src/controller.rs`, `docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md` |
 
 ## Milestone 5.5 — Security architecture and threat model
 
-**Status: awaiting owner approval.**
+**Status: architecture completed; its non-cryptographic foundation is now used
+by Milestone 6.1.**
 
 The analysis and documentation are complete in
 [milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md](milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md),
@@ -41,19 +45,21 @@ The analysis and documentation are complete in
 [security/ARCHITECTURE.md](security/ARCHITECTURE.md). They deliberately do not
 implement encryption, authentication, storage, or recovery.
 
-The remaining approval questions are material: PIN policy, recovery-passphrase
-policy, storage-engine choice, backup/export model, hardware-rooted protection,
-and the release/review standard for key-management code. No Milestone 6 work
-should begin until those decisions are recorded.
+The remaining approval questions are material for the cryptographic and
+persistent-data work: PIN policy, recovery-passphrase policy, storage-engine
+choice, backup/export model, hardware-rooted protection, and the
+release/review standard for key-management code. They must be resolved before
+Milestone 6.2 or later, but they were not needed to safely add an
+unauthenticated, memory-only mode.
 
 ## Proposed security milestones
 
 Each milestone must be independently understandable, automatically testable,
 manually verifiable, privacy-reviewed, and documented before the next begins.
 
-| Proposed milestone | Objective | Depends on |
+| Milestone | Objective | Depends on |
 | --- | --- | --- |
-| 6.1 — Security state and initialization | Add the state boundary for uninitialized/setup/locked/unlocked/recovery-required without private-storage migration | Approved 5.5 design |
+| 6.1 — Security state and initialization | **Implemented:** state boundary and Ephemeral Mode, without private-storage migration | M5.5 design; manual Pi-button verification remains |
 | 6.2 — Master key and recovery phrase | Generate a DEK, create versioned PIN/recovery envelopes, and implement a safe recovery ceremony boundary | 6.1; approved key/envelope format |
 | 6.3 — PIN authentication and recovery | Implement PIN-derived unwrapping, controlled recovery, rewrapping, and rate-limit policy | 6.2; approved PIN policy |
 | 6.4 — Encrypted local storage | Put private application data behind the security manager and chosen encrypted-storage format | 6.1–6.3; approved storage decision |

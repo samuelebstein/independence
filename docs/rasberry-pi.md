@@ -254,7 +254,8 @@ controller rather than a text keyboard:
 
 | Physical key | Linux button event | Independence behavior |
 | --- | --- | --- |
-| Hold Enter | `TalkPressed`, then `TalkReleased` | After the `i'm listening` cue, records while held; release finishes the draft and submits it once transcription/photos are ready. |
+| First hold Enter for 5 seconds, then release | `TalkPressed`, then `TalkReleased` | Enters default Ephemeral Mode before microphone/camera/model/Piper startup. That release is consumed; it does not record. |
+| Later hold Enter | `TalkPressed`, then `TalkReleased` | After the `i'm listening` cue, records while held; release finishes the draft and submits it once transcription/photos are ready. |
 | Press `P` while Enter is held and capture has begun | `PhotoPressed` | Requests one explicit still photograph to attach to that draft. |
 | Press Escape | `Cancel` | Discards unfinished recording/photo/model/speech work while preserving accepted conversation history. |
 
@@ -357,6 +358,14 @@ backend-neutral model name and takes precedence over the compatible legacy
 `INDEPENDENCE_TTS_CONFIG`, `INDEPENDENCE_PIPER_COMMAND`, and
 `INDEPENDENCE_CAMERA_BACKEND` remain per-launch environment overrides.
 
+Milestone 6.1 makes this launch an unauthenticated **Ephemeral Mode** session.
+Before the normal voice runtime starts, hold the attached keyboard's Enter key
+for five seconds and release it. The terminal/SSH log confirms entry; no
+microphone, camera, Ollama, Whisper, or Piper resource was opened by that
+entry gate. Press Enter again to make the normal hold-to-talk recording. This
+is a deliberate physical entry gesture, not authentication. `--mode private`
+is currently rejected because PIN/recovery authentication is not implemented.
+
 In this mode Independence starts **no** stdin reader and enables **no**
 Crossterm raw-key reader. Enter, `P`, and Escape typed in the SSH terminal do
 nothing to recording, photos, submission, or cancellation. The SSH terminal
@@ -456,16 +465,18 @@ After the independent checks pass, launch the button command over SSH. Type
 Enter, `P`, and Escape into the SSH terminal first: logs should not show any
 interaction change. Then, on the physically attached keyboard:
 
-1. Hold Enter and wait for the logged/listening cue; recording starts only
-   after that cue completes.
-2. While still holding Enter, press `P` once. With a verified vision model,
+1. Hold Enter for five seconds and release it. Confirm the logged Ephemeral
+   Mode entry. No microphone/listening cue should have started yet.
+2. Hold Enter again and wait for the logged/listening cue; recording starts
+   only after that cue completes.
+3. While still holding Enter, press `P` once. With a verified vision model,
    one still is requested; with `gemma3:1b`, the app reports text-only support
    and leaves the camera off.
-3. Release Enter. The draft submits only after its current transcript and
+4. Release Enter. The draft submits only after its current transcript and
    requested photo capture are ready.
-4. Hold Enter again during unfinished work to replace that unfinished draft,
+5. Hold Enter again during unfinished work to replace that unfinished draft,
    or press Escape to cancel it without erasing accepted history.
-5. Unplug the selected keyboard while recording. The microphone should stop
+6. Unplug the selected keyboard while recording. The microphone should stop
    and no incomplete question should submit. Reconnect it, wait for recovery,
    and use a fresh Enter press.
 

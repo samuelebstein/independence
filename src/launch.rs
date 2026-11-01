@@ -7,6 +7,8 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
+use crate::security::OperatingMode;
+
 /// The one hardware profile currently understood by the application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HardwareProfile {
@@ -127,12 +129,15 @@ pub struct VoiceLaunchOptions {
     pub model: Option<String>,
     pub pipeline: Option<VoicePipeline>,
     pub backend: Option<ModelBackend>,
+    /// Defaults to Ephemeral Mode. Private Mode is parsed explicitly so the
+    /// SecurityManager can reject unauthenticated use before hardware starts.
+    pub mode: Option<OperatingMode>,
 }
 
 /// The top-level action selected from argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchCommand {
-    Interactive,
+    Interactive { mode: OperatingMode },
     Dictate,
     Voice(VoiceLaunchOptions),
     ListAudioOutputs,
@@ -153,7 +158,12 @@ pub fn parse_arguments(arguments: &[OsString]) -> Result<LaunchCommand, String> 
         .collect::<Result<Vec<_>, _>>()?;
 
     match values.as_slice() {
-        [] => Ok(LaunchCommand::Interactive),
+        [] => Ok(LaunchCommand::Interactive {
+            mode: OperatingMode::Ephemeral,
+        }),
+        ["--mode", mode] => Ok(LaunchCommand::Interactive {
+            mode: OperatingMode::parse(mode)?,
+        }),
         ["--dictate"] => Ok(LaunchCommand::Dictate),
         ["--audio-devices"] => Ok(LaunchCommand::ListAudioOutputs),
         ["--audio-input-devices"] => Ok(LaunchCommand::ListAudioInputs),
@@ -206,6 +216,7 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
                 ModelBackend::parse(value)?,
                 "--backend",
             )?,
+            "--mode" => set_once(&mut options.mode, OperatingMode::parse(value)?, "--mode")?,
             "--audio-backend" => {
                 return Err("`--audio-backend` was renamed to `--backend`".into());
             }
@@ -239,6 +250,7 @@ mod tests {
         HardwareProfile, LaunchCommand, ModelBackend, VoiceInputMode, VoiceLaunchOptions,
         VoicePipeline, parse_arguments,
     };
+    use crate::security::OperatingMode;
 
     fn parse(values: &[&str]) -> Result<LaunchCommand, String> {
         parse_arguments(&values.iter().map(OsString::from).collect::<Vec<_>>())
@@ -269,6 +281,7 @@ mod tests {
                 model: None,
                 pipeline: None,
                 backend: None,
+                mode: None,
             }))
         );
     }
@@ -311,6 +324,7 @@ mod tests {
         assert_eq!(options.pipeline, Some(VoicePipeline::AudioToAudio));
         assert_eq!(options.backend, Some(ModelBackend::Fixture));
         assert_eq!(options.model.as_deref(), Some("local-audio-model"));
+        assert_eq!(options.mode, None);
     }
 
     #[test]
@@ -332,5 +346,26 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("renamed to `--backend`"));
+    }
+
+    #[test]
+    fn operating_mode_defaults_to_ephemeral_and_private_is_explicit() {
+        assert_eq!(
+            parse(&[]),
+            Ok(LaunchCommand::Interactive {
+                mode: OperatingMode::Ephemeral
+            })
+        );
+        assert_eq!(
+            parse(&["--mode", "private"]),
+            Ok(LaunchCommand::Interactive {
+                mode: OperatingMode::Private
+            })
+        );
+        let options = match parse(&["--voice", "--mode", "ephemeral"]).unwrap() {
+            LaunchCommand::Voice(options) => options,
+            _ => unreachable!(),
+        };
+        assert_eq!(options.mode, Some(OperatingMode::Ephemeral));
     }
 }

@@ -9,6 +9,7 @@ use crate::{
         AudioTurnFinished, AudioTurnRequest, AudioTurnResult, CameraPreparation, CameraRequestId,
         Effect, Event, Input, Output, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
     },
+    security::OperatingMode,
     see::Photo,
     think::ConversationTurn,
 };
@@ -18,6 +19,7 @@ pub const MAX_HISTORY_TURNS: usize = 6;
 
 #[derive(Debug, Default)]
 pub struct Controller {
+    mode: OperatingMode,
     session: Session,
     active: Option<ActiveTurn>,
     pending_camera: Option<PendingCamera>,
@@ -80,8 +82,48 @@ struct PendingCamera {
 }
 
 impl Controller {
+    /// Builds the safe default controller: an ephemeral, memory-only session.
+    /// There is deliberately no production constructor for Private Mode in
+    /// this milestone because there is no authenticated storage capability.
     pub fn new() -> Self {
+        Self::new_ephemeral()
+    }
+
+    pub(crate) fn new_ephemeral() -> Self {
         Self {
+            mode: OperatingMode::Ephemeral,
+            next_turn_id: 1,
+            next_camera_request_id: 1,
+            ..Self::default()
+        }
+    }
+
+    /// Current application mode. This is a session policy, not proof that a
+    /// device is authenticated; SecurityManager owns that lifecycle.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn operating_mode(&self) -> OperatingMode {
+        self.mode
+    }
+
+    /// Clears application-owned temporary context at the end of an ephemeral
+    /// session. The runtime cancels and joins its workers separately before
+    /// this is called. Dropping these buffers is not claimed to be secure
+    /// erasure from the OS, allocator, swap, or other processes.
+    pub(crate) fn clear_ephemeral_session(&mut self) {
+        debug_assert_eq!(self.mode, OperatingMode::Ephemeral);
+        self.session = Session::default();
+        self.active = None;
+        self.pending_camera = None;
+    }
+
+    /// Existing controller tests still need to exercise staged `/look`
+    /// semantics independently of the new production Ephemeral Mode policy.
+    /// This constructor is omitted from release artifacts and cannot create a
+    /// production private session or storage capability.
+    #[cfg(test)]
+    pub(crate) fn new_private_for_test() -> Self {
+        Self {
+            mode: OperatingMode::Private,
             next_turn_id: 1,
             next_camera_request_id: 1,
             ..Self::default()
@@ -150,11 +192,14 @@ impl Controller {
                 recording_id,
                 audio,
             } => self.start_audio_turn(recording_id, audio),
-            Input::Look { path, question } => self.start_turn(
+            Input::Look { path, question } if self.mode == OperatingMode::Private => self.start_turn(
                 question,
                 VisualRequest::ProposeNew(path),
                 SceneCommit::ReplaceWithWorkerPhoto,
             ),
+            Input::Look { .. } => vec![Effect::Display(Output::Diagnostic(
+                "Ephemeral Mode does not load local files or saved photos; use /camera for a new temporary still image".into(),
+            ))],
             Input::Cameras => vec![Effect::ListCameras],
             Input::Camera {
                 requested,
@@ -200,8 +245,12 @@ impl Controller {
         if !matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto)
             && self.session.history.len() >= MAX_HISTORY_TURNS
         {
+            let restart = match self.mode {
+                OperatingMode::Ephemeral => "/reset to start a new temporary session",
+                OperatingMode::Private => "/reset or /look to start a new scene",
+            };
             return vec![Effect::Display(Output::Diagnostic(format!(
-                "this session has reached {MAX_HISTORY_TURNS} accepted exchanges; use /reset or /look to start a new scene"
+                "this session has reached {MAX_HISTORY_TURNS} accepted exchanges; use {restart}"
             )))];
         }
 
@@ -457,6 +506,7 @@ mod tests {
     };
 
     use super::{Controller, MAX_HISTORY_TURNS};
+    use crate::security::OperatingMode;
 
     fn start_ask(controller: &mut Controller, question: &str) -> TurnRequest {
         let effects = controller.handle(Event::Input(Input::Ask(question.into())));
@@ -481,6 +531,67 @@ mod tests {
                 _ => None,
             })
             .expect("a valid /look should start a turn")
+    }
+
+    #[test]
+    fn default_controller_is_an_empty_ephemeral_session_that_rejects_file_photos() {
+        let mut controller = Controller::new();
+        assert_eq!(controller.operating_mode(), OperatingMode::Ephemeral);
+        assert!(controller.accepted_history().is_empty());
+        assert!(controller.accepted_photos().is_empty());
+
+        let effects = controller.handle(Event::Input(Input::Look {
+            path: PathBuf::from("private-photo.jpeg"),
+            question: "What is this?".into(),
+        }));
+
+        assert_eq!(
+            effects,
+            vec![Effect::Display(Output::Diagnostic(
+                "Ephemeral Mode does not load local files or saved photos; use /camera for a new temporary still image".into()
+            ))]
+        );
+        assert!(!controller.has_active_turn());
+        assert!(controller.accepted_history().is_empty());
+        assert!(controller.accepted_photos().is_empty());
+    }
+
+    #[test]
+    fn ending_an_ephemeral_session_releases_accepted_context_and_media() {
+        let mut controller = Controller::new_ephemeral();
+        let photo = Photo::test_photo("temporary-camera.jpeg");
+        let request = controller
+            .handle(Event::Input(Input::AskWithPhotos {
+                question: "What is in this temporary photo?".into(),
+                photos: vec![photo],
+            }))
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .expect("an ephemeral question with a fresh photo starts one turn");
+        successful_answer(
+            &mut controller,
+            request.id,
+            "A temporary observation.",
+            None,
+        );
+        assert_eq!(controller.accepted_history().len(), 1);
+        assert_eq!(controller.accepted_photos().len(), 1);
+
+        controller.clear_ephemeral_session();
+
+        assert!(controller.accepted_history().is_empty());
+        assert!(controller.accepted_photos().is_empty());
+        assert!(controller.accepted_scene().is_none());
+        assert!(!controller.has_active_turn());
+
+        let fresh_question = start_ask(&mut controller, "Do you remember before?");
+        assert!(fresh_question.history.is_empty());
+        assert!(
+            matches!(fresh_question.visual, VisualRequest::UseAccepted(ref photos) if photos.is_empty())
+        );
     }
 
     fn camera(id: u32) -> CameraDescriptor {
@@ -576,7 +687,7 @@ mod tests {
 
     #[test]
     fn reset_prevents_a_late_result_from_restoring_session_state() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let old_photo = Photo::test_photo("old.png");
         let look = start_look(&mut controller, "old.png", "what is this?");
         successful_answer(&mut controller, look.id, "an old scene", Some(old_photo));
@@ -603,7 +714,7 @@ mod tests {
 
     #[test]
     fn failed_new_photo_preserves_the_accepted_scene_and_history() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let old_photo = Photo::test_photo("old.png");
         let first = start_look(&mut controller, "old.png", "old question");
         successful_answer(&mut controller, first.id, "old answer", Some(old_photo));
@@ -632,7 +743,7 @@ mod tests {
 
     #[test]
     fn stopped_new_photo_preserves_the_accepted_scene_and_history() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let old_photo = Photo::test_photo("old.png");
         let first = start_look(&mut controller, "old.png", "old question");
         successful_answer(&mut controller, first.id, "old answer", Some(old_photo));
@@ -661,7 +772,7 @@ mod tests {
 
     #[test]
     fn follow_up_carries_the_accepted_photo_and_history() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let photo = Photo::test_photo("tree.png");
         let first = start_look(&mut controller, "tree.png", "what tree is this?");
         successful_answer(&mut controller, first.id, "a test tree", Some(photo));
@@ -679,7 +790,7 @@ mod tests {
 
     #[test]
     fn voice_photos_append_in_order_only_after_the_answer_is_accepted() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let existing = Photo::test_photo("existing.png");
         let first = start_look(&mut controller, "existing.png", "what is this?");
         successful_answer(
@@ -769,7 +880,7 @@ mod tests {
         assert_eq!(controller.accepted_history().len(), MAX_HISTORY_TURNS);
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Display(Output::Diagnostic(message))] if message.contains("/reset or /look")
+            [Effect::Display(Output::Diagnostic(message))] if message.contains("/reset to start a new temporary session")
         ));
     }
 
@@ -811,7 +922,7 @@ mod tests {
 
     #[test]
     fn failed_or_cancelled_camera_scene_preserves_the_previous_camera_scene() {
-        let mut controller = Controller::new();
+        let mut controller = Controller::new_private_for_test();
         let old_camera = camera(0);
         let first = start_look(&mut controller, "old.png", "old scene");
         successful_answer(

@@ -107,7 +107,7 @@ pub(crate) async fn run(
     }
 
     let mut runtime = AudioToAudioRuntime::new(
-        Controller::new(),
+        Controller::new_ephemeral(),
         recorder,
         backend,
         capture_sender,
@@ -1008,6 +1008,7 @@ impl AudioToAudioRuntime {
                 telemetry::Fields::new(),
             );
         }
+        self.controller.clear_ephemeral_session();
     }
 }
 

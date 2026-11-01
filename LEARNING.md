@@ -647,3 +647,71 @@ preservation, malformed-audio rejection, and stale-result cancellation. See
 [`docs/audio-to-audio.md`](docs/audio-to-audio.md) for controls, Pi/button use,
 configuration precedence, and why a backend must verify both a model's
 capabilities and the request/response format before direct audio can run.
+
+## Latest milestone: security architecture before security code
+
+The security milestone deliberately changes no Rust behavior. That is useful:
+cryptography is not something to “add later” as an incidental wrapper around a
+database. It changes who is allowed to read state, when private material exists
+in memory, how recovery works, and what a person can honestly expect after a
+device is stolen.
+
+The proposed future shape is:
+
+```text
+PIN ----------------> Argon2id --------> PIN wrapping key -----\
+                                                                  \
+random 24-word BIP-39 phrase -> standard seed -> HKDF -> recovery key -> two encrypted envelopes
+                                                                        /
+same random master DEK -----------------------------------------------/
+                       |
+                       +-> HKDF purpose keys -> encrypted private data / backup
+```
+
+The key idea is **wrapping**, not encrypting everything again. The random DEK
+protects the data. A PIN change only changes the small PIN envelope that wraps
+that DEK, so a password change need not rewrite every photo and conversation.
+The recovery phrase provides a separate wrapping path, but it is not a backup:
+the phrase plus a copied encrypted device/backup can recover data; the phrase
+alone cannot recreate data that was lost.
+
+This architecture is intentionally not a promise that an unlocked computer is
+safe from malicious software. A future `SecurityManager` can withhold the DEK
+and private storage from the controller while Locked, but a compromised
+operating system can still observe a process while it is Unlocked. Zeroizing a
+Rust value is good cleanup hygiene; it does not turn normal RAM into a secure
+enclave or prevent a suspended machine from writing memory to disk.
+
+The most important behavior change later will be a **boundary of authority**:
+
+```text
+Locked
+  -> controller has no private session/history capability
+  -> microphone/camera/model results cannot restore it
+
+successful PIN or recovery authorization
+  -> SecurityManager grants narrow private-storage capability
+  -> controller can load accepted history / future memories
+
+lock, sleep, shutdown, or cancellation
+  -> revoke capability, clear app caches best-effort, return to Locked
+```
+
+No part of that state machine exists in the application yet. The documents make
+the next decisions visible rather than burying them in implementation:
+
+- [Security threat model](docs/security/THREAT_MODEL.md) names attackers,
+  assets, trust boundaries, and the limits of local processing.
+- [Proposed security architecture](docs/security/ARCHITECTURE.md) explains
+  PINs, BIP-39, Argon2id, HKDF, authenticated encryption, recovery, backups,
+  Linux/Pi differences, and library choices.
+- [Milestone 5.5 decision record](docs/milestones/MILESTONE_5_5_SECURITY_ARCHITECTURE.md)
+  lists the owner approvals needed before any key or storage code begins.
+- [Security review checklist](docs/security/REVIEW_CHECKLIST.md) is the gate
+  every later audio, vision, networking, storage, or authentication milestone
+  must pass.
+
+The current status is **awaiting owner approval**, not “security complete.”
+That is the honest result: the architecture is ready for discussion, but PIN
+policy, storage engine, backup rules, lock behavior, and hardware-authenticator
+scope are still meaningful choices.

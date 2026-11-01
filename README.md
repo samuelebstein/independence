@@ -178,7 +178,7 @@ INDEPENDENCE_PIPER_COMMAND="$HOME/.local/share/independence/piper-venv/bin/piper
   --mode ephemeral \
   --profile raspberry-pi \
   --input buttons \
-  --input-device /dev/input/independence/button-kbd \
+  --input-device /dev/input/event7 \
   --audio-input 'alsa:plughw:CARD=Device,DEV=0' \
   --audio-output 'alsa:plughw:CARD=Device,DEV=0' \
   --backend ollama \

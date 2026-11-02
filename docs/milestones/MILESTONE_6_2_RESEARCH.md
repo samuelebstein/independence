@@ -84,6 +84,30 @@ This is intentionally not a Milestone 6.2 build plan. It records the
 security properties a later approved milestone should preserve and the
 questions it must answer.
 
+### Architecture-revision note
+
+This research report is evidence for discussion, not the final selected
+architecture. The pre-approval revision in
+[Authentication and key management architecture](../security/AUTHENTICATION_AND_KEY_MANAGEMENT.md)
+clarifies three points that supersede the simplified diagrams in Sections 9
+and 13 of this report:
+
+- A cloud backup carries only the recovery-protected DEK envelope, never a
+  PIN/TPM envelope. The everyday PIN has no cloud-backup decryption role.
+- The local short-PIN path is a TPM/secure-element **split-secret** design:
+  Argon2id produces separate TPM-authorization and local-wrapping components;
+  the TPM releases a device-bound random secret only under a reviewed policy;
+  HKDF combines that secret with the local component before the local DEK
+  envelope can open.
+- That construction is acceptable only if a candidate protector demonstrates
+  `PolicyAuthValue`, `noDA`-clear dictionary-attack behavior, device binding,
+  and credible lockout handling. It is not a claim that a stock Raspberry Pi
+  currently has this protection.
+
+The revised architecture also specifies complete backup consistency checks,
+replacement-device recovery, and the remaining approval decisions. It does not
+approve an implementation.
+
 ### What this research did not verify
 
 No PIN, key, phrase, envelope, disk format, or authentication factor was

@@ -15,6 +15,12 @@ is isolated in memory and cleared on ordinary shutdown. It does **not** yet
 have authentication, encrypted private storage, persistent lock state,
 recovery keys, or encrypted backups.
 
+Milestone 6.2 now records the proposed authentication and key-management
+architecture in
+[security/AUTHENTICATION_AND_KEY_MANAGEMENT.md](security/AUTHENTICATION_AND_KEY_MANAGEMENT.md).
+It is an architecture document awaiting owner review, not an implementation of
+PIN authentication, cryptography, TPM support, or backups.
+
 ## Delivered capabilities evidenced by history
 
 The older work was not consistently numbered as formal milestones, so this
@@ -45,27 +51,24 @@ The analysis and documentation are complete in
 [security/ARCHITECTURE.md](security/ARCHITECTURE.md). They deliberately do not
 implement encryption, authentication, storage, or recovery.
 
-The remaining approval questions are material for the cryptographic and
-persistent-data work: PIN policy, recovery-passphrase policy, storage-engine
-choice, backup/export model, hardware-rooted protection, and the
-release/review standard for key-management code. They must be resolved before
-Milestone 6.2 or later, but they were not needed to safely add an
-unauthenticated, memory-only mode.
+Milestone 6.2 records the established product decisions for independent local
+PIN/hardware and recovery-phrase paths, and leaves the remaining implementation
+details explicit: a compatible TPM/secure-element, measured-boot policy,
+Argon2id calibration, BIP-39 passphrase policy, storage format, and backup
+rollback/retention policy. None was needed to safely add an unauthenticated,
+memory-only mode, and none authorizes cryptographic implementation yet.
 
-## Proposed security milestones
+## Security architecture and next-step status
 
-Each milestone must be independently understandable, automatically testable,
-manually verifiable, privacy-reviewed, and documented before the next begins.
+Each implementation milestone must be independently understandable,
+automatically testable, manually verifiable, privacy-reviewed, and documented
+before the next begins. No follow-up implementation scope is approved yet.
 
 | Milestone | Objective | Depends on |
 | --- | --- | --- |
 | 6.1 — Security state and initialization | **Implemented:** state boundary and Ephemeral Mode, without private-storage migration | M5.5 design; manual Pi-button verification remains |
-| 6.2 — Master key and recovery phrase | Generate a DEK, create versioned PIN/recovery envelopes, and implement a safe recovery ceremony boundary | 6.1; approved key/envelope format |
-| 6.3 — PIN authentication and recovery | Implement PIN-derived unwrapping, controlled recovery, rewrapping, and rate-limit policy | 6.2; approved PIN policy |
-| 6.4 — Encrypted local storage | Put private application data behind the security manager and chosen encrypted-storage format | 6.1–6.3; approved storage decision |
-| 6.5 — Device lifecycle and physical controls | Lock/sleep/wake/shutdown behavior and safe physical controls on Linux and Pi | 6.4; platform review |
-| 6.6 — Authentication capabilities | Add runtime discovery and adapters for supported authenticators without treating biometrics as encryption keys | 6.3; per-platform capability review |
-| 6.7 — Encrypted backup and restoration | Create authenticated export, nondestructive restore, and recovery-envelope migration | 6.2 and 6.4; approved backup policy |
+| 6.2 — Authentication & key-management architecture | **Documented; awaiting owner review.** Defines the independent local hardware/PIN and portable recovery-phrase paths, and makes cloud backups recovery-only. No production code is added. | 6.1; [6.2 research](milestones/MILESTONE_6_2_RESEARCH.md) |
+| Next implementation milestone | **Not defined.** It may be proposed only after the owner reviews and approves the M6.2 architecture. | Approved M6.2 architecture and an explicitly approved scope |
 
 ## Rules for every future milestone
 

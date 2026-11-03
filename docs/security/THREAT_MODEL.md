@@ -1,8 +1,9 @@
 # Security threat model
 
 > **Status:** Milestone 5.5 design artifact plus Milestone 6.1 foundation.
-> The current code implements an Ephemeral Mode/lifecycle boundary, but not
-> encryption, authentication, locked storage, recovery, or secure memory.
+> The current code implements an Ephemeral Mode/lifecycle boundary and an
+> explicit unencrypted development-memory experiment, but not encryption,
+> authentication, locked storage, recovery, or secure memory.
 
 ## Purpose and method
 
@@ -34,6 +35,12 @@ storage boundary:
 - Ephemeral Mode rejects `/look` before file I/O, so it does not load an
   arbitrary saved photo or personal file. Explicit fresh camera capture remains
   available under the existing consent/control path and stays in memory.
+- The distinct `--mode development-memory --memory-dir <directory>` experiment
+  can create a plain local SQLite/FTS5 database of model-selected textual
+  memories and evidence. It is enabled only with an explicit path and a model
+  advertising native tools. It is **not** protected storage: a local account,
+  copied filesystem, backup, or compromised OS can read or alter it. Ephemeral
+  Mode never opens this database.
 - Captured microphone samples, Whisper work, camera JPEGs, and Piper WAVs are
   bounded in memory for an interaction. The application does not intentionally
   save camera stills or recordings (`src/dictation/`, `src/see/`, `src/speak/`).
@@ -50,19 +57,21 @@ storage boundary:
 
 There is currently no PIN, recovery phrase, master key, encrypted database,
 persistent lock/unlock state, secure enclave integration, encrypted backup, or
-private storage. Treat every current local user/process that can inspect the
-app's memory, terminal, files, child processes, or device nodes as potentially
-able to observe interaction material.
+private storage. The development SQLite file is persistence but not private
+storage. Treat every current local user/process that can inspect the app's
+memory, terminal, files, child processes, or device nodes as potentially able
+to observe interaction material.
 
 ### What Milestone 6.1 changes—and does not change
 
 The lifecycle boundary prevents a controller/UI/CLI selection from asserting
-that private data is available. It makes an unauthenticated temporary session
-the only production session and prevents local-file photo loading in that
-session. It does **not** protect plaintext while it is in application memory,
-force another local process to forget input, erase terminal scrollback, or
-securely erase OS/allocator/swap/crash-dump copies. The local Ollama server is
-also outside the application's memory-clearing guarantee.
+that private data is available. It makes default use an unauthenticated
+temporary session and prevents local-file photo loading there. The explicit
+development-memory lease adds no private-storage capability. Neither lease
+protects plaintext while it is in application memory, forces another local
+process to forget input, erases terminal scrollback, or securely erases
+OS/allocator/swap/crash-dump copies. The local Ollama server is also outside
+the application's memory-clearing guarantee.
 
 ## Assets to protect
 
@@ -177,8 +186,8 @@ it is not implemented by this document.
 
 | Scenario | Attacker capability and path | Assets targeted | Existing protections | Required protections | Residual risk |
 | --- | --- | --- | --- | --- | --- |
-| Physical theft, powered off | Take laptop/Pi/SD card and inspect files | Future private store, envelopes, backups | No persistent app session today; no encryption | App-level authenticated encryption; optionally LUKS2/secure storage; PIN/recovery envelopes | Weak PIN may still be guessed offline; device may contain plaintext logs/models elsewhere |
-| Storage removal/offline inspection | Copy storage without device | Same plus backup metadata | None for future storage | Unique KDF salts, costly Argon2id, AEAD envelopes, backup encryption | Unlimited offline attempts; phrase+envelope is sufficient by design |
+| Physical theft, powered off | Take laptop/Pi/SD card and inspect files | Development SQLite memories; future private store, envelopes, backups | Default session is in-memory only, but an explicitly created development database is plaintext | App-level authenticated encryption; optionally LUKS2/secure storage; PIN/recovery envelopes | Development database is readable by design; weak PIN may still be guessed offline; device may contain plaintext logs/models elsewhere |
+| Storage removal/offline inspection | Copy storage without device | Development database; future store and backup metadata | Development SQLite contents are directly readable; none for future protected storage | Unique KDF salts, costly Argon2id, AEAD envelopes, backup encryption | Unlimited offline attempts; phrase+envelope is sufficient by design |
 | PIN guessing/bypass | Try PIN at UI or on copied envelope | PIN-wrapped DEK | No PIN yet | Online rate policy; Argon2id parameters per device class; optional hardware support | App rate limits do not constrain copied storage; short numeric PIN remains weak |
 | Recovery phrase exposure | Photograph/write down/read phrase | Recovery-derived key | No phrase yet | Display-only ceremony, no transcript/log/model path, explicit warning, user-controlled paper handling | Phrase is a high-value bearer secret; social/physical theft remains |
 | Phrase plus encrypted device/backup | Obtain both recovery phrase and envelope/ciphertext | DEK and all protected data | Not applicable yet | This combination intentionally recovers the DEK; warn clearly | Complete compromise of protected data; cannot be prevented without a second factor or different recovery model |

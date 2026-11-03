@@ -7,7 +7,7 @@ use crate::{
         Photo,
         camera::{CameraDescriptor, CameraId, CameraPhotoSource},
     },
-    think::ConversationTurn,
+    think::{ConversationTurn, ToolRound},
 };
 
 /// A unique identifier for one proposed model turn.
@@ -254,6 +254,13 @@ pub enum Event {
         id: TurnId,
         source: CameraPhotoSource,
     },
+    /// A controller-authorized worker is about to perform one bounded
+    /// application-owned operation. The controller suppresses stale progress
+    /// after cancellation or a newer turn just as it suppresses stale answers.
+    Progress {
+        id: TurnId,
+        progress: ProgressEvent,
+    },
     TurnFinished(TurnFinished),
     AudioTurnFinished(AudioTurnFinished),
 }
@@ -358,6 +365,9 @@ pub struct TurnFinished {
 pub enum TurnResult {
     Answer {
         answer: String,
+        /// All tool call/result rounds that occurred before this final answer.
+        /// The controller accepts them only with the current final turn.
+        tool_rounds: Vec<ToolRound>,
         proposed_scene: Option<Photo>,
     },
     Failed {
@@ -389,7 +399,39 @@ pub enum Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     Answer(String),
+    Progress(ProgressEvent),
     Diagnostic(String),
     Cameras(Vec<CameraDescriptor>),
     Help,
+}
+
+/// Fixed, application-authored user-facing progress. Models never supply these
+/// words, and the reusable memory crate never depends on this presentation
+/// type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProgressEvent {
+    SearchingMemory,
+    SavingMemory,
+    UpdatingMemory,
+    ReducingHistory { exchanges: usize },
+}
+
+impl ProgressEvent {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::SearchingMemory => "Searching memory...",
+            Self::SavingMemory => "Saving a memory...",
+            Self::UpdatingMemory => "Updating a memory...",
+            Self::ReducingHistory { .. } => "Reducing older conversation context...",
+        }
+    }
+
+    pub const fn event(self) -> &'static str {
+        match self {
+            Self::SearchingMemory => "memory_search_started",
+            Self::SavingMemory => "memory_save_started",
+            Self::UpdatingMemory => "memory_update_started",
+            Self::ReducingHistory { .. } => "context_history_trimmed",
+        }
+    }
 }

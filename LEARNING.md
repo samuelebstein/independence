@@ -642,7 +642,114 @@ preservation, malformed-audio rejection, and stale-result cancellation. See
 configuration precedence, and why a backend must verify both a model's
 capabilities and the request/response format before direct audio can run.
 
-## Latest milestone: security foundation and Ephemeral Mode
+## Latest milestone: development memory, tools, and context management
+
+The new memory capability is deliberately less magical than “Independence
+remembers everything.” There are two different layers:
+
+```text
+current application run                         explicit development database
+
+Controller accepted history                     independence-memory / SQLite
+user -> assistant exchanges                     selected concise memories
+tool calls and matching results                 evidence + correction history
+cleared on /reset or exit                       remains after restart
+```
+
+Current-session history is what makes “How long did it take?” make sense after
+an earlier answer in the same run. It is still owned by `Controller`, remains
+in process memory, and is cleared at the normal session boundary. Persistent
+memory is deliberately narrower: the local model may choose to save a useful
+observation, experiment result, project decision, plan, instruction, or
+correction. It must not automatically store every message or archive a whole
+conversation.
+
+The database is enabled only with both an explicit mode and directory:
+
+```bash
+cargo run -- \
+  --mode development-memory \
+  --memory-dir ./local-data/development-memory
+```
+
+That database is ordinary, unencrypted SQLite test storage. This does not
+unlock Private Mode or grant access to any future private storage. Normal
+Ephemeral Mode does not even construct the database service or send tool
+definitions to the model. A tool-capable model is required before the database
+opens, so this experiment cannot silently fall back to a model that ignores the
+memory contract.
+
+The tool loop stays under Independence's authority:
+
+```text
+model returns a requested tool call
+  -> Independence validates the tool name and JSON arguments
+  -> controller-authorized progress appears: Saving / Searching / Updating
+  -> independence-memory performs one SQLite operation
+  -> result returns to the model as a tool message
+  -> model produces the final answer
+```
+
+The important distinction is that a model asking to call `remember` does not
+mean anything was saved. It is only successful once SQLite commits, and a
+failed operation is returned as a failure. `correct` does not overwrite the
+past: it marks the old record superseded, creates a new current record, and
+links the two. `recall` is SQLite FTS5 keyword search, not a semantic/vector
+database; a no-match and a database error are deliberately different results.
+
+Each tool call and result stays attached to the conversation exchange that
+caused it. That means a follow-up model request sees this order:
+
+```text
+previous user/assistant exchanges
+current user message
+assistant tool-call message
+tool result message
+next assistant answer
+```
+
+The model cannot loop forever: a turn gets at most four tool-call iterations.
+The existing `TurnId` ownership rule still wins. A stale/cancelled result is not
+accepted into a newer conversation. An already-running short SQLite transaction
+may finish after cancellation because Rust cannot safely kill a blocking write
+mid-transaction; its result remains discarded. That limit is documented rather
+than hidden.
+
+### Context capacity is a budget, not a message count
+
+Earlier code kept a small fixed number of exchanges. The new context manager
+instead asks a more honest question before every request: “Can all required
+material fit in the configured runtime context after reserving room for the
+answer?”
+
+```text
+runtime num_ctx
+  - reserved answer tokens
+  - safety margin
+  = available input budget
+
+system guidance + tool schemas + oldest-to-newest accepted exchanges
+  + active user/tool messages
+  = estimated request input
+```
+
+`/api/show` may describe a model's theoretical context capacity. Independence
+does not mistake that for the live Ollama setting: it selects a conservative
+runtime `num_ctx` (default 8,192) and sends that value. The initial counter is
+conservative UTF-8-byte estimation, including envelopes, tool JSON, results,
+and a fixed image allowance. It is intentionally labeled an estimate, not an
+exact tokenizer count.
+
+If the request is too large, the manager drops only the oldest complete
+exchanges from that *outgoing snapshot*. It does not alter the controller's
+stored session history, delete SQLite memories, cut the newest question, or
+split a tool call away from its result. If the required current material alone
+cannot fit, it returns an error instead of silently damaging the prompt.
+
+Read [`docs/memory.md`](docs/memory.md) for exact commands, storage location,
+library API, observability, security limits, tests, and benchmark commands.
+
+## Foundation milestone: security foundation and Ephemeral Mode
 
 Milestone 6.1 turns one security design idea into a small, testable code
 boundary without pretending encryption exists. The new

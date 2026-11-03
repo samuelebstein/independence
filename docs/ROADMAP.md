@@ -11,9 +11,12 @@ explicit fresh-camera input, local dictation and hold-to-talk voice input,
 local Ollama inference, optional local Piper playback, telemetry, and Linux/
 Raspberry Pi hardware adapters. Milestone 6.1 adds a process-local security
 lifecycle boundary and makes **Ephemeral Mode** the default: temporary context
-is isolated in memory and cleared on ordinary shutdown. It does **not** yet
-have authentication, encrypted private storage, persistent lock state,
-recovery keys, or encrypted backups.
+is isolated in memory and cleared on ordinary shutdown. The current working
+tree also contains an explicit, unencrypted development-memory experiment:
+native SQLite/FTS5 selected memories, bounded local-model tool calls, and
+context-window management. It is not Private Mode and does **not** add
+authentication, encrypted private storage, persistent lock state, recovery
+keys, or encrypted backups.
 
 ## Delivered capabilities evidenced by history
 
@@ -33,6 +36,7 @@ delivered capability and the relevant commits/docs instead.
 | Complete | Runtime model capability discovery and isolated audio-to-audio fixture path | `e878e09`, `e12f267`, `d570372`, `docs/audio-to-audio.md` |
 | Complete | Current learning/vision essays | `a955012` and `docs/` |
 | Implemented; manual hardware check pending | 6.1 security lifecycle boundary and default Ephemeral Mode | `src/security.rs`, `src/controller.rs`, `docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md` |
+| Implemented in working tree; automated verification and development-machine benchmarks complete, live model/Pi verification pending | Native persistent memory, tool execution, and context management development experiment | `crates/independence-memory/`, `src/think/tools.rs`, `src/think/context.rs`, `docs/memory.md` |
 
 ## Milestone 5.5 — Security architecture and threat model
 

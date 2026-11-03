@@ -27,10 +27,10 @@ pub use worker::{
     SpeechEvent, SpeechHandle, SpeechOutcome, SpeechOwner, SpeechService, UtteranceId,
 };
 
-pub const HELP: &str = r#"Independence local observation prototype — Ephemeral Mode
+pub const HELP: &str = r#"Independence local observation prototype
 
 Type a question to ask the local Ollama model.
-/look <path> | <question>  unavailable in Ephemeral Mode (does not read local files)
+/look <path> | <question>  unavailable in unauthenticated modes (does not read local files)
 /cameras                    list usable local V4L2 camera identifiers
 /camera | <question>        capture from the only listed camera and ask
 /camera <id> | <question>   capture from one explicitly selected camera
@@ -50,17 +50,21 @@ listed, /camera requires an ID; it never guesses a /dev/video node. A camera
 capture briefly opens the selected device, discards up to two warm-up frames,
 keeps one validated JPEG in memory, then releases the device before Ollama is
 contacted. Photos must be JPEG or PNG and at most 10 MiB. History and captured
-photos are in memory only and cap at six accepted exchanges; use /reset to
-clear this temporary session.
+photos stay in memory only. Independence selects the newest complete exchanges
+that fit the configured model context for each request. Use /reset to clear this
+temporary session.
 
 Ephemeral Mode never loads saved conversations, preferences, photographs, or
-other local files, and Independence does not persist its temporary history,
-captured camera photos, or microphone recordings. Terminal scrollback or
-redirected stdout may still retain what was displayed.
-This observation mode has keyboard input and terminal output only: no
-microphone, speech synthesis, persistent memory, continuous vision, streaming,
-or autonomous tools. /stop cancels this application's request task, but cannot
-prove that a separate Ollama server has stopped its own computation immediately.
+other local files, and never persists its temporary history, captured camera
+photos, or microphone recordings. The explicit `--mode development-memory`
+experiment is different: it stores only model-selected text memories in the
+directory you name, in unencrypted SQLite. Terminal scrollback or redirected
+stdout may still retain what was displayed.
+Default Ephemeral observation mode has keyboard input and terminal output only:
+no microphone, speech synthesis, persistent memory, continuous vision,
+streaming, or autonomous tools. /stop cancels this application's request task,
+but cannot prove that a separate Ollama server has stopped its own computation
+immediately.
 
 For the deliberately separate local microphone experiment, start
 `cargo run -- --dictate`. Its transcript is displayed only; it never becomes a
@@ -229,6 +233,7 @@ pub fn welcome() {
 pub fn emit(output: Output) {
     match output {
         Output::Answer(answer) => independence_says(&answer),
+        Output::Progress(progress) => process(progress.event(), progress.message()),
         Output::Diagnostic(message) => warning("diagnostic", message),
         Output::Cameras(cameras) => {
             if cameras.is_empty() {

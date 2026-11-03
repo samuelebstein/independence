@@ -26,7 +26,7 @@ use crate::{
         audio::CpalRecorder,
         transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
     },
-    launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline},
+    launch::{InteractiveLaunchOptions, ModelBackend, VoiceLaunchOptions, VoicePipeline},
     listen::{
         self,
         controls::{VoiceControlEvent, VoiceInputEvent, VoiceInputSource},
@@ -38,8 +38,8 @@ use crate::{
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
     },
     security::{
-        EphemeralEntryControl, EphemeralEntryGesture, EphemeralEntryOutcome, EphemeralSession,
-        OperatingMode, SecurityError, SecurityManager,
+        DevelopmentMemorySession, EphemeralEntryControl, EphemeralEntryGesture,
+        EphemeralEntryOutcome, EphemeralSession, OperatingMode, SecurityError, SecurityManager,
     },
     see::{
         Photo, PhotoSource,
@@ -47,7 +47,11 @@ use crate::{
     },
     speak,
     telemetry::{self, Interaction},
-    think::{ModelCapabilities, OllamaClient, ThinkError},
+    think::{
+        ModelCapabilities, OllamaClient, ThinkError,
+        context::ContextBudget,
+        tools::{MemoryService, ToolHarnessError, ToolLoopConfig, ToolTurnRequest},
+    },
 };
 
 const EVENT_CHANNEL_CAPACITY: usize = 32;
@@ -130,7 +134,7 @@ impl MainEventResult {
 
 /// Runs the interactive terminal application until `/quit`, EOF, or Ctrl+C.
 pub async fn run() -> Result<(), AppError> {
-    run_with_mode(OperatingMode::Ephemeral).await
+    run_with_options(InteractiveLaunchOptions::default()).await
 }
 
 /// Runs the line-oriented application in the requested operating mode.
@@ -139,18 +143,42 @@ pub async fn run() -> Result<(), AppError> {
 /// Milestone 6.1 before an Ollama client, terminal reader, camera, or private
 /// storage could be initialized: no authenticator exists yet.
 pub async fn run_with_mode(mode: OperatingMode) -> Result<(), AppError> {
+    run_with_options(InteractiveLaunchOptions {
+        mode,
+        ..InteractiveLaunchOptions::default()
+    })
+    .await
+}
+
+/// Runs typed interaction with optional, explicitly selected development-only
+/// SQLite memory. The caller must supply its directory at the command line;
+/// ordinary Ephemeral Mode remains incapable of opening persistent memory.
+pub async fn run_with_options(options: InteractiveLaunchOptions) -> Result<(), AppError> {
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
-    let session = enter_requested_ephemeral_mode(&mut security, mode)?;
+    let session = enter_requested_unauthenticated_mode(&mut security, options.mode)?;
 
     let result = async {
         let client = OllamaClient::from_environment()?;
         discover_model_capabilities(&client).await;
+        let memory =
+            initialize_memory_service(options.mode, options.memory_dir.as_deref(), &client)?;
+        let tool_loop_config = tool_loop_config(
+            options.context_window,
+            options.reserved_output_tokens,
+            client.capabilities().model_context_capacity,
+        )?;
         let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         listen::spawn_stdin_reader(event_sender.clone()).map_err(AppError::InputAdapter)?;
 
-        let mut controller = Controller::new_ephemeral();
-        let mut runtime = TurnRuntime::new(client, CameraService::v4l(), event_sender);
+        let mut controller = controller_for_unauthenticated_mode(options.mode);
+        let mut runtime = TurnRuntime::new_with_memory(
+            client,
+            CameraService::v4l(),
+            event_sender,
+            memory,
+            tool_loop_config,
+        );
         speak::welcome();
 
         loop {
@@ -173,7 +201,7 @@ pub async fn run_with_mode(mode: OperatingMode) -> Result<(), AppError> {
     }
     .await;
 
-    finish_ephemeral_session(&mut security, session)?;
+    finish_unauthenticated_session(&mut security, session)?;
     result
 }
 
@@ -190,13 +218,21 @@ fn announce_security_lifecycle(security: &SecurityManager) {
     );
 }
 
-/// Acquires the only production session type Milestone 6.1 can authorize.
-/// Keeping this decision in `SecurityManager` prevents the controller or a
-/// presentation adapter from treating a CLI selection as authentication.
-fn enter_requested_ephemeral_mode(
+/// A mode lease for either unauthenticated operating experience. Neither
+/// variant carries a private-storage capability.
+#[derive(Debug)]
+enum UnauthenticatedSession {
+    Ephemeral(EphemeralSession),
+    DevelopmentMemory(DevelopmentMemorySession),
+}
+
+/// Acquires one explicitly selected unauthenticated session. Keeping this
+/// decision in `SecurityManager` prevents the controller or a presentation
+/// adapter from treating a CLI selection as authentication.
+fn enter_requested_unauthenticated_mode(
     security: &mut SecurityManager,
     requested: OperatingMode,
-) -> Result<EphemeralSession, AppError> {
+) -> Result<UnauthenticatedSession, AppError> {
     match requested {
         OperatingMode::Ephemeral => {
             let session = security.enter_ephemeral().map_err(AppError::Security)?;
@@ -204,7 +240,17 @@ fn enter_requested_ephemeral_mode(
                 "operating_mode",
                 "Ephemeral Mode active — temporary context only; private data is unavailable",
             );
-            Ok(session)
+            Ok(UnauthenticatedSession::Ephemeral(session))
+        }
+        OperatingMode::DevelopmentMemory => {
+            let session = security
+                .enter_development_memory()
+                .map_err(AppError::Security)?;
+            speak::warning(
+                "development_memory_active",
+                "Development Memory mode is active — selected memories are stored in an unencrypted local SQLite database; Private Mode remains unavailable",
+            );
+            Ok(UnauthenticatedSession::DevelopmentMemory(session))
         }
         OperatingMode::Private => Err(AppError::PrivateModeUnavailable {
             state: security.state(),
@@ -212,18 +258,97 @@ fn enter_requested_ephemeral_mode(
     }
 }
 
-fn finish_ephemeral_session(
+fn finish_unauthenticated_session(
     security: &mut SecurityManager,
-    session: EphemeralSession,
+    session: UnauthenticatedSession,
 ) -> Result<(), AppError> {
-    security
-        .end_ephemeral(session)
-        .map_err(AppError::Security)?;
+    match session {
+        UnauthenticatedSession::Ephemeral(session) => security
+            .end_ephemeral(session)
+            .map_err(AppError::Security)?,
+        UnauthenticatedSession::DevelopmentMemory(session) => security
+            .end_development_memory(session)
+            .map_err(AppError::Security)?,
+    }
     speak::process(
-        "ephemeral_session_cleared",
+        "unauthenticated_session_cleared",
         "temporary conversation and image buffers were released",
     );
     Ok(())
+}
+
+fn controller_for_unauthenticated_mode(mode: OperatingMode) -> Controller {
+    match mode {
+        OperatingMode::Ephemeral => Controller::new_ephemeral(),
+        OperatingMode::DevelopmentMemory => Controller::new_development_memory(),
+        OperatingMode::Private => unreachable!("Private Mode has no authenticated controller yet"),
+    }
+}
+
+fn initialize_memory_service(
+    mode: OperatingMode,
+    directory: Option<&std::path::Path>,
+    client: &OllamaClient,
+) -> Result<Option<MemoryService>, AppError> {
+    match mode {
+        OperatingMode::Ephemeral => Ok(None),
+        OperatingMode::Private => Err(AppError::PrivateModeUnavailable {
+            state: crate::security::SecurityState::Uninitialized,
+        }),
+        OperatingMode::DevelopmentMemory => {
+            let directory = directory.ok_or(AppError::DevelopmentMemoryDirectoryMissing)?;
+            if !client.supports_tools() {
+                return Err(AppError::MemoryToolsUnsupported {
+                    model: client.model().to_owned(),
+                    capability: client.capabilities().tool_calling.label(),
+                });
+            }
+            let memory = MemoryService::open(directory).map_err(AppError::Memory)?;
+            let database_path = memory
+                .database_path()
+                .map_err(|error| AppError::ToolHarness(error.to_string()))?;
+            speak::warning(
+                "development_memory_database",
+                format!(
+                    "Development Memory database: {} (unencrypted experimental storage)",
+                    database_path.display()
+                ),
+            );
+            Ok(Some(memory))
+        }
+    }
+}
+
+fn tool_loop_config(
+    context_window: Option<usize>,
+    reserved_output_tokens: Option<usize>,
+    model_context_capacity: Option<usize>,
+) -> Result<ToolLoopConfig, AppError> {
+    let mut context_budget = ContextBudget::default();
+    if let Some(context_window) = context_window {
+        context_budget.runtime_context_tokens = context_window;
+    }
+    if let Some(reserved_output_tokens) = reserved_output_tokens {
+        context_budget.reserved_output_tokens = reserved_output_tokens;
+    }
+    context_budget
+        .input_budget()
+        .map_err(|error| AppError::Context(error.to_string()))?;
+    speak::process(
+        "context_budget",
+        format!(
+            "runtime={} tokens; reserved output={} tokens; model metadata context={}",
+            context_budget.runtime_context_tokens,
+            context_budget.reserved_output_tokens,
+            model_context_capacity
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+    );
+    Ok(ToolLoopConfig {
+        context_budget,
+        ..ToolLoopConfig::default()
+    })
 }
 
 /// Obtains one cached `/api/show` record for the selected local model. A
@@ -235,15 +360,21 @@ async fn discover_model_capabilities(client: &OllamaClient) {
             image_input,
             audio_input,
             audio_output,
+            tool_calling,
+            model_context_capacity,
             ..
         }) => speak::process(
             "ollama_model_capabilities",
             format!(
-                "model={} image_input={} audio_input={} audio_output={}",
+                "model={} image_input={} audio_input={} audio_output={} tool_calling={} model_context={}",
                 client.model(),
                 image_input.label(),
                 audio_input.label(),
-                audio_output.label()
+                audio_output.label(),
+                tool_calling.label(),
+                model_context_capacity
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".into())
             ),
         ),
         Err(error) => speak::warning(
@@ -261,9 +392,9 @@ async fn discover_model_capabilities(client: &OllamaClient) {
 pub async fn run_dictation() -> Result<(), AppError> {
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
-    let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)?;
+    let session = enter_requested_unauthenticated_mode(&mut security, OperatingMode::Ephemeral)?;
     let result = dictation::run().await.map_err(AppError::Dictation);
-    finish_ephemeral_session(&mut security, session)?;
+    finish_unauthenticated_session(&mut security, session)?;
     result
 }
 
@@ -419,19 +550,19 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
         // the default safe mode enters it immediately. The terminal reader is
         // created later by the actual voice runtime.
         ResolvedVoiceInput::Terminal => {
-            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
+            enter_requested_unauthenticated_mode(&mut security, resolved.operating_mode)?
         }
         // A physical Pi controller uses its existing Talk button for a
         // deliberate 5-second hold. This gate opens only the evdev device;
         // it does not start microphone, camera, Whisper, Piper, or Ollama.
         ResolvedVoiceInput::Buttons(path) => {
             if matches!(
-                await_button_ephemeral_entry(path.clone()).await?,
+                await_button_unauthenticated_entry(path.clone(), resolved.operating_mode).await?,
                 EphemeralEntryResult::Shutdown
             ) {
                 return Ok(());
             }
-            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
+            enter_requested_unauthenticated_mode(&mut security, resolved.operating_mode)?
         }
     };
 
@@ -440,13 +571,26 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
             (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
                 let client = configured_ollama_client(&resolved)?;
                 discover_model_capabilities(&client).await;
-                run_transcribe_and_speak(resolved, client).await
+                let memory = initialize_memory_service(
+                    resolved.operating_mode,
+                    resolved.memory_dir.as_deref(),
+                    &client,
+                )?;
+                let tool_loop_config = tool_loop_config(
+                    resolved.context_window,
+                    resolved.reserved_output_tokens,
+                    client.capabilities().model_context_capacity,
+                )?;
+                run_transcribe_and_speak(resolved, client, memory, tool_loop_config).await
             }
             (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
                 backend: backend.label(),
                 pipeline: VoicePipeline::TranscribeAndSpeak.label(),
             }),
             (VoicePipeline::AudioToAudio, backend) => {
+                if resolved.operating_mode == OperatingMode::DevelopmentMemory {
+                    return Err(AppError::DevelopmentMemoryRequiresTextPipeline);
+                }
                 // The fixture backend is specifically a microphone→backend→speaker
                 // plumbing check. It must not start an Ollama client or probe a
                 // model. The explicit `ollama` backend receives cached metadata
@@ -470,7 +614,7 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     // This always runs after an entered session, even if model or hardware
     // startup failed.  It revokes the mode lease; individual runtimes clear
     // their application-owned buffers during their own shutdown.
-    finish_ephemeral_session(&mut security, session)?;
+    finish_unauthenticated_session(&mut security, session)?;
     result
 }
 
@@ -482,15 +626,23 @@ enum EphemeralEntryResult {
     Shutdown,
 }
 
-async fn await_button_ephemeral_entry(
+async fn await_button_unauthenticated_entry(
     path: std::path::PathBuf,
+    mode: OperatingMode,
 ) -> Result<EphemeralEntryResult, AppError> {
     let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let mut input = EvdevButtonInputSource::open(path, sender).map_err(AppError::ButtonInput)?;
     let mut gesture = EphemeralEntryGesture::new();
+    let mode_label = match mode {
+        OperatingMode::Ephemeral => "Ephemeral Mode",
+        OperatingMode::DevelopmentMemory => "Development Memory mode",
+        OperatingMode::Private => unreachable!("Private Mode was rejected before physical entry"),
+    };
     speak::process(
-        "ephemeral_entry_waiting",
-        "hold the physical Talk/Enter button for five seconds, then release to enter Ephemeral Mode",
+        "unauthenticated_entry_waiting",
+        format!(
+            "hold the physical Talk/Enter button for five seconds, then release to enter {mode_label}"
+        ),
     );
 
     loop {
@@ -522,15 +674,15 @@ async fn await_button_ephemeral_entry(
             VoiceInputEvent::SourceLost { source, message } => {
                 gesture.reset();
                 speak::warning(
-                    "ephemeral_entry_input_lost",
-                    format!("{source} was lost while waiting for Ephemeral Mode entry: {message}"),
+                    "unauthenticated_entry_input_lost",
+                    format!("{source} was lost while waiting for {mode_label} entry: {message}"),
                 );
                 continue;
             }
             VoiceInputEvent::SourceRecovered { source } => {
                 gesture.reset();
                 speak::process(
-                    "ephemeral_entry_input_recovered",
+                    "unauthenticated_entry_input_recovered",
                     format!("{source} is available again; hold Talk/Enter for five seconds"),
                 );
                 continue;
@@ -559,8 +711,10 @@ async fn await_button_ephemeral_entry(
             EphemeralEntryOutcome::Entered => {
                 input.shutdown();
                 speak::process(
-                    "ephemeral_entry_confirmed",
-                    "Ephemeral Mode selected; release consumed, press Talk/Enter again to record",
+                    "unauthenticated_entry_confirmed",
+                    format!(
+                        "{mode_label} selected; release consumed, press Talk/Enter again to record"
+                    ),
                 );
                 return Ok(EphemeralEntryResult::Entered);
             }
@@ -585,6 +739,8 @@ fn configured_ollama_client(resolved: &ResolvedVoiceProfile) -> Result<OllamaCli
 async fn run_transcribe_and_speak(
     resolved: ResolvedVoiceProfile,
     client: OllamaClient,
+    memory: Option<MemoryService>,
+    tool_loop_config: ToolLoopConfig,
 ) -> Result<(), AppError> {
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
@@ -642,14 +798,16 @@ async fn run_transcribe_and_speak(
     );
 
     let mut runtime = VoiceRuntime::new(
-        Controller::new_ephemeral(),
-        TurnRuntime::new(
+        controller_for_unauthenticated_mode(resolved.operating_mode),
+        TurnRuntime::new_with_memory(
             client,
             match resolved.camera_backend {
                 CameraBackendSelection::V4l => CameraService::v4l(),
                 CameraBackendSelection::RpiCamStill => CameraService::rpicam(),
             },
             main_event_sender,
+            memory,
+            tool_loop_config,
         ),
         dictation,
         voice_aux_sender,
@@ -815,6 +973,11 @@ struct TurnRuntime {
     client: Arc<OllamaClient>,
     camera: CameraService,
     event_sender: mpsc::Sender<Event>,
+    /// Present only for the explicit development-memory experiment. Ordinary
+    /// Ephemeral Mode uses the same context manager but exposes no tools and
+    /// never opens a SQLite database.
+    memory: Option<MemoryService>,
+    tool_loop_config: ToolLoopConfig,
     active: Option<RunningTurn>,
     pending_interaction: Option<Interaction>,
     /// Cancellation returns control immediately, but an already-running
@@ -846,11 +1009,30 @@ impl RuntimeEffectResult {
 }
 
 impl TurnRuntime {
+    #[cfg(test)]
     fn new(client: OllamaClient, camera: CameraService, event_sender: mpsc::Sender<Event>) -> Self {
+        Self::new_with_memory(
+            client,
+            camera,
+            event_sender,
+            None,
+            ToolLoopConfig::default(),
+        )
+    }
+
+    fn new_with_memory(
+        client: OllamaClient,
+        camera: CameraService,
+        event_sender: mpsc::Sender<Event>,
+        memory: Option<MemoryService>,
+        tool_loop_config: ToolLoopConfig,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             camera,
             event_sender,
+            memory,
+            tool_loop_config,
             active: None,
             pending_interaction: None,
             cleanup_tasks: Vec::new(),
@@ -965,12 +1147,18 @@ impl TurnRuntime {
         let client = self.client.clone();
         let camera = self.camera.clone();
         let event_sender = self.event_sender.clone();
+        let memory = self.memory.clone();
+        let tool_loop_config = self.tool_loop_config;
         let worker_interaction = interaction.clone();
         let handle = tokio::spawn(async move {
             let result = run_turn_with_interaction(
-                client,
-                camera,
-                event_sender.clone(),
+                TurnWorkerResources {
+                    client,
+                    camera_service: camera,
+                    event_sender: event_sender.clone(),
+                    memory,
+                    tool_loop_config,
+                },
                 request,
                 worker_cancellation.clone(),
                 worker_interaction,
@@ -2237,9 +2425,13 @@ async fn run_turn(
     let interaction = telemetry::start_interaction("direct", None);
     interaction.bind_turn(request.id);
     run_turn_with_interaction(
-        client,
-        camera_service,
-        event_sender,
+        TurnWorkerResources {
+            client,
+            camera_service,
+            event_sender,
+            memory: None,
+            tool_loop_config: ToolLoopConfig::default(),
+        },
         request,
         cancellation,
         interaction,
@@ -2247,14 +2439,30 @@ async fn run_turn(
     .await
 }
 
-async fn run_turn_with_interaction(
+/// I/O/configuration owned by a `TurnRuntime` task. Grouping the fixed worker
+/// resources keeps the turn function focused on request handling rather than
+/// creating a broad application service abstraction.
+struct TurnWorkerResources {
     client: Arc<OllamaClient>,
     camera_service: CameraService,
     event_sender: mpsc::Sender<Event>,
+    memory: Option<MemoryService>,
+    tool_loop_config: ToolLoopConfig,
+}
+
+async fn run_turn_with_interaction(
+    resources: TurnWorkerResources,
     request: TurnRequest,
     cancellation: CancellationToken,
     interaction: Interaction,
 ) -> TurnResult {
+    let TurnWorkerResources {
+        client,
+        camera_service,
+        event_sender,
+        memory,
+        tool_loop_config,
+    } = resources;
     let TurnRequest {
         id,
         question,
@@ -2394,38 +2602,55 @@ async fn run_turn_with_interaction(
     let image_bytes = images.iter().map(Photo::bytes).collect::<Vec<_>>();
     interaction.set_photo_count(image_bytes.len());
     interaction.mark("ollama.request_dispatch_started");
-    let _ollama_in_flight = interaction.in_flight_guard("ollama");
-
-    let answer = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            return TurnResult::Cancelled;
+    let answer = crate::think::tools::run(
+        client.as_ref(),
+        memory,
+        ToolTurnRequest {
+            history,
+            question,
+            image_bytes: &image_bytes,
+            turn_id: id,
         },
-        answer = client.answer_with_telemetry(&history, &question, &image_bytes, Some(&interaction)) => answer,
-    };
-
-    if cancellation.is_cancelled() {
-        return TurnResult::Cancelled;
-    }
+        tool_loop_config,
+        event_sender,
+        cancellation.clone(),
+        &interaction,
+    )
+    .await;
 
     match answer {
         Ok(answer) => {
             interaction.mark("ollama.response_received");
             TurnResult::Answer {
-                answer: answer.text,
+                answer: answer.answer,
+                tool_rounds: answer.tool_rounds,
                 proposed_scene,
             }
         }
+        Err(ToolHarnessError::Cancelled) => TurnResult::Cancelled,
         Err(error) => {
             interaction.event(
                 "ollama.request.failed",
-                error.classification(),
+                tool_error_classification(&error),
                 telemetry::Fields::new(),
             );
             TurnResult::Failed {
-                message: format!("local inference failed: {error}"),
+                message: format!("local inference or tool execution failed: {error}"),
             }
         }
+    }
+}
+
+fn tool_error_classification(error: &ToolHarnessError) -> &'static str {
+    match error {
+        ToolHarnessError::Model(error) => error.classification(),
+        ToolHarnessError::Context(_) => "context_overflow",
+        ToolHarnessError::Cancelled => "cancelled",
+        ToolHarnessError::ProgressChannelClosed => "progress_channel_closed",
+        ToolHarnessError::MemoryWorkerUnavailable => "memory_worker_unavailable",
+        ToolHarnessError::ToolIterationLimit { .. } => "tool_iteration_limit",
+        ToolHarnessError::ToolExecutionTimedOut { .. } => "memory_tool_timeout",
+        ToolHarnessError::EmptyFinalAnswer => "empty_final_answer",
     }
 }
 
@@ -2455,6 +2680,31 @@ pub enum AppError {
     PrivateModeUnavailable {
         state: crate::security::SecurityState,
     },
+
+    #[error("--mode development-memory requires an explicit --memory-dir <directory>")]
+    DevelopmentMemoryDirectoryMissing,
+
+    #[error(
+        "Development Memory requires a local Ollama model that advertises tool calling; model `{model}` capability is {capability}"
+    )]
+    MemoryToolsUnsupported {
+        model: String,
+        capability: &'static str,
+    },
+
+    #[error("could not open the explicitly configured Development Memory database: {0}")]
+    Memory(#[source] independence_memory::MemoryError),
+
+    #[error("could not initialize the local memory tool harness: {0}")]
+    ToolHarness(String),
+
+    #[error("invalid model context budget: {0}")]
+    Context(String),
+
+    #[error(
+        "Development Memory currently requires the transcribe-and-speak text pipeline; audio-to-audio does not expose text memory tools"
+    )]
+    DevelopmentMemoryRequiresTextPipeline,
 
     #[error("the physical input device closed while waiting for Ephemeral Mode entry")]
     EphemeralEntryInputClosed,
@@ -2569,8 +2819,9 @@ mod tests {
     };
 
     use super::{
-        AppError, TurnRuntime, VoiceRuntime, enter_requested_ephemeral_mode,
-        finish_ephemeral_session, run_turn, run_voice_with_options,
+        AppError, TurnRuntime, VoiceRuntime, enter_requested_unauthenticated_mode,
+        finish_unauthenticated_session, initialize_memory_service, run_turn,
+        run_voice_with_options,
     };
     use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
     use crate::security::{OperatingMode, SecurityManager, SecurityState};
@@ -2586,18 +2837,60 @@ mod tests {
     #[test]
     fn application_mode_boundary_enters_ephemeral_but_rejects_private_without_authentication() {
         let mut security = SecurityManager::new();
-        let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)
+        let session = enter_requested_unauthenticated_mode(&mut security, OperatingMode::Ephemeral)
             .expect("default application launch enters the temporary mode");
         assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), Some(OperatingMode::Ephemeral));
-        finish_ephemeral_session(&mut security, session).unwrap();
+        finish_unauthenticated_session(&mut security, session).unwrap();
         assert_eq!(security.active_mode(), None);
 
-        let error = enter_requested_ephemeral_mode(&mut security, OperatingMode::Private)
+        let error = enter_requested_unauthenticated_mode(&mut security, OperatingMode::Private)
             .expect_err("a CLI selection cannot manufacture authentication");
         assert!(matches!(error, AppError::PrivateModeUnavailable { .. }));
         assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), None);
+    }
+
+    #[test]
+    fn ephemeral_mode_never_opens_a_persistent_memory_database() {
+        let directory = tempdir().unwrap();
+        let requested = directory.path().join("must-not-exist");
+        let client =
+            OllamaClient::new(OllamaConfig::new("http://127.0.0.1:11434", "test-model").unwrap())
+                .unwrap();
+
+        let memory = initialize_memory_service(OperatingMode::Ephemeral, None, &client).unwrap();
+        assert!(memory.is_none());
+        assert!(!requested.exists());
+    }
+
+    #[test]
+    fn development_memory_requires_a_tool_capable_model_before_creating_storage() {
+        let directory = tempdir().unwrap();
+        let requested = directory.path().join("development-memory");
+        let client = OllamaClient::new(
+            OllamaConfig::new("http://127.0.0.1:11434", "text-only-model").unwrap(),
+        )
+        .unwrap();
+        client.set_capabilities_for_test(&[]);
+
+        let error = match initialize_memory_service(
+            OperatingMode::DevelopmentMemory,
+            Some(&requested),
+            &client,
+        ) {
+            Ok(_) => panic!("a model without native tools must not open development memory"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::MemoryToolsUnsupported { .. }));
+        assert!(!requested.exists());
+
+        client.set_capabilities_for_test(&["tools"]);
+        let memory =
+            initialize_memory_service(OperatingMode::DevelopmentMemory, Some(&requested), &client)
+                .unwrap()
+                .expect("explicit development mode opens one selected database");
+        assert_eq!(memory.database_path().unwrap(), requested.join("memory.db"));
     }
 
     async fn within_test_timeout<T>(future: impl Future<Output = T>) -> T {
@@ -3309,6 +3602,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3327,6 +3621,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3428,6 +3723,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3446,6 +3742,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3531,6 +3828,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3807,6 +4105,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -3980,6 +4279,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -4071,6 +4371,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -4088,6 +4389,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -4136,6 +4438,7 @@ mod tests {
             .and(path("/api/chat"))
             .and(body_json(json!({
                 "model": "test-model",
+                "options": {"num_ctx": 8192},
                 "stream": false,
                 "messages": [
                     {"role": "system", "content": TEACHER_INSTRUCTIONS},
@@ -4259,6 +4562,7 @@ mod tests {
                     id: TurnId::new(1),
                     result: TurnResult::Answer {
                         answer: "late old answer".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))
@@ -4307,6 +4611,7 @@ mod tests {
                     id: TurnId::new(1),
                     result: TurnResult::Answer {
                         answer: "late cancelled answer".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))

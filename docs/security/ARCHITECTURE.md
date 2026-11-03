@@ -1,14 +1,16 @@
 # Security architecture
 
 > **Status:** Milestone 5.5 design plus Milestone 6.1 foundation. The
-> cryptographic, authentication, recovery, storage, and backup sections remain
-> approval-required design; the lifecycle/ephemeral boundary is current code.
+> cryptographic, authentication, recovery, protected-storage, and backup
+> sections remain approval-required design; the lifecycle/ephemeral boundary
+> and an explicit unencrypted development-memory experiment are current code.
 
 > **Implementation status:** Milestone 6.1 now implements the process-local
 > `SecurityManager` lifecycle policy and default Ephemeral Mode described
 > below. It does **not** implement keys, PINs, recovery phrases, encryption,
-> private storage, or persistent authentication. Sections about those remain
-> approved design direction or recommendations, not current protection.
+> private storage, or persistent authentication. The separate development
+> SQLite experiment is not private storage or protection. Sections about those
+> remain approved design direction or recommendations, not current protection.
 
 ## Read this first: three kinds of statement
 
@@ -249,6 +251,7 @@ PIN input, recovery input, or model/device authority.
 | Lifecycle states | `Uninitialized`, `SetupInProgress`, `Locked`, `Unlocked`, `RecoveryRequired`, with tested transition checks | Persisting state or obtaining state from an enrolled device |
 | Default launch | Starts a process-local `Uninitialized` manager, then obtains an opaque Ephemeral Mode lease | Any automatic setup or unlock |
 | Ephemeral Mode | Allowed from `Uninitialized`, `Locked`, and `RecoveryRequired`; does not change lifecycle state | A durable profile, preferences, or personal-memory load |
+| Development Memory mode | Explicitly named unauthenticated lease; selected local model tools may use one caller-chosen plaintext SQLite directory | Private-storage authority, authentication, encryption, secure deletion, or persistent profile access |
 | Private Mode | Named explicitly and denied unless lifecycle is `Unlocked` | Any production way to become `Unlocked` |
 | Storage authority | An opaque future `PrivateStorageAccess` type exists behind the manager | A storage adapter, DEK, envelope, or actual data access |
 | Cleanup | Runtime cancels/joins work, then clears controller-owned temporary history/photos on orderly exit | Secure erasure outside normal Rust/application ownership |
@@ -265,7 +268,7 @@ RecoveryRequired rules so later storage/authentication work has a stable
 policy boundary. Calling the device “locked” today would be misleading: no
 private data store exists to lock.
 
-#### Ephemeral session policy
+#### Unauthenticated session policy
 
 The controller is constructed as an Ephemeral controller for typed and voice
 paths. It begins with empty history/photos; `/look` is rejected before file
@@ -281,14 +284,23 @@ After controller cleanup, the next request has no prior application history.
 Model residency (`keep_alive`) or opaque model-server internals are not proof
 of cryptographic or secure-memory clearing.
 
-#### Physical entry policy
+The opt-in Development Memory mode is a distinct unauthenticated experience,
+not a shortcut around this rule. It requires `--memory-dir`, records only
+model-selected concise text memories/evidence in ordinary SQLite, and never
+constructs `PrivateStorageAccess`. Default Ephemeral Mode does not open or
+receive this store. The directory is unencrypted and must be treated as exposed
+development test data until a later approved protected-storage milestone moves
+it behind the future storage capability.
+
+#### Physical unauthenticated-entry policy
 
 In Raspberry Pi `--voice --input buttons` mode, the selected exclusive evdev
-Talk/Enter button must be held for five seconds then released before the
-Ephemeral lease is obtained. The gate uses no microphone/camera/model/Piper
-work and consumes that first release; a fresh press begins normal recording.
-Terminal mode has no physical device to gate and enters default Ephemeral Mode
-directly. This is a usability/intent gesture, not authentication.
+Talk/Enter button must be held for five seconds then released before the chosen
+unauthenticated lease is obtained. The gate uses no microphone/camera/model/
+Piper work and consumes that first release; a fresh press begins normal
+recording. Terminal mode has no physical device to gate and enters default
+Ephemeral Mode directly. This is a usability/intent gesture, not
+authentication.
 
 ### Proposed state machine
 

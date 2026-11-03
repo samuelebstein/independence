@@ -132,12 +132,44 @@ pub struct VoiceLaunchOptions {
     /// Defaults to Ephemeral Mode. Private Mode is parsed explicitly so the
     /// SecurityManager can reject unauthenticated use before hardware starts.
     pub mode: Option<OperatingMode>,
+    /// Required only for the explicitly unencrypted Development Memory
+    /// experiment. Ordinary Ephemeral Mode never opens this directory.
+    pub memory_dir: Option<PathBuf>,
+    /// An explicit runtime `num_ctx` setting. If absent, Independence uses a
+    /// documented conservative fallback instead of treating model metadata as
+    /// a live Ollama context setting.
+    pub context_window: Option<usize>,
+    /// Tokens reserved for the non-streaming model response inside the
+    /// configured runtime context window.
+    pub reserved_output_tokens: Option<usize>,
+}
+
+/// CLI selections for line-oriented interaction. This deliberately mirrors
+/// the persistence/context choices available to voice mode without pulling
+/// hardware configuration into the typed path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InteractiveLaunchOptions {
+    pub mode: OperatingMode,
+    pub memory_dir: Option<PathBuf>,
+    pub context_window: Option<usize>,
+    pub reserved_output_tokens: Option<usize>,
+}
+
+impl Default for InteractiveLaunchOptions {
+    fn default() -> Self {
+        Self {
+            mode: OperatingMode::Ephemeral,
+            memory_dir: None,
+            context_window: None,
+            reserved_output_tokens: None,
+        }
+    }
 }
 
 /// The top-level action selected from argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchCommand {
-    Interactive { mode: OperatingMode },
+    Interactive(InteractiveLaunchOptions),
     Dictate,
     Voice(VoiceLaunchOptions),
     ListAudioOutputs,
@@ -158,12 +190,20 @@ pub fn parse_arguments(arguments: &[OsString]) -> Result<LaunchCommand, String> 
         .collect::<Result<Vec<_>, _>>()?;
 
     match values.as_slice() {
-        [] => Ok(LaunchCommand::Interactive {
-            mode: OperatingMode::Ephemeral,
-        }),
-        ["--mode", mode] => Ok(LaunchCommand::Interactive {
-            mode: OperatingMode::parse(mode)?,
-        }),
+        [] => Ok(LaunchCommand::Interactive(
+            InteractiveLaunchOptions::default(),
+        )),
+        [first, ..]
+            if first.starts_with("--")
+                && *first != "--voice"
+                && *first != "--dictate"
+                && *first != "--audio-devices"
+                && *first != "--audio-input-devices"
+                && *first != "--input-devices"
+                && *first != "--speak-test" =>
+        {
+            parse_interactive_options(&values).map(LaunchCommand::Interactive)
+        }
         ["--dictate"] => Ok(LaunchCommand::Dictate),
         ["--audio-devices"] => Ok(LaunchCommand::ListAudioOutputs),
         ["--audio-input-devices"] => Ok(LaunchCommand::ListAudioInputs),
@@ -173,6 +213,46 @@ pub fn parse_arguments(arguments: &[OsString]) -> Result<LaunchCommand, String> 
             .map(|audio_output| LaunchCommand::SpeakTest { audio_output }),
         _ => Err("unrecognized command-line arguments".into()),
     }
+}
+
+fn parse_interactive_options(values: &[&str]) -> Result<InteractiveLaunchOptions, String> {
+    let mut options = InteractiveLaunchOptions::default();
+    let mut mode_was_set = false;
+    let mut index = 0;
+    while index < values.len() {
+        let flag = values[index];
+        let value = values
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} requires a value"))?;
+        match flag {
+            "--mode" => {
+                if mode_was_set {
+                    return Err("--mode may be provided only once".into());
+                }
+                options.mode = OperatingMode::parse(value)?;
+                mode_was_set = true;
+            }
+            "--memory-dir" => set_once(
+                &mut options.memory_dir,
+                PathBuf::from(value),
+                "--memory-dir",
+            )?,
+            "--context-window" => set_once(
+                &mut options.context_window,
+                parse_positive_usize(value, "--context-window")?,
+                "--context-window",
+            )?,
+            "--reserved-output-tokens" => set_once(
+                &mut options.reserved_output_tokens,
+                parse_positive_usize(value, "--reserved-output-tokens")?,
+                "--reserved-output-tokens",
+            )?,
+            _ => return Err(format!("unknown interactive option `{flag}`")),
+        }
+        index += 2;
+    }
+    validate_memory_selection(options.mode, options.memory_dir.as_ref())?;
+    Ok(options)
 }
 
 fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
@@ -217,6 +297,21 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
                 "--backend",
             )?,
             "--mode" => set_once(&mut options.mode, OperatingMode::parse(value)?, "--mode")?,
+            "--memory-dir" => set_once(
+                &mut options.memory_dir,
+                PathBuf::from(value),
+                "--memory-dir",
+            )?,
+            "--context-window" => set_once(
+                &mut options.context_window,
+                parse_positive_usize(value, "--context-window")?,
+                "--context-window",
+            )?,
+            "--reserved-output-tokens" => set_once(
+                &mut options.reserved_output_tokens,
+                parse_positive_usize(value, "--reserved-output-tokens")?,
+                "--reserved-output-tokens",
+            )?,
             "--audio-backend" => {
                 return Err("`--audio-backend` was renamed to `--backend`".into());
             }
@@ -224,7 +319,36 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
         }
         index += 2;
     }
+    validate_memory_selection(
+        options.mode.unwrap_or(OperatingMode::Ephemeral),
+        options.memory_dir.as_ref(),
+    )?;
     Ok(options)
+}
+
+fn parse_positive_usize(value: &str, flag: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("{flag} requires a positive integer"))
+}
+
+fn validate_memory_selection(
+    mode: OperatingMode,
+    memory_dir: Option<&PathBuf>,
+) -> Result<(), String> {
+    match (mode, memory_dir) {
+        (OperatingMode::DevelopmentMemory, None) => Err(
+            "--mode development-memory requires --memory-dir <explicit unencrypted development directory>"
+                .into(),
+        ),
+        (OperatingMode::Ephemeral | OperatingMode::Private, Some(_)) => Err(
+            "--memory-dir is allowed only with --mode development-memory; Ephemeral Mode never opens persistent memory"
+                .into(),
+        ),
+        (OperatingMode::DevelopmentMemory, Some(_)) | (_, None) => Ok(()),
+    }
 }
 
 fn parse_speak_test_options(values: &[&str]) -> Result<Option<String>, String> {
@@ -247,8 +371,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        HardwareProfile, LaunchCommand, ModelBackend, VoiceInputMode, VoiceLaunchOptions,
-        VoicePipeline, parse_arguments,
+        HardwareProfile, InteractiveLaunchOptions, LaunchCommand, ModelBackend, VoiceInputMode,
+        VoiceLaunchOptions, VoicePipeline, parse_arguments,
     };
     use crate::security::OperatingMode;
 
@@ -282,6 +406,9 @@ mod tests {
                 pipeline: None,
                 backend: None,
                 mode: None,
+                memory_dir: None,
+                context_window: None,
+                reserved_output_tokens: None,
             }))
         );
     }
@@ -352,20 +479,48 @@ mod tests {
     fn operating_mode_defaults_to_ephemeral_and_private_is_explicit() {
         assert_eq!(
             parse(&[]),
-            Ok(LaunchCommand::Interactive {
-                mode: OperatingMode::Ephemeral
-            })
+            Ok(LaunchCommand::Interactive(
+                InteractiveLaunchOptions::default()
+            ))
         );
         assert_eq!(
             parse(&["--mode", "private"]),
-            Ok(LaunchCommand::Interactive {
-                mode: OperatingMode::Private
-            })
+            Ok(LaunchCommand::Interactive(InteractiveLaunchOptions {
+                mode: OperatingMode::Private,
+                ..InteractiveLaunchOptions::default()
+            }))
         );
         let options = match parse(&["--voice", "--mode", "ephemeral"]).unwrap() {
             LaunchCommand::Voice(options) => options,
             _ => unreachable!(),
         };
         assert_eq!(options.mode, Some(OperatingMode::Ephemeral));
+    }
+
+    #[test]
+    fn development_memory_requires_an_explicit_directory_and_keeps_context_choices_explicit() {
+        let error = parse(&["--mode", "development-memory"]).unwrap_err();
+        assert!(error.contains("--memory-dir"));
+        let parsed = parse(&[
+            "--mode",
+            "development-memory",
+            "--memory-dir",
+            "local-data/dev-memory",
+            "--context-window",
+            "8192",
+            "--reserved-output-tokens",
+            "1024",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed,
+            LaunchCommand::Interactive(InteractiveLaunchOptions {
+                mode: OperatingMode::DevelopmentMemory,
+                memory_dir: Some("local-data/dev-memory".into()),
+                context_window: Some(8192),
+                reserved_output_tokens: Some(1024),
+            })
+        );
+        assert!(parse(&["--memory-dir", "local-data/nope"]).is_err());
     }
 }

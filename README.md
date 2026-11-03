@@ -4,7 +4,7 @@ Independence is an experiment in a local only, airgapped computer for noticing a
 learning about the physical world. This repository currently contains a narrow
 terminal prototype—not a finished product.
 
-It currently runs its user-facing interactions in **Ephemeral Mode**: a fresh,
+It normally runs its user-facing interactions in **Ephemeral Mode**: a fresh,
 unauthenticated, in-memory-only session. It can:
 
 - take keyboard input as its `listen` capability;
@@ -35,10 +35,11 @@ It also has two explicit local microphone modes:
   `/quit` text is never parsed as a terminal command.
 
 The default observation mode (`cargo run`) does not access a microphone or
-speaker. No current mode persists a conversation, streams tokens, calls tools
-autonomously, or uses a cloud model. It also does not load saved local files
-with `/look`: that capability is deferred until authenticated Private Mode
-exists.
+speaker, persist memories, or expose model tools. The explicitly named
+development-only `--mode development-memory --memory-dir <directory>` experiment
+adds selected unencrypted SQLite memories and bounded local model tools; it is
+not Private Mode. No current mode streams tokens or uses a cloud model. `/look`
+still cannot load saved local files until authenticated Private Mode exists.
 
 ## Start here
 
@@ -76,6 +77,8 @@ Read these files in this order:
    design.
 15. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
    gates, and the next intentionally small milestones.
+16. [`docs/memory.md`](docs/memory.md) — the explicit unencrypted development
+   memory experiment, native tools, session history, and context trimming.
 
 ## Run it on the same laptop
 
@@ -125,6 +128,24 @@ Use the ordinary default command to enter Ephemeral Mode. It is usable while
 the lifecycle is uninitialized, locked, or recovery-required in the future;
 the current process-local implementation starts uninitialized every time.
 
+### Explicit development-memory experiment
+
+The persistent-memory work is deliberately separate from both default
+Ephemeral Mode and future authenticated Private Mode. It is an unencrypted
+development experiment intended for test data, not personal information:
+
+```bash
+cargo run -- \
+  --mode development-memory \
+  --memory-dir ./local-data/development-memory
+```
+
+The named directory is the only place this mode creates SQLite storage. The
+selected Ollama model must advertise tool calling through `/api/show`; otherwise
+startup fails before the database opens. The model may use bounded `remember`,
+`recall`, and `correct` tools, but Independence never automatically archives a
+whole conversation. Read [the memory guide](docs/memory.md) before enabling it.
+
 ## Launch command reference
 
 Run these examples from the repository root. `--mode ephemeral` is written
@@ -136,8 +157,10 @@ not available until a later authentication milestone.
 | What you want to do | Command | Model and device behavior |
 | --- | --- | --- |
 | Typed local conversation, with an optional fresh V4L2 camera still | `cargo run -- --mode ephemeral` | Uses the configured/default local Ollama model: currently `qwen3-vl:4b-instruct` unless `OLLAMA_MODEL` is set for that launch. |
+| Development-only selected memory experiment | `cargo run -- --mode development-memory --memory-dir ./local-data/development-memory` | Requires a local model whose `/api/show` metadata advertises `tools`; opens an explicitly named, unencrypted SQLite database. |
 | Transcribe only; never contact Ollama | `cargo run -- --dictate` | Uses the default or explicitly configured microphone and local Whisper. |
 | Hold-to-talk voice conversation | `cargo run -- --voice --mode ephemeral --input terminal --model qwen3-vl:4b-instruct` | Uses the terminal Enter/P/Escape controls, local Whisper, local Ollama, and Piper when configured. The default microphone and speaker are used unless selected explicitly. |
+| Voice with development memory | `cargo run -- --voice --mode development-memory --memory-dir ./local-data/development-memory --input terminal --model <tool-capable-local-model>` | Keeps the same Whisper/Ollama/Piper pipeline; tool-capable Ollama metadata is required before the database is opened. |
 
 For a specific laptop microphone or speaker, append the exact IDs reported by
 the device-list commands:
@@ -777,12 +800,18 @@ src/
   dictation/     recording-ID controller, CPAL capture, Whisper, accepted-text boundary
   see/           bounded, validated file-photo and camera-image handling
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
-  think/         Ollama /api/chat client and teacher prompt
+  think/         Ollama client, teacher prompt, native tool loop, and context manager
+    context.rs   conservative request budgeting and chronological history trimming
+    tools.rs     bounded remember/recall/correct execution harness
   speak/
     mod.rs        timestamped terminal logger and dialogue boundary
     tts.rs        local Piper CLI adapter; text in, in-memory WAV out
     playback.rs   Rodio output-device discovery and WAV playback
     worker.rs     one ordered, bounded synthesis/playback worker
+crates/
+  independence-memory/
+    src/         reusable SQLite/FTS5 selected-memory library
+    tests/       persistence, retrieval, correction, and ignored benchmark tests
 ```
 
 The controller holds the only accepted scene and conversation. Each model turn
@@ -814,11 +843,16 @@ application code.
   experiment. Its default fixture proves microphone-to-speaker plumbing but is
   not a conversational model; it does not use Whisper, Piper, a camera, or
   text conversation history.
-- Six accepted exchanges per temporary session; this is a simple context cap,
-  not exact token budgeting. Use `/reset` to clear it. Ephemeral Mode rejects
-  `/look` before it reads a local file.
-- No persistent memory, database, vector store, agent framework, plugins,
-  containers, or cloud fallback.
+- Current-session history is context-budgeted per request: Independence keeps
+  the accepted session in memory, conservatively estimates the request, and
+  removes the oldest complete exchanges from that request snapshot if needed.
+  It never removes the newest request, system guidance, or only one half of a
+  tool call/result pair. Use `/reset` to clear the session. Ephemeral Mode
+  still rejects `/look` before it reads a local file.
+- The explicit development-memory experiment uses a local SQLite/FTS5 database
+  with bounded native model tools. It is not semantic/vector retrieval,
+  automatic transcript archiving, authentication, or encrypted storage. There
+  is no generic agent framework, plugin host, container, or cloud fallback.
 - A process-local SecurityManager and Ephemeral Mode boundary exist, but there
   is no authentication, production unlock, encrypted application storage,
   recovery phrase, or encrypted backup. The cryptographic design and its
@@ -835,7 +869,44 @@ application code.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
 
-### Latest: Security Foundation and Ephemeral Mode (Milestone 6.1)
+### Latest: Native Persistent Memory, Tools, and Context Management
+
+The project now has a small reusable Rust crate,
+[`independence-memory`](crates/independence-memory/README.md), for explicitly
+selected local SQLite memories. It stores concise current memories, short
+supporting evidence, and correction history—not raw audio/images or complete
+conversation archives. SQLite FTS5 provides bounded keyword retrieval; it does
+not claim semantic search.
+
+This is enabled only by the intentionally conspicuous development command:
+
+```bash
+cargo run -- \
+  --mode development-memory \
+  --memory-dir ./local-data/development-memory
+```
+
+The directory is unencrypted test storage. Default Ephemeral Mode neither opens
+the database nor supplies memory tools to the local model; Private Mode remains
+unavailable. A selected model must advertise native Ollama `tools` support
+before the database opens.
+
+The model can ask Independence to `remember`, `recall`, or `correct`; the app
+validates each request, displays a fixed progress message before work begins,
+and returns a result to the model only after the database confirms it. Tool
+calls/results remain attached to their accepted current-session exchange, so a
+follow-up preserves its context. The tool loop is capped at four iterations and
+the controller's existing turn-ID/cancellation rule prevents stale answers or
+progress from reaching a newer turn.
+
+Every outgoing model request is prepared against an explicit runtime context
+budget. The first version uses a conservative byte-based token estimate,
+reserves output room, and removes only the oldest complete exchanges if needed.
+It preserves system instructions, the latest request, and whole tool-call/result
+sequences. [The memory guide](docs/memory.md) explains the data path, storage
+warning, commands, cancellation limit, traces, and benchmarks.
+
+### Foundation: Security Foundation and Ephemeral Mode (Milestone 6.1)
 
 Independence now has a small `SecurityManager`, but it is intentionally **not**
 a login system or cryptography implementation. It makes the current safety
@@ -1137,8 +1208,13 @@ src/
     camera.rs              V4L2 and rpicam-still one-still camera backends
 
   think/
-    mod.rs                 loopback-only Ollama /api/chat client
+    mod.rs                 loopback-only Ollama client and tool wire protocol
+    context.rs             request budgeting and complete-exchange trimming
+    tools.rs               bounded native memory-tool execution harness
     teacher.txt            editable model teaching instructions
+
+crates/
+  independence-memory/     reusable local SQLite/FTS5 memory crate
 
   speak/
     mod.rs                 tracing logger and authorized dialogue boundary
@@ -1152,8 +1228,9 @@ src/
 
 There is currently no decision model, photo-permission state, autonomous
 camera call, microphone transcription in normal typed mode, wake word,
-continuous vision, persistent memory, cloud fallback, agent/tool framework,
-speech streaming, TTS-driven turn-taking, or echo cancellation.
+continuous vision, semantic/vector retrieval, production protected memory,
+cloud fallback, generalized agent/plugin framework, speech streaming,
+TTS-driven turn-taking, or echo cancellation.
 
 ### Previous milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
 

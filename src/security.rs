@@ -48,12 +48,16 @@ impl fmt::Display for SecurityState {
 
 /// The experience currently running inside Independence.
 ///
-/// The mode is intentionally separate from [`SecurityState`].  Ephemeral Mode
+/// The mode is intentionally separate from [`SecurityState`]. Ephemeral Mode
 /// is usable while a device is uninitialized, locked, or recovery-required;
-/// Private Mode requires a future authentication result.
+/// Private Mode requires a future authentication result. Development Memory is
+/// an explicitly selected, unencrypted experiment: it grants no private-data
+/// authority and exists only so the application can exercise a persistent
+/// memory backend before the future encrypted Private Mode exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatingMode {
     Ephemeral,
+    DevelopmentMemory,
     Private,
 }
 
@@ -61,6 +65,7 @@ impl OperatingMode {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ephemeral => "ephemeral",
+            Self::DevelopmentMemory => "development-memory",
             Self::Private => "private",
         }
     }
@@ -68,9 +73,10 @@ impl OperatingMode {
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "ephemeral" => Ok(Self::Ephemeral),
+            "development-memory" => Ok(Self::DevelopmentMemory),
             "private" => Ok(Self::Private),
             _ => Err(format!(
-                "unknown operating mode `{value}`; use `ephemeral` or `private`"
+                "unknown operating mode `{value}`; use `ephemeral`, `development-memory`, or `private`"
             )),
         }
     }
@@ -184,6 +190,14 @@ struct ActiveMode {
 /// session.
 #[derive(Debug)]
 pub(crate) struct EphemeralSession {
+    id: u64,
+}
+
+/// Proof that the process explicitly selected the unencrypted development
+/// memory experiment. It grants no private-storage capability and must not be
+/// confused with an authenticated Private Mode session.
+#[derive(Debug)]
+pub(crate) struct DevelopmentMemorySession {
     id: u64,
 }
 
@@ -330,6 +344,55 @@ impl SecurityManager {
             }
             _ => Err(SecurityError::SessionMismatch {
                 operation: "end Ephemeral Mode",
+            }),
+        }
+    }
+
+    /// Starts the explicit development-only persistence experiment. Like
+    /// Ephemeral Mode, this does not alter the security lifecycle or create
+    /// private-storage authority. The caller remains responsible for making
+    /// the unencrypted data directory obvious to the person running it.
+    pub(crate) fn enter_development_memory(
+        &mut self,
+    ) -> Result<DevelopmentMemorySession, SecurityError> {
+        self.require_no_active_mode("enter Development Memory mode")?;
+        match self.state {
+            SecurityState::Uninitialized
+            | SecurityState::Locked
+            | SecurityState::RecoveryRequired => {
+                let id = self.next_id();
+                self.active_mode = Some(ActiveMode {
+                    mode: OperatingMode::DevelopmentMemory,
+                    id,
+                });
+                Ok(DevelopmentMemorySession { id })
+            }
+            SecurityState::SetupInProgress | SecurityState::Unlocked => {
+                Err(SecurityError::InvalidTransition {
+                    operation: "enter Development Memory mode",
+                    state: self.state,
+                })
+            }
+        }
+    }
+
+    /// Ends an explicit development-memory session. This revokes only the
+    /// session lease; the application drops current conversation/media buffers
+    /// and closes the ordinary SQLite connection separately.
+    pub(crate) fn end_development_memory(
+        &mut self,
+        session: DevelopmentMemorySession,
+    ) -> Result<(), SecurityError> {
+        match self.active_mode {
+            Some(ActiveMode {
+                mode: OperatingMode::DevelopmentMemory,
+                id,
+            }) if id == session.id => {
+                self.active_mode = None;
+                Ok(())
+            }
+            _ => Err(SecurityError::SessionMismatch {
+                operation: "end Development Memory mode",
             }),
         }
     }
@@ -529,6 +592,23 @@ mod tests {
         let session = recovery.enter_ephemeral().unwrap();
         assert_eq!(recovery.state(), SecurityState::RecoveryRequired);
         recovery.end_ephemeral(session).unwrap();
+    }
+
+    #[test]
+    fn development_memory_is_explicit_unauthenticated_mode_without_private_access() {
+        let mut manager = SecurityManager::new();
+        let session = manager.enter_development_memory().unwrap();
+        assert_eq!(manager.state(), SecurityState::Uninitialized);
+        assert_eq!(
+            manager.active_mode(),
+            Some(OperatingMode::DevelopmentMemory)
+        );
+        assert!(matches!(
+            manager.enter_private(),
+            Err(SecurityError::OperatingModeAlreadyActive { .. })
+        ));
+        manager.end_development_memory(session).unwrap();
+        assert_eq!(manager.active_mode(), None);
     }
 
     #[test]

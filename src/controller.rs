@@ -14,9 +14,6 @@ use crate::{
     think::ConversationTurn,
 };
 
-/// A small, explicit context cap. It is a turn cap, not token accounting.
-pub const MAX_HISTORY_TURNS: usize = 6;
-
 #[derive(Debug, Default)]
 pub struct Controller {
     mode: OperatingMode,
@@ -90,8 +87,23 @@ impl Controller {
     }
 
     pub(crate) fn new_ephemeral() -> Self {
+        Self::new_unauthenticated(OperatingMode::Ephemeral)
+    }
+
+    /// Development Memory has the same camera/file isolation as Ephemeral
+    /// Mode. Its only additional capability is the explicitly configured
+    /// external SQLite service owned by the runtime, never by the controller.
+    pub(crate) fn new_development_memory() -> Self {
+        Self::new_unauthenticated(OperatingMode::DevelopmentMemory)
+    }
+
+    fn new_unauthenticated(mode: OperatingMode) -> Self {
+        debug_assert!(matches!(
+            mode,
+            OperatingMode::Ephemeral | OperatingMode::DevelopmentMemory
+        ));
         Self {
-            mode: OperatingMode::Ephemeral,
+            mode,
             next_turn_id: 1,
             next_camera_request_id: 1,
             ..Self::default()
@@ -110,7 +122,10 @@ impl Controller {
     /// this is called. Dropping these buffers is not claimed to be secure
     /// erasure from the OS, allocator, swap, or other processes.
     pub(crate) fn clear_ephemeral_session(&mut self) {
-        debug_assert_eq!(self.mode, OperatingMode::Ephemeral);
+        debug_assert!(matches!(
+            self.mode,
+            OperatingMode::Ephemeral | OperatingMode::DevelopmentMemory
+        ));
         self.session = Session::default();
         self.active = None;
         self.pending_camera = None;
@@ -142,6 +157,7 @@ impl Controller {
             Event::CameraCaptureReady { id, source } => {
                 self.handle_camera_capture_ready(id, source)
             }
+            Event::Progress { id, progress } => self.handle_progress(id, progress),
             Event::TurnFinished(finished) => self.handle_turn_finished(finished),
             Event::AudioTurnFinished(finished) => self.handle_audio_turn_finished(finished),
         }
@@ -241,18 +257,6 @@ impl Controller {
         // A newer valid question makes an outstanding no-stream camera
         // preflight stale before it can supersede anything.
         self.pending_camera = None;
-
-        if !matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto)
-            && self.session.history.len() >= MAX_HISTORY_TURNS
-        {
-            let restart = match self.mode {
-                OperatingMode::Ephemeral => "/reset to start a new temporary session",
-                OperatingMode::Private => "/reset or /look to start a new scene",
-            };
-            return vec![Effect::Display(Output::Diagnostic(format!(
-                "this session has reached {MAX_HISTORY_TURNS} accepted exchanges; use {restart}"
-            )))];
-        }
 
         let mut effects = self.cancel_active();
         let id = TurnId::new(self.next_turn_id);
@@ -420,9 +424,17 @@ impl Controller {
             TurnResult::Failed { message } => vec![Effect::Display(Output::Diagnostic(message))],
             TurnResult::Answer {
                 answer,
+                tool_rounds,
                 proposed_scene,
-            } => self.accept_answer(active, answer, proposed_scene),
+            } => self.accept_answer(active, answer, tool_rounds, proposed_scene),
         }
+    }
+
+    fn handle_progress(&self, id: TurnId, progress: crate::protocol::ProgressEvent) -> Vec<Effect> {
+        if self.active.as_ref().map(ActiveTurn::id) != Some(id) {
+            return Vec::new();
+        }
+        vec![Effect::Display(Output::Progress(progress))]
     }
 
     fn handle_audio_turn_finished(&mut self, finished: AudioTurnFinished) -> Vec<Effect> {
@@ -453,6 +465,7 @@ impl Controller {
         &mut self,
         active: TextTurn,
         answer: String,
+        tool_rounds: Vec<crate::think::ToolRound>,
         proposed_scene: Option<Photo>,
     ) -> Vec<Effect> {
         if answer.trim().is_empty() {
@@ -483,6 +496,7 @@ impl Controller {
 
         self.session.history.push(ConversationTurn {
             user: active.question,
+            tool_rounds,
             assistant: answer.clone(),
         });
 
@@ -505,7 +519,7 @@ mod tests {
         },
     };
 
-    use super::{Controller, MAX_HISTORY_TURNS};
+    use super::Controller;
     use crate::security::OperatingMode;
 
     fn start_ask(controller: &mut Controller, question: &str) -> TurnRequest {
@@ -626,6 +640,7 @@ mod tests {
             id,
             result: TurnResult::Answer {
                 answer: answer.into(),
+                tool_rounds: Vec::new(),
                 proposed_scene: scene,
             },
         }));
@@ -651,6 +666,7 @@ mod tests {
                     id: older.id,
                     result: TurnResult::Answer {
                         answer: "old answer".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))
@@ -677,6 +693,7 @@ mod tests {
                     id: request.id,
                     result: TurnResult::Answer {
                         answer: "too late".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))
@@ -703,6 +720,7 @@ mod tests {
                     id: request.id,
                     result: TurnResult::Answer {
                         answer: "too late".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))
@@ -756,6 +774,7 @@ mod tests {
                     id: replacement.id,
                     result: TurnResult::Answer {
                         answer: "too late".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: Some(Photo::test_photo("new.png")),
                     },
                 }))
@@ -869,19 +888,41 @@ mod tests {
     }
 
     #[test]
-    fn history_limit_requires_an_explicit_new_scene_or_reset() {
+    fn controller_retains_session_history_and_leaves_token_budgeting_to_context_manager() {
         let mut controller = Controller::new();
-        for number in 0..MAX_HISTORY_TURNS {
+        for number in 0..8 {
             let request = start_ask(&mut controller, &format!("question {number}"));
             successful_answer(&mut controller, request.id, "answer", None);
         }
 
-        let effects = controller.handle(Event::Input(Input::Ask("one too many".into())));
-        assert_eq!(controller.accepted_history().len(), MAX_HISTORY_TURNS);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Display(Output::Diagnostic(message))] if message.contains("/reset to start a new temporary session")
-        ));
+        let request = start_ask(&mut controller, "a ninth exchange");
+        assert_eq!(controller.accepted_history().len(), 8);
+        assert_eq!(request.history.len(), 8);
+    }
+
+    #[test]
+    fn stale_tool_progress_is_not_displayed_for_a_newer_turn() {
+        let mut controller = Controller::new();
+        let first = start_ask(&mut controller, "first");
+        let second = start_ask(&mut controller, "second");
+
+        assert!(
+            controller
+                .handle(Event::Progress {
+                    id: first.id,
+                    progress: crate::protocol::ProgressEvent::SearchingMemory,
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            controller.handle(Event::Progress {
+                id: second.id,
+                progress: crate::protocol::ProgressEvent::SearchingMemory,
+            }),
+            vec![Effect::Display(Output::Progress(
+                crate::protocol::ProgressEvent::SearchingMemory
+            ))]
+        );
     }
 
     #[test]
@@ -913,6 +954,7 @@ mod tests {
                     id: active.id,
                     result: TurnResult::Answer {
                         answer: "still accepted".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: None,
                     },
                 }))
@@ -980,6 +1022,7 @@ mod tests {
                     id: replacement.id,
                     result: TurnResult::Answer {
                         answer: "too late".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(1))),
                     },
                 }))
@@ -1025,6 +1068,7 @@ mod tests {
                     id: request.id,
                     result: TurnResult::Answer {
                         answer: "too late".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(0))),
                     },
                 }))
@@ -1067,6 +1111,7 @@ mod tests {
                     id: camera_turn.id,
                     result: TurnResult::Answer {
                         answer: "late camera answer".into(),
+                        tool_rounds: Vec::new(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(0))),
                     },
                 }))

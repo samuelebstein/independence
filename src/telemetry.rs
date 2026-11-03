@@ -1033,6 +1033,8 @@ fn component_for(operation: &str) -> &'static str {
         || operation.contains("playback")
     {
         "speech"
+    } else if operation.contains("memory") || operation.contains("tool") {
+        "memory"
     } else if operation.contains("recording") || operation.contains("audio") {
         "audio"
     } else {
@@ -1046,6 +1048,7 @@ fn queue_wait_reason(component: &str) -> &'static str {
         "speech" => "ordered_speech_worker",
         "whisper" => "blocking_recognition_worker",
         "microphone" => "microphone_capture_start",
+        "memory" => "sqlite_connection_gate",
         _ => "application_owned_work",
     }
 }

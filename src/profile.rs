@@ -81,6 +81,14 @@ pub(crate) struct ResolvedVoiceProfile {
     pub pipeline: VoicePipeline,
     pub backend: ModelBackend,
     pub operating_mode: OperatingMode,
+    /// Present only for the explicit, unencrypted development-memory mode.
+    /// It remains a launch configuration value rather than a profile default.
+    pub memory_dir: Option<PathBuf>,
+    /// Explicitly selected runtime context capacity, if supplied. The app
+    /// otherwise uses its documented conservative fallback and sends it as
+    /// Ollama's `num_ctx` option.
+    pub context_window: Option<usize>,
+    pub reserved_output_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,6 +230,17 @@ fn resolve_with_environment(
         Some(value) => CameraBackendSelection::parse(&value)?,
         None => defaults.camera_backend,
     };
+    let operating_mode = options.mode.unwrap_or(OperatingMode::Ephemeral);
+    match (operating_mode, options.memory_dir.as_ref()) {
+        (OperatingMode::DevelopmentMemory, None) => {
+            return Err(ProfileError::MissingDevelopmentMemoryDirectory);
+        }
+        (OperatingMode::Ephemeral | OperatingMode::Private, Some(_)) => {
+            return Err(ProfileError::UnexpectedMemoryDirectory);
+        }
+        (OperatingMode::DevelopmentMemory, Some(_)) | (_, None) => {}
+    }
+
     Ok(ResolvedVoiceProfile {
         profile: options.profile,
         input,
@@ -234,7 +253,10 @@ fn resolve_with_environment(
         camera_backend,
         pipeline,
         backend,
-        operating_mode: options.mode.unwrap_or(OperatingMode::Ephemeral),
+        operating_mode,
+        memory_dir: options.memory_dir.clone(),
+        context_window: options.context_window,
+        reserved_output_tokens: options.reserved_output_tokens,
     })
 }
 
@@ -254,6 +276,14 @@ pub enum ProfileError {
     EmptyModel,
     #[error("invalid local Ollama configuration: {0}")]
     Ollama(#[source] ThinkError),
+    #[error(
+        "--mode development-memory requires --memory-dir <explicit unencrypted development directory>"
+    )]
+    MissingDevelopmentMemoryDirectory,
+    #[error(
+        "--memory-dir is allowed only with --mode development-memory; Ephemeral Mode never opens persistent memory"
+    )]
+    UnexpectedMemoryDirectory,
 }
 
 #[cfg(test)]

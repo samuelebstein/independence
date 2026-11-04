@@ -439,6 +439,11 @@ controlled race completions. It demonstrates software properties such as
 accurate, that it followed the teacher prompt, or that a visual interpretation
 is safe. Those remain reasons to inspect, verify, and improve the system.
 
+The exact purpose-response rule has a narrower automated check: it locks the
+prompt's exact ending, while existing mock-request tests use that prompt as
+their system content. Together, those tests verify Independence's request
+construction, not a selected local model's compliance with the rule.
+
 Camera tests use fake backends to cover selection, failure-before-inference,
 image-plus-question request construction, scene follow-ups, cancellation,
 and the one-worker capture gate. They do not prove that every physical V4L2

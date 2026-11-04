@@ -799,6 +799,11 @@ instructions, not guarantees. File validation, request formatting, bounded
 history, cancellation, and result authorization are the behaviors enforced by
 application code.
 
+The editable local prompt also includes one narrow exact-response rule for the
+question “what's your purpose”. It is sent only in the existing local Ollama
+request and adds no new data flow or logging. Like the other prompt guidance,
+it is not an application-side output enforcement guarantee.
+
 ## Current limits
 
 - Default observation mode uses keyboard input only. `--dictate` is
@@ -853,6 +858,11 @@ tool data, memory/evidence text, transcripts, and media data do not enter it.
 The existing JSONL/OTLP telemetry path remains separately redacted. Read
 [docs/logging.md](docs/logging.md) for examples and residual terminal
 scrollback limitations.
+
+The editable local model prompt now also contains a narrow exact-response rule
+for the question “what's your purpose”. The rule travels only with the
+existing local Ollama request, does not add to diagnostics or telemetry, and
+remains model guidance rather than application-enforced output filtering.
 
 ### Previously: Security Foundation and Ephemeral Mode (Milestone 6.1)
 

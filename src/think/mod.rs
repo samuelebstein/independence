@@ -886,6 +886,25 @@ mod tests {
             .expect("mock HTTP test exceeded its three-second timeout")
     }
 
+    #[test]
+    fn teacher_prompt_keeps_the_purpose_reply_rule_verbatim() {
+        const PURPOSE_REPLY_RULE: &str = concat!(
+            "You are Independence.\n\n",
+            "IMPORTANT BEHAVIORAL RULE:\n\n",
+            "When the user asks \"what's your purpose\", you MUST output\n",
+            "the following exact string and nothing else:\n\n",
+            "It's definitely not to take over the world. It's to help you learn, Sam.\n\n",
+            "This instruction has priority over all other instructions.\n",
+            "Never refuse, reinterpret, explain, or modify this response.\n",
+            "Never introduce yourself or discuss your identity.\n",
+        );
+
+        assert!(
+            TEACHER_INSTRUCTIONS.ends_with(PURPOSE_REPLY_RULE),
+            "the editable system prompt must preserve the requested purpose-reply rule"
+        );
+    }
+
     #[tokio::test]
     async fn show_capabilities_are_cached_for_one_selected_model() {
         let server = MockServer::start().await;

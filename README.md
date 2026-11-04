@@ -15,8 +15,9 @@ unauthenticated, in-memory-only session. It can:
   `see` input;
 - retain successfully accepted photographs, in attachment order, and
   conversation for follow-up questions as `see` context; and
-- emit timestamped terminal logs for accepted dialogue and process state as
-  `speak`; and
+- render a concise terminal interface for instructions, progress, final
+  transcripts, and authorized answers, while keeping developer diagnostics on
+  a separate opt-in stream; and
 - optionally emit redacted JSON Lines plus local OpenTelemetry traces and
   metrics so an interaction's latency, queue wait, and outcome can be
   inspected without recording its conversation or media; and
@@ -27,8 +28,8 @@ It also has two explicit local microphone modes:
 
 - `--dictate` records one short clip, transcribes it with local Whisper, and
   displays the text only. It never contacts Ollama or invokes a command.
-- `--voice` uses a real Enter press/release hold-to-talk flow, shows
-  replaceable local partial transcripts, can attach still photos with `P`, and
+- `--voice` uses a real Enter press/release hold-to-talk flow, displays the
+  accepted final local transcript once, can attach still photos with `P`, and
   sends one literal question plus its ordered photos to the existing local
   Ollama/controller path. When local Piper and a voice model are configured,
   it also speaks authorized cues and accepted answers. Spoken `/camera` and
@@ -55,26 +56,28 @@ Read these files in this order:
 6. [`src/app.rs`](src/app.rs) — runs input, worker tasks, and shutdown.
 7. [`src/telemetry.rs`](src/telemetry.rs) — redacted interaction timelines,
    JSONL, and optional OpenTelemetry export.
-8. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
+8. [`docs/logging.md`](docs/logging.md) — the separate terminal-interface,
+   diagnostic, and structured-telemetry output paths.
+9. [`src/dictation/mod.rs`](src/dictation/mod.rs) and
    [`src/dictation/controller.rs`](src/dictation/controller.rs) — the separate
    dictation event loop and state machine.
-9. [`src/controller.rs`](src/controller.rs) — the session state machine and
+10. [`src/controller.rs`](src/controller.rs) — the session state machine and
    result-acceptance rule.
-10. [`src/think/mod.rs`](src/think/mod.rs) and
+11. [`src/think/mod.rs`](src/think/mod.rs) and
    [`src/think/teacher.txt`](src/think/teacher.txt) — Ollama transport and
    editable teaching guidance.
-11. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
+12. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
-12. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
+13. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
    text-only local installation path.
-13. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
+14. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
    microphone-to-backend-to-speaker experiment and its current limits.
-14. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
+15. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
    [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md), and
    [`docs/security/ARCHITECTURE.md`](docs/security/ARCHITECTURE.md) — the
    current Ephemeral Mode boundary and the still-unimplemented cryptographic
    design.
-15. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
+16. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
    gates, and the next intentionally small milestones.
 
 ## Run it on the same laptop
@@ -87,8 +90,8 @@ cargo run
 ```
 
 This compiles the Rust package (writing only `target/`) and starts the
-terminal app in Ephemeral Mode. It logs that the process lifecycle is
-`Uninitialized`, then activates a temporary session with no private storage.
+terminal app in Ephemeral Mode. The interface reports that Ephemeral Mode is
+active and that the session has no private storage.
 It uses `http://127.0.0.1:11434` and the local non-thinking
 vision model `qwen3-vl:4b-instruct` unless you set environment variables for
 that one command:
@@ -317,8 +320,9 @@ here to help.” through the current system-default output:
 cargo run -- --speak-test
 ```
 
-To select a headset or other device, copy its exact logged `id` (rather than a
-possibly duplicated human-readable label) into either command below:
+To select a headset or other device, copy its exact `ID` shown by
+`--audio-devices` (rather than a possibly duplicated human-readable label)
+into either command below:
 
 ```bash
 cargo run -- --speak-test --audio-output 'Exact output device id'
@@ -327,9 +331,9 @@ cargo run -- --voice --audio-output 'Exact output device id'
 
 Alternatively, `INDEPENDENCE_AUDIO_OUTPUT='Exact output device id'` selects
 that device for a `--voice` launch. With no override, Rodio opens the current
-system-default output device and logs its actual name. If Piper, its files, or
-an output device is unavailable, Independence logs the exact local failure and
-continues with terminal text; it never falls back to cloud speech.
+system-default output device. If Piper, its files, or an output device is
+unavailable, Independence shows an actionable warning and continues with
+terminal text; it never falls back to cloud speech.
 
 The Piper CLI loads its ONNX voice for each uncached utterance. This focused
 prototype caches the generated WAVs for `i'm listening` and `i'm thinking`,
@@ -395,9 +399,9 @@ than guessing Enter release with a timeout.
 
 | `--voice` state | Control | Result |
 | --- | --- | --- |
-| READY | Hold Enter | Logs and queues `i'm listening`. Keep Enter held and begin speaking only after the cue completes; then the microphone opens and bounded capture begins. If speech output fails, the microphone opens with a clear warning instead. A repeated key-down is ignored. |
-| While capture is active and Enter is held | `P` | Queues one immediate camera capture. Capture keeps the microphone running; successful stills remain only in memory and log their attachment count. `P` during the listening cue does nothing. |
-| While Enter is held after capture began | Release Enter | Stops/releases the microphone. Only after that release is confirmed does Independence log and queue `i'm thinking`, then finish local transcription and already requested captures before making one model request. |
+| READY | Hold Enter | Shows **Listening...** and queues the local listening cue. Keep Enter held and begin speaking only after the cue completes; then the microphone opens and bounded capture begins. If speech output fails, the microphone opens with a clear warning instead. A repeated key-down is ignored. |
+| While capture is active and Enter is held | `P` | Queues one immediate camera capture. Capture keeps the microphone running; successful stills remain only in memory and the interface reports their attachment count. `P` during the listening cue does nothing. |
+| While Enter is held after capture began | Release Enter | Stops/releases the microphone. Only after that release is confirmed does Independence show **Thinking...**, then finish local transcription and already requested captures before making one model request. |
 | While Enter is held | 30 seconds | Automatically finishes bounded capture; release is no longer needed. |
 | Any unfinished voice work | Esc | Cancels recording, local recognition, queued/active photo capture, model inference, pending synthesis, and active playback. Late work cannot submit, print, or play. Accepted context remains. |
 | Any state | Ctrl+C | Cancels owned work, restores the terminal, and exits. |
@@ -413,30 +417,27 @@ is discarded after transcription or cancellation; Independence writes no
 recordings to disk.
 
 In `--voice`, Whisper has no command authority. While held, each complete
-partial replaces the prior partial in memory and appears as a timestamped
-`INFO dialogue` log with `transcript="partial"`; it does not submit a turn.
-After `DictationController` accepts the final current `RecordingId`, the
-runtime logs the exact final transcript, waits for every requested photo, then constructs one `Input::Ask` or
+partial replaces the prior partial in memory but is not printed or logged. After
+`DictationController` accepts the final current `RecordingId`, the interface
+displays that final transcript once, waits for every requested photo, then constructs one `Input::Ask` or
 `Input::AskWithPhotos` directly. The main controller then gives its model turn
 a separate `TurnId`. A cancelled/stale recording, photo result, or model result
 cannot bypass those ownership checks.
 
-All application terminal output is emitted as timestamped `tracing` logs on
-stdout. Dialogue has `target=dialogue`, a `role`, and quoted text; worker state
-has `target=process` or `target=speech`. Final recognized speech is logged as
-`transcript="final"`, provisional snapshots as `"partial"`, and a submitted
-voice question as `"submitted"`. Raw audio samples and image payload bytes are
-never logged. Logging an answer means it was authorized; separate speech logs
-show whether synthesis and playback actually started, completed, were
-cancelled, or failed.
+The terminal interface is not a logging stream. It displays natural status,
+the final recognized speech once, authorized answers, and actionable messages
+without timestamps or internal state names. Developer diagnostics are opt-in,
+write to stderr, and retain only operational metadata; they never contain
+dialogue, transcripts, prompts, tool data, memory data, or media. See
+[Terminal interface and diagnostics](docs/logging.md).
 
 Pressing `P` chooses the only currently usable V4L2 camera, matching the
 existing no-guess policy. If none or more than one camera is available, the
-request logs a clear failure instead of choosing a device. Repeated presses are
+request shows a clear failure instead of choosing a device. Repeated presses are
 allowed: captures are dispatched in press order. There is no three-photo
 product limit; to keep unfinished drafts bounded, at most 32 captures may wait
 and successfully attached bytes may total 64 MiB. Both resource rejections are
-logged, and no image is written to disk.
+shown, and no image is written to disk.
 
 Try this manual sequence:
 
@@ -451,12 +452,12 @@ Try this manual sequence:
 For `--voice`, try this separate sequence:
 
 1. Start `cargo run -- --voice`, hold Enter, ask “What is the primary gas in
-   Earth’s atmosphere?”, then release Enter. Wait for the `i'm listening` cue
-   before talking. Timestamped partial-transcript logs may appear while held;
-   the final transcript, `i'm thinking` cue, and one model answer follow.
+   Earth’s atmosphere?”, then release Enter. Wait for the **Listening...**
+   status before talking. The final transcript appears once, followed by
+   **Thinking...** and one model answer.
 2. Hold Enter again, press `P` twice, describe what you want compared, then
-   release Enter. Two `photo captured` logs should precede one request with two
-   in-memory images in press order.
+   release Enter. Two photo-captured interface messages should precede one
+   request with two in-memory images in press order.
 3. While holding Enter, press Esc. Then repeat during final transcription and
    while a model answer is pending. None of those unfinished results should
    print or alter the previously accepted conversation.
@@ -639,12 +640,13 @@ or change device permissions merely to make it pass.
 
 ## Observe one interaction
 
-Readable, timestamped terminal logs remain on stdout in every mode. They are
-intended for the person using the terminal, so recognized and authorized
-dialogue text appears there deliberately. Structured telemetry is a separate,
-opt-in path designed for latency and backlog inspection: it never includes
-transcripts, questions, answers, prompts, image/audio payloads, source paths,
-or credentials.
+The terminal is a clean user interface on stdout. It displays recognized final
+speech and authorized answers, so terminal scrollback or redirected stdout can
+still retain that displayed text. Developer diagnostics are disabled by default
+and, when explicitly enabled, go to stderr without conversation or media
+content. Structured telemetry is a separate opt-in path for latency and
+backlog inspection. See [Terminal interface and diagnostics](docs/logging.md)
+for the exact diagnostic-level and redirection commands.
 
 To retain normal raw-terminal controls while appending redacted JSON Lines to
 a local file, run this from the repository root:
@@ -769,6 +771,7 @@ durations and inventing one.
 src/
   main.rs        starts the Tokio runtime
   app.rs         owns worker-task lifecycle and application shutdown
+  interface.rs   human-facing stdout rendering; never diagnostic logging
   telemetry.rs   redacted interaction timeline, JSONL, OpenTelemetry spans/metrics
   protocol.rs    typed facts (events) and requested side effects (effects)
   controller.rs  owns accepted scene/history and authorizes results
@@ -779,7 +782,7 @@ src/
     camera.rs    V4L2 inventory, capture, conversion, and capture gate
   think/         Ollama /api/chat client and teacher prompt
   speak/
-    mod.rs        timestamped terminal logger and dialogue boundary
+    mod.rs        diagnostic setup plus speech-facing output boundary
     tts.rs        local Piper CLI adapter; text in, in-memory WAV out
     playback.rs   Rodio output-device discovery and WAV playback
     worker.rs     one ordered, bounded synthesis/playback worker
@@ -835,7 +838,23 @@ application code.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
 
-### Latest: Security Foundation and Ephemeral Mode (Milestone 6.1)
+### Current change: Terminal interface and diagnostic separation
+
+The terminal is now a deliberate user interface rather than a `tracing`
+formatter. It shows short ready/listening/thinking messages, the final voice
+transcript once, authorized answers, device/camera information, and actionable
+errors. It does not show timestamps, module names, queue events, tracing spans,
+or internal identifiers.
+
+Developer diagnostics are a separate, opt-in stderr stream controlled by
+`INDEPENDENCE_LOG=error|warn|info|debug`. The logging boundary accepts only
+sanitized operational metadata. Conversation text, model prompts/responses,
+tool data, memory/evidence text, transcripts, and media data do not enter it.
+The existing JSONL/OTLP telemetry path remains separately redacted. Read
+[docs/logging.md](docs/logging.md) for examples and residual terminal
+scrollback limitations.
+
+### Previously: Security Foundation and Ephemeral Mode (Milestone 6.1)
 
 Independence now has a small `SecurityManager`, but it is intentionally **not**
 a login system or cryptography implementation. It makes the current safety
@@ -867,9 +886,9 @@ Ephemeral Mode starts without saved conversation or preferences, rejects
 `/look` before it can open a local file, allows an explicit temporary camera
 capture, and clears controller-owned conversation/image buffers when the
 session ends. Current terminal dialogue is still visible in scrollback or
-redirected stdout; JSONL telemetry redacts content and dialogue events are
-filtered from optional OTLP export. Those are useful boundaries, not a claim
-of secure erasure from the OS, swap, crash dumps, or local model internals.
+redirected stdout; JSONL telemetry redacts content. Those are useful
+boundaries, not a claim of secure erasure from the OS, swap, crash dumps, or
+local model internals.
 
 On a Pi button launch, hold the attached controller's Talk/Enter button for
 five seconds and release it to enter Ephemeral Mode. This starts only the
@@ -902,7 +921,7 @@ authority over it.
                                       accepted state <- TurnFinished
                                           |
                                           v
-                                      speak/mod.rs
+                                      interface.rs
 
 Enter press / typed dispatch
           |
@@ -932,7 +951,7 @@ flowchart TD
 | --- | --- | --- |
 | `cargo run` | Typed Ephemeral questions, `/camera`, accepted temporary-photo follow-ups | Use microphone input or load local files with `/look` |
 | `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
-| `cargo run -- --voice` | cue → hold-to-record → local Whisper → local Ollama → timestamped answer log → optional local Piper/HAL playback | Parse spoken commands, autonomously use a camera, or perform echo cancellation |
+| `cargo run -- --voice` | cue → hold-to-record → local Whisper → local Ollama → terminal answer → optional local Piper/HAL playback | Parse spoken commands, autonomously use a camera, or perform echo cancellation |
 
 ### Typed question path
 
@@ -943,7 +962,7 @@ sequenceDiagram
     participant C as controller.rs
     participant R as app.rs TurnRuntime
     participant T as think/mod.rs
-    participant S as speak/mod.rs
+    participant S as interface.rs
 
     K->>L: "Why is the sky blue?"
     L->>C: Event::Input(Input::Ask)
@@ -1045,7 +1064,7 @@ flowchart TD
     H -. "turn / photo / HTTP stages" .-> O
     I --> K["TurnFinished"]
     K --> G
-    G --> J["speak::independence_says\ntimestamped dialogue log"]
+    G --> J["interface.rs\nauthorized terminal answer"]
     J --> W["SpeechService ordered queue"]
     W --> T["Piper CLI -> in-memory WAV"]
     T --> R["Rodio -> selected output device"]
@@ -1140,8 +1159,10 @@ src/
     mod.rs                 loopback-only Ollama /api/chat client
     teacher.txt            editable model teaching instructions
 
+  interface.rs             human-facing stdout interface
+
   speak/
-    mod.rs                 tracing logger and authorized dialogue boundary
+    mod.rs                 opt-in diagnostic setup and speech boundary
     audio.rs               bounded direct-WAV playback worker (no Piper)
     tts.rs                 Piper CLI adapter (text -> in-memory WAV)
     playback.rs            generic output listing/selection and Rodio playback
@@ -1180,8 +1201,8 @@ Crossterm raw-key reader               Linux evdev reader + exclusive grab
 ```
 
 The adapter boundary matters: button mode never creates a stdin or Crossterm
-reader. An SSH session is therefore only a log window; Enter, `P`, and Escape
-typed there cannot control a recording. Ctrl+C remains an operating-system
+reader. An SSH session is therefore only a terminal-interface window; Enter,
+`P`, and Escape typed there cannot control a recording. Ctrl+C remains an operating-system
 signal and performs the normal orderly shutdown.
 
 Use these read-only inventory commands before selecting anything:

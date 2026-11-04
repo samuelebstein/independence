@@ -1,9 +1,9 @@
 //! Privacy-preserving observability for Independence.
 //!
-//! Terminal dialogue remains a readable `tracing` stream. This module is a
-//! separate path for redacted machine-readable records, OpenTelemetry spans,
-//! and metrics. It deliberately accepts identifiers, sizes, durations, and
-//! outcomes rather than transcripts, answers, audio, image bytes, or prompts.
+//! The terminal interface is separate from `tracing`. This module produces
+//! redacted machine-readable records, OpenTelemetry spans, and metrics. It
+//! deliberately accepts identifiers, sizes, durations, and outcomes rather
+//! than transcripts, answers, audio, image bytes, prompts, or tool data.
 
 use std::{
     collections::BTreeMap,
@@ -115,8 +115,11 @@ pub fn initialize() -> TelemetryRuntime {
 impl TelemetryRuntime {
     /// Emits startup diagnostics only after the normal terminal logger exists.
     pub fn report_startup(&mut self) {
-        for warning_message in self.startup_warnings.drain(..) {
-            warn!(target: "telemetry", event = "startup_warning", detail = %warning_message, "telemetry");
+        for _warning_message in self.startup_warnings.drain(..) {
+            // Startup warnings can originate in an external exporter. Keep
+            // their raw wording out of every diagnostic destination; the
+            // event name is enough to find the relevant configuration path.
+            warn!(target: "telemetry", event = "startup_warning", warning_class = "configuration", "telemetry");
         }
         let exporter = if otlp_endpoint_configured() {
             "configured"
@@ -159,11 +162,11 @@ impl TelemetryRuntime {
             );
         }
 
-        if let Err(error) = self
+        if let Err(_error) = self
             .tracer_provider
             .shutdown_with_timeout(TELEMETRY_SHUTDOWN_TIMEOUT)
         {
-            warn!(target: "telemetry", event = "trace_flush_failed", error = %error, "telemetry");
+            warn!(target: "telemetry", event = "trace_flush_failed", failure_class = "tracer_shutdown", "telemetry");
         }
 
         // The SDK's metric provider does not expose a timeout-aware shutdown
@@ -180,8 +183,8 @@ impl TelemetryRuntime {
             });
         match done_receiver.recv_timeout(TELEMETRY_SHUTDOWN_TIMEOUT) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                warn!(target: "telemetry", event = "metric_flush_failed", error = %error, "telemetry")
+            Ok(Err(_error)) => {
+                warn!(target: "telemetry", event = "metric_flush_failed", failure_class = "metric_shutdown", "telemetry")
             }
             Err(_) => warn!(target: "telemetry", event = "metric_flush_timed_out", "telemetry"),
         }
@@ -1269,25 +1272,51 @@ fn redact_fields(mut fields: Fields) -> Fields {
             || key.contains("answer")
             || key.contains("prompt")
             || key.contains("content")
+            || key.contains("response")
+            || key.contains("detail")
+            || key.contains("error")
+            || key.contains("message")
+            || key == "reason"
+            || key.contains("tool_argument")
+            || key.contains("tool_result")
+            || key.contains("memory_content")
+            || key.contains("retrieved_memory")
+            || key.contains("evidence")
+            || key.contains("image_description")
+            || key.contains("visual_description")
+            || key.contains("description")
             || key.contains("image_payload")
             || key.contains("audio_payload")
             || key.contains("recording_bytes")
+            || key.contains("payload")
+            || key.contains("media")
             || key.contains("credential")
             || key.contains("secret")
-            || key.ends_with("_path");
+            || key.contains("token")
+            || key.contains("passphrase")
+            || key.contains("mnemonic")
+            || key.contains("recovery")
+            || key.contains("authorization")
+            || key.contains("cookie")
+            || key.contains("path")
+            || key.contains("query");
         if sensitive {
             return false;
         }
         // Long opaque strings are more likely to be dialogue or server
         // diagnostics than a bounded operational label.
-        value.as_str().is_none_or(|string| string.len() <= 256)
+        match value {
+            Value::String(string) => string.len() <= 256,
+            Value::Null | Value::Bool(_) | Value::Number(_) => true,
+            Value::Array(_) | Value::Object(_) => false,
+        }
     });
     fields
 }
 
 /// Mirrors scalar, already-redacted JSON attributes onto an OpenTelemetry span.
-/// Arrays and objects remain in JSONL only: forcing them into strings would
-/// make the trace schema less queryable and risks accidental content capture.
+/// The redaction boundary rejects arrays and objects before either telemetry
+/// destination so structured values cannot accidentally carry private text.
 fn set_span_attributes(span: &Span, fields: &Fields) {
     for (key, value) in fields {
         match value {
@@ -1366,12 +1395,33 @@ mod tests {
             ("model", json!("qwen3-vl:4b-instruct")),
             ("transcript", json!("private words")),
             ("image_payload", json!("not exported")),
+            ("tool_arguments", json!("TOOL_ARGUMENTS_SENTINEL_1e4b")),
+            ("tool_result", json!("TOOL_RESULT_SENTINEL_62c9")),
+            ("memory_content", json!("MEMORY_CONTENT_SENTINEL_5f8a")),
+            ("evidence_excerpt", json!("EVIDENCE_SENTINEL_31de")),
+            ("message", json!("MESSAGE_SENTINEL_8b0f")),
+            ("reason", json!("RAW_REASON_SENTINEL_42a1")),
+            ("wait_reason", json!("ordered_speech_worker")),
+            ("model_response", json!("MODEL_RESPONSE_SENTINEL_6c73")),
+            (
+                "structured_value",
+                json!({ "content": "NESTED_SENTINEL_28fa" }),
+            ),
             ("encoded_image_bytes", json!(1_024)),
         ]));
         assert_eq!(fields["model"], "qwen3-vl:4b-instruct");
         assert_eq!(fields["encoded_image_bytes"], 1_024);
+        assert_eq!(fields["wait_reason"], "ordered_speech_worker");
         assert!(!fields.contains_key("transcript"));
         assert!(!fields.contains_key("image_payload"));
+        assert!(!fields.contains_key("tool_arguments"));
+        assert!(!fields.contains_key("tool_result"));
+        assert!(!fields.contains_key("memory_content"));
+        assert!(!fields.contains_key("evidence_excerpt"));
+        assert!(!fields.contains_key("message"));
+        assert!(!fields.contains_key("reason"));
+        assert!(!fields.contains_key("model_response"));
+        assert!(!fields.contains_key("structured_value"));
     }
 
     #[test]

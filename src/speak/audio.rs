@@ -182,10 +182,10 @@ impl DirectPlaybackService {
                         device_id = %player.device_id(),
                         "direct audio playback"
                     ),
-                    Err(error) => warn!(
+                    Err(_error) => warn!(
                         target: "speech",
                         event = "direct_audio_output_unavailable",
-                        error = %error,
+                        failure_class = "output_device_unavailable",
                         "direct audio responses will be reported but cannot play"
                     ),
                 }
@@ -332,7 +332,7 @@ where
             }
             DirectPlaybackOutcome::Cancelled
         }
-        Err(error) => {
+        Err(_error) => {
             if let Some(stage) = stage {
                 stage.finish(
                     "failed",
@@ -347,7 +347,7 @@ where
                 event = "direct_audio_playback_failed",
                 playback_id = request.id.value(),
                 turn_id = request.turn_id.value(),
-                error = %error,
+                failure_class = "output_device_failure",
                 "direct audio playback"
             );
             DirectPlaybackOutcome::Failed

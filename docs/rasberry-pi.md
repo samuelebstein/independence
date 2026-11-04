@@ -244,7 +244,7 @@ with `/quit`.
 
 This section is an additional voice-and-camera path. It does not replace the
 text-only run above. The one Independence executable still owns the same
-controller, accepted history, cancellation rules, and terminal logs.
+controller, accepted history, cancellation rules, and terminal interface.
 It describes the hardware-adapter source changes after the reported `156c506`
 text-only baseline; it is not a claim that those adapters existed or were
 hardware-tested at that recorded revision.
@@ -282,7 +282,7 @@ unstable `/dev/input/eventN` number.
 
 The second command lists CPAL microphone identifiers/names without starting a
 recording. The third lists Rodio/CPAL output identifiers without opening a
-speaker stream. Copy an exact logged `id` when selecting a USB microphone or
+speaker stream. Copy an exact `ID` shown by the device-list command when selecting a USB microphone or
 speaker; Independence accepts either CPAL's exact input ID or its exact name
 for `INDEPENDENCE_MICROPHONE`, but the ID is less ambiguous.
 
@@ -360,7 +360,7 @@ backend-neutral model name and takes precedence over the compatible legacy
 
 Milestone 6.1 makes this launch an unauthenticated **Ephemeral Mode** session.
 Before the normal voice runtime starts, hold the attached keyboard's Enter key
-for five seconds and release it. The terminal/SSH log confirms entry; no
+for five seconds and release it. The terminal/SSH interface confirms entry; no
 microphone, camera, Ollama, Whisper, or Piper resource was opened by that
 entry gate. Press Enter again to make the normal hold-to-talk recording. This
 is a deliberate physical entry gesture, not authentication. `--mode private`
@@ -369,7 +369,7 @@ is currently rejected because PIN/recovery authentication is not implemented.
 In this mode Independence starts **no** stdin reader and enables **no**
 Crossterm raw-key reader. Enter, `P`, and Escape typed in the SSH terminal do
 nothing to recording, photos, submission, or cancellation. The SSH terminal
-still displays timestamped logs, and Ctrl+C/SIGINT still performs orderly
+still displays the user-facing interface, and Ctrl+C/SIGINT still performs orderly
 shutdown.
 
 When the selected keyboard starts, Independence exclusively grabs its evdev
@@ -399,7 +399,7 @@ INDEPENDENCE_MICROPHONE='Exact CPAL input id' \
 
 The first command needs the local `ggml-base.en.bin` file; the second needs the
 Piper executable plus the HAL ONNX/config pair. If either is missing,
-Independence keeps terminal logging usable and reports the local failure. These
+Independence keeps the terminal interface usable and reports the local failure. These
 commands do not prove that a particular USB device is suitable until you speak
 or listen through it on the Pi.
 
@@ -462,12 +462,12 @@ decision through `/api/show`.
 ### End-to-end physical acceptance test
 
 After the independent checks pass, launch the button command over SSH. Type
-Enter, `P`, and Escape into the SSH terminal first: logs should not show any
+Enter, `P`, and Escape into the SSH terminal first: the interface should not show any
 interaction change. Then, on the physically attached keyboard:
 
-1. Hold Enter for five seconds and release it. Confirm the logged Ephemeral
+1. Hold Enter for five seconds and release it. Confirm the Ephemeral
    Mode entry. No microphone/listening cue should have started yet.
-2. Hold Enter again and wait for the logged/listening cue; recording starts
+2. Hold Enter again and wait for the **Listening...** cue; recording starts
    only after that cue completes.
 3. While still holding Enter, press `P` once. With a verified vision model,
    one still is requested; with `gemma3:1b`, the app reports text-only support

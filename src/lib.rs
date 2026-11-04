@@ -2,6 +2,7 @@ pub mod app;
 pub mod audio_to_audio;
 pub mod controller;
 pub mod dictation;
+pub mod interface;
 pub mod launch;
 pub mod listen;
 pub mod profile;

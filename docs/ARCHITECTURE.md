@@ -7,7 +7,7 @@ the future encryption/authentication design in
 
 ## Entry points and modes
 
-`src/main.rs` initializes telemetry and terminal logging, parses arguments in
+`src/main.rs` initializes telemetry and the opt-in diagnostic subscriber, parses arguments in
 `src/launch.rs`, then starts exactly one application mode.
 
 | Invocation | Entry function | Current purpose | Does not do |
@@ -141,13 +141,20 @@ An SSH tunnel can make a remote owner-controlled Ollama server appear on a
 local loopback port, but it is still a connection to another machine. There is
 no cloud fallback in the application.
 
-## Speak: terminal output and optional local audio
+## Terminal interface, diagnostics, and optional local audio
 
-`src/speak/mod.rs` configures timestamped `tracing` output so raw-key terminal
-mode remains readable. Authorized dialogue is logged there before optional
-speech playback. This means final transcripts and answers are intentionally
-visible in terminal scrollback and any output redirection; this is an important
-current privacy boundary.
+`src/interface.rs` owns all human-facing stdout rendering. It writes concise
+status, instructions, final transcripts, authorized answers, device/camera
+lists, and actionable errors without timestamps, log levels, IDs, or tracing
+detail. Its raw-mode-safe writer flushes each message. Final transcripts and
+answers are intentionally visible in terminal scrollback and redirected stdout;
+that remains an important privacy boundary.
+
+`src/speak/mod.rs` configures a separate opt-in diagnostic subscriber. It
+writes sanitized operational metadata to stderr only when
+`INDEPENDENCE_LOG=error|warn|info|debug` is selected. It has no dialogue
+target and does not receive text, prompts, responses, transcripts, tool data,
+memory contents, or media. See [logging.md](logging.md).
 
 In voice mode, `src/speak/worker.rs` owns one bounded, ordered synthesis and
 playback queue. It tags work with a generation and `TurnId`/draft owner so stale
@@ -163,11 +170,10 @@ cancellation: a speaker can be heard by a microphone.
 assigned a `TurnId`. It can write redacted JSON Lines when
 `INDEPENDENCE_TELEMETRY_JSONL` is set and can export OpenTelemetry only when an
 OTLP endpoint is explicitly configured. Its intended schema omits transcript,
-prompt, answer, image, audio, credential, and path fields. `src/speak/mod.rs`
-also filters its `dialogue` tracing target from OTLP; terminal dialogue remains
-terminal-only. Redaction/filtering is defense in depth, not a substitute for
-an encrypted private store. Telemetry files are optional and are not currently
-encrypted or rotated by the application.
+prompt, answer, image, audio, credential, and path fields. Redaction/filtering
+is defense in depth, not a substitute for an encrypted private store. Telemetry
+files are optional and are not currently encrypted or rotated by the
+application.
 
 Current data lifetime:
 
@@ -178,8 +184,9 @@ Current data lifetime:
 | `/look` source | No production Ephemeral Mode access | File loading is blocked before I/O; future Private Mode is not implemented |
 | Camera still | Process memory | App does not save it, but the model request contains its bytes |
 | Whisper/Piper/Ollama model artifacts | User-managed `local-data` or external runtime locations | Not application-owned private data storage |
-| Terminal logs | Terminal scrollback/stdout/redirection | Current dialogue text is deliberately shown and can be retained outside app control |
-| Optional JSONL/OTLP telemetry | Explicitly configured destination | Application redacts/filter dialogue, but files/exporters are not encrypted or retention-managed by the app |
+| Terminal interface | Terminal scrollback/stdout/redirection | Current dialogue text is deliberately shown and can be retained outside app control |
+| Opt-in diagnostics | stderr or a developer-selected redirected file | Contains operational metadata only; it is not an archive of dialogue |
+| Optional JSONL/OTLP telemetry | Explicitly configured destination | Application redacts content, but files/exporters are not encrypted or retention-managed by the app |
 
 This is why the security milestone does **not** describe the current system as
 locked or encrypted. See [security/THREAT_MODEL.md](security/THREAT_MODEL.md).

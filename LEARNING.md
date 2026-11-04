@@ -124,7 +124,7 @@ controller first authorizes `Output::Answer`, then `OutputMode::Voice` in
 
 ```text
 accepted Output::Answer(text)
-  -> speak::independence_says(text)       timestamped terminal log now
+  -> interface::answer(text)               human-facing terminal output
   -> SpeechHandle::say(TurnId, text)      bounded async queue
   -> PiperCli::synthesize(text)           local subprocess, WAV stays in memory
   -> RodioPlayback::play(WAV)              selected output device
@@ -208,12 +208,14 @@ the duration is positive. A non-streaming request has no truthful first-token
 latency, and the local API does not expose a server queue depth, so both are
 reported unavailable rather than inferred by subtraction.
 
-The readable terminal logger and structured output are intentionally separate.
-The logger shows recognized/authorized dialogue on stdout. Set
-`INDEPENDENCE_TELEMETRY_JSONL` to opt into a bounded background JSONL writer;
-set standard `OTEL_EXPORTER_OTLP_*` endpoint variables only when an OTLP
-collector is deliberately available. See README's “Observe one interaction”
-section for exact commands, fields, a synthetic trace, and privacy limits.
+The terminal interface, diagnostics, and structured telemetry are intentionally
+separate. `interface.rs` shows recognized final speech and authorized answers
+on stdout. Diagnostics are disabled by default; a developer can use
+`INDEPENDENCE_LOG=error|warn|info|debug` to send sanitized operational metadata
+to stderr. Set `INDEPENDENCE_TELEMETRY_JSONL` to opt into a bounded background
+JSONL writer; set standard `OTEL_EXPORTER_OTLP_*` endpoint variables only when
+an OTLP collector is deliberately available. See [docs/logging.md](docs/logging.md)
+for exact commands and privacy limits.
 
 ## Why the controller owns state
 
@@ -263,10 +265,10 @@ press to `HoldStart`, Enter release to `HoldEnd`, and distinct `P` presses to
 photo requests; repeats are ignored. If the terminal cannot report event
 types, voice mode fails rather than using a release timeout. Its short poll
 interval lets shutdown join the thread before the raw-mode guard restores
-normal terminal settings. `--voice` uses raw-mode-safe output for model
-answers too; the shared `tracing` writer flushes timestamped logs to stdout
-with CRLF handling instead of assuming ordinary `println!` behaves correctly
-while raw mode is active.
+normal terminal settings. `--voice` uses the raw-mode-safe interface writer
+for model answers and status text. It writes CRLF and flushes each message
+instead of assuming ordinary `println!` behaves correctly while raw mode is
+active.
 
 ### Ownership snapshots and `Arc`
 
@@ -414,13 +416,13 @@ cargo run -- --speak-test
 
 The first command only lists outputs. The second deliberately speaks one fixed
 sentence through the system-default device. It is the real speaker check and
-does not open a microphone, contact Ollama, or capture a photo. If the log
-names a different desired output, rerun it with `--audio-output 'Exact id'`.
+does not open a microphone, contact Ollama, or capture a photo. If the device
+list names a different desired output, rerun it with `--audio-output 'Exact id'`.
 
-For `--voice`, hold Enter and wait for `i'm listening` before asking “What is
+For `--voice`, hold Enter and wait for **Listening...** before asking “What is
 the primary gas in Earth's atmosphere?”; then release Enter. The microphone is
-not open during that cue. Partial log lines may appear before the final
-transcript, `i'm thinking`, and the text answer. Repeat while pressing `P`
+not open during that cue. The final transcript appears once, followed by
+**Thinking...** and the text answer. Repeat while pressing `P`
 twice after capture begins and before release to attach two stills in press
 order. While an answer is pending, hold Enter again: its old model result and
 old speech must become ineligible. Press Esc during the listening cue, a held
@@ -692,8 +694,8 @@ has none to send.
 Ephemeral Mode's most visible data-isolation choice is `/look`: it is rejected
 before it opens a local path. An explicit fresh `/camera` still works and
 remains in memory only. Terminal transcript/answer output remains visible to
-the person using the terminal; it is not forwarded through the OpenTelemetry
-tracing layer, and JSONL telemetry keeps its existing redaction rules.
+the person using the terminal; diagnostics and JSONL telemetry keep their
+separate content-redaction boundaries.
 
 On the Raspberry Pi button profile, the existing Talk/Enter evdev input is a
 physical entry gesture: hold for five seconds and release before the normal

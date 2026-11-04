@@ -26,6 +26,7 @@ use crate::{
         audio::CpalRecorder,
         transcribe::{Transcriber, TranscriptionError, WhisperTranscriber},
     },
+    interface,
     launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline},
     listen::{
         self,
@@ -293,7 +294,13 @@ pub fn list_audio_inputs() -> Result<(), AppError> {
         );
         return Ok(());
     }
-    speak::process("audio_input_list", format!("{} device(s)", devices.len()));
+    interface::audio_inputs(
+        &devices
+            .iter()
+            .map(|device| (device.id.clone(), device.name.clone(), device.is_default))
+            .collect::<Vec<_>>(),
+    );
+    info!(target: "process", event = "audio_input_listed", count = devices.len(), "audio input devices listed");
     for device in devices {
         info!(
             target: "process",
@@ -319,7 +326,33 @@ pub fn list_input_devices() -> Result<(), AppError> {
         );
         return Ok(());
     }
-    speak::process("input_device_list", format!("{} node(s)", devices.len()));
+    let interface_lines = devices
+        .iter()
+        .map(|device| match device.access_error.as_ref() {
+            Some(_) => format!(
+                "- {} — unavailable (check device permissions)",
+                device.path.display()
+            ),
+            None => {
+                let controls = device.controls.expect("open device has controls");
+                let name = device.name.as_deref().unwrap_or("unnamed device");
+                format!(
+                    "- {} — {name}; ENTER: {}, P: {}, ESC: {}{}",
+                    device.path.display(),
+                    if controls.enter { "yes" } else { "no" },
+                    if controls.photo { "yes" } else { "no" },
+                    if controls.cancel { "yes" } else { "no" },
+                    if device.supports_controller() {
+                        " (button-controller compatible)"
+                    } else {
+                        ""
+                    }
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    interface::input_devices(&interface_lines);
+    info!(target: "process", event = "input_device_listed", count = devices.len(), "Linux input devices listed");
     for device in devices {
         match device.access_error {
             Some(error) => speak::warning(
@@ -960,6 +993,9 @@ impl TurnRuntime {
                 .await;
             return;
         }
+        // A model request has been authorized and is about to begin. This is
+        // deliberately user-interface state, not a tracing message.
+        interface::status("Thinking...");
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let client = self.client.clone();
@@ -1560,7 +1596,7 @@ impl VoiceRuntime {
             // `AcceptedTranscript` below provides the exact, one-time final
             // transcript log. Avoid printing it once here and once there.
             DictationOutput::Transcript(_) => {}
-            DictationOutput::Diagnostic(message) => speak::voice_log(&message),
+            DictationOutput::Diagnostic(message) => speak::warning("dictation", message),
         }
     }
 
@@ -1611,7 +1647,10 @@ impl VoiceRuntime {
     /// remains the only source of model answers; this helper is used only for
     /// fixed interaction cues owned by this runtime.
     fn say(&self, owner: speak::SpeechOwner, text: &'static str) -> Option<speak::UtteranceId> {
-        speak::independence_says(text);
+        // Fixed voice cues are interface status, not assistant dialogue and
+        // never diagnostic content. Accepted model answers still use the
+        // distinct controller-authorized answer path.
+        speak::voice_cue(text);
         let interaction = match owner {
             speak::SpeechOwner::Draft(draft_id) => self
                 .draft

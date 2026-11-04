@@ -196,8 +196,9 @@ compatibility result; use `--backend fixture` for the plumbing proof.
 - There is at most one active controller-authorized direct-audio request and a
   bounded one-item direct playback queue. Escape and a new talk press
   invalidate old output before it can be accepted for playback.
-- Logs and telemetry record IDs, format/count/byte sizes, and outcomes—not raw
-  audio samples, transcript text, image payloads, or model prompts.
+- Opt-in diagnostics and telemetry record IDs, format/count/byte sizes, and
+  outcomes—not raw audio samples, transcript text, image payloads, or model
+  prompts.
 
 ## Real audio-to-audio backend status
 

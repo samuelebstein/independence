@@ -43,10 +43,10 @@ storage boundary:
 - Typed and spoken input are not passed through a shell. A spoken slash command
   remains question text.
 - Optional JSONL telemetry is redacted and OTLP is only enabled by explicit
-  configuration (`src/telemetry.rs`). `src/speak/mod.rs` additionally filters
-  terminal `dialogue` events from OTLP. Terminal dialogue logging is
-  intentionally different: it includes recognized text and answers in terminal
-  scrollback/stdout.
+  configuration (`src/telemetry.rs`). Conversation text now enters neither the
+  diagnostic nor telemetry paths. The terminal interface intentionally shows
+  recognized final text and answers on stdout, so terminal scrollback and
+  redirection remain exposure boundaries.
 
 There is currently no PIN, recovery phrase, master key, encrypted database,
 persistent lock/unlock state, secure enclave integration, encrypted backup, or
@@ -187,7 +187,7 @@ it is not implemented by this document.
 | Compromised OS/kernel/firmware | Read memory and intercept I/O | DEK, PIN, phrase, live media | None | Document as out of app scope; optional verified boot/TPM/layered OS hardening per device | Still cannot trust an unlocked compromised system |
 | Dependency/model supply chain | Backdoored crate, package, model, Piper/Ollama binary, build artifact | All assets and correctness | Cargo.lock pins resolution; no reproducible-build policy yet | Dependency review, advisory scanning, provenance/SBOM plan, pinned hashes/releases, reproducible-build path | Review cannot prove absence of compromise |
 | Physical observation/listening | See words on screen/paper; hear recovery words or speaker echo; plug input device | Recovery phrase, PIN, transcript, photo context | Explicit capture and current no persistent audio | Private ceremony UX, mute output, no general ASR, no phrase display logging, safe physical controls | Shoulder surfing, hidden cameras, acoustic leakage remain |
-| Logs/debug/telemetry/model exposure | Read scrollback, redirected stdout, JSONL, OTLP, crash report, model request | Transcript, answer, media metadata, PIN/recovery phrase | Telemetry redaction; terminal dialogue currently plaintext | Secret-safe types, no debug/display, logging policy, encrypted or opt-in logs, no secrets in model path | Existing terminal logs already expose dialogue; third-party process logs remain |
+| Logs/debug/telemetry/model exposure | Read scrollback, redirected stdout, stderr diagnostics, JSONL, OTLP, crash report, model request | Transcript, answer, media metadata, PIN/recovery phrase | Terminal interface plaintext; diagnostics/telemetry redact conversation content | Secret-safe types, no debug/display, logging policy, encrypted or opt-in logs, no secrets in model path | Terminal interface scrollback still exposes dialogue; third-party process logs remain |
 | Unauthorized backup access | Copy/cloud-sync/export backup | Ciphertext, recovery envelope, metadata | No backup feature yet | AEAD backup format, no plaintext DEK/phrase, versioned manifest, restore authentication | Phrase theft plus backup decrypts by design; metadata leakage must be minimized |
 | Tamper/rollback/corruption | Modify/delete old ciphertext/envelopes/backup | Integrity and availability | Model/camera validation only | AEAD, authenticated metadata, atomic writes, backup version/rollback policy | Availability cannot be guaranteed; rollback detection needs a trusted monotonic anchor or user-visible policy |
 | Peripheral/input attack | Malicious keyboard/camera/audio USB or evdev injection | Controls, privacy, availability | Explicit device selection and exclusive evdev grab | Permission scoping, input validation, indicator/lock policy, physical-device guidance | A malicious USB device can emulate a trusted device; no hardware attestation today |

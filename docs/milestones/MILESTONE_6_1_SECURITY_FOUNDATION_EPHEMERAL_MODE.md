@@ -36,9 +36,9 @@ of accessing personal data.
   could expose a saved personal photo or file. Explicit `/camera` still works:
   it captures one fresh temporary still only after the existing user action and
   model-capability checks.
-- Optional OTLP export filters terminal dialogue events. JSONL telemetry keeps
-  its existing redaction path. Terminal dialogue remains intentionally visible
-  to the person using the terminal.
+- Optional JSONL/OTLP telemetry keeps its existing redaction path. The terminal
+  interface intentionally displays final dialogue to the person using the
+  terminal, while opt-in diagnostics do not receive conversation content.
 
 ## Explicitly excluded work
 
@@ -123,7 +123,7 @@ speech, and Ollama components. It verifies:
 - typed/controller, voice, camera, cancellation, stale-result, and speech
   regressions using the existing mocks;
 - evdev key mapping/repeat suppression plus synthetic button routing;
-- telemetry redaction and the terminal-only dialogue exporter filter.
+- telemetry redaction and the separate terminal-interface/diagnostic boundary.
 
 No automated test opens a real microphone/camera, runs Piper/Whisper, sends a
 request to a live Ollama server, or reads a real Pi button device.

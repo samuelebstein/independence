@@ -403,8 +403,8 @@ the future lifecycle UX.
 
 The recovery phrase needs a different interaction boundary from ordinary voice
 dictation. The current DictationSession intentionally displays recognized text
-and ordinary terminal logging records it. That path is not allowed to process a
-recovery phrase.
+through the terminal interface. That path is not allowed to process a recovery
+phrase.
 
 ### Agreed ceremony requirements
 
@@ -421,14 +421,14 @@ recovery phrase.
 1. Before displaying words, show the exact recovery warning in the threat
    model and explain that the phrase is the second path to the same data.
 2. Disable camera capture, normal conversation, Ollama requests, Piper output,
-   ordinary transcript display, and terminal dialogue logging for the ceremony.
+   ordinary transcript display, and terminal interface rendering for the ceremony.
 3. Generate the mnemonic locally. Display exactly one numbered word at a time.
    Do not spell it through a speaker, copy it to the clipboard, print it to
    stdout, or write it to a screenshot-friendly log.
 4. For “next”, use an isolated control-only input boundary that yields only an
    enum such as Next, Pause, Cancel, or NoMatch. It discards raw audio and
-   partial/final words immediately. It must not reuse current ordinary
-   DictationSession logging until that path has been specifically redesigned and
+   partial/final words immediately. It must not reuse the current ordinary
+   DictationSession display path until that path has been specifically redesigned and
    tested for phrase safety.
 5. For verification, ask for selected word positions using a private typed or
    physical-button selector by default. Do **not** ask the person to speak the

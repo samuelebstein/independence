@@ -297,7 +297,7 @@ impl SpeechService {
                         );
                         SystemPlayback::Ready(playback)
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         telemetry::run_event(
                             "speech.output.initialize",
                             "unavailable",
@@ -306,10 +306,10 @@ impl SpeechService {
                         warn!(
                             target: "speech",
                             event = "output_unavailable",
-                            error = %error,
+                            failure_class = "output_device_unavailable",
                             "terminal dialogue will continue without audio"
                         );
-                        SystemPlayback::Unavailable(error)
+                        SystemPlayback::Unavailable(_error)
                     }
                 };
                 worker_loop_with_metrics(
@@ -585,7 +585,7 @@ fn process_request<S, P>(
             );
             return;
         }
-        Err(error) => {
+        Err(_error) => {
             if let Some(stage) = synthesis {
                 stage.finish(
                     "failed",
@@ -596,7 +596,7 @@ fn process_request<S, P>(
                 target: "speech",
                 event = "synthesis_failed",
                 utterance_id = request.utterance_id.value(),
-                error = %error,
+                failure_class = "synthesis_failure",
                 owner = ?request.owner,
                 "speech"
             );
@@ -690,7 +690,7 @@ fn process_request<S, P>(
                 queue_metrics.active_work.as_ref(),
             );
         }
-        Err(error) => {
+        Err(_error) => {
             if let Some(stage) = playback_stage {
                 stage.finish(
                     "failed",
@@ -704,7 +704,7 @@ fn process_request<S, P>(
                 target: "speech",
                 event = "playback_failed",
                 utterance_id = request.utterance_id.value(),
-                error = %error,
+                failure_class = "output_device_failure",
                 owner = ?request.owner,
                 "terminal dialogue remains available"
             );

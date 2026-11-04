@@ -21,6 +21,22 @@ the second, much harder and much more lucrative cyber attack is to steal informa
 
 getting inside is much harder than attack from outside. the first scenario was akin to throwing a fishing pole into a lake and hoping you get a fish. the second is like jumping into a lake where you cant miss if you have knife. there are so many fish inside the lake, you're just trying to figure out what you want to catch. getting in is extremely hard but causing a fucking shitstorm while you're in and getting out are both pretty easy. . but while you're in there is like jumping into the lake with a grenade 
 
-the protections _within_ a company are much worse than the protection around. its similar to a massive wall around a castle. it might be hard to get over but once you're inside you just have to convince the right person to let you walk around 
+the protections _within_ a company are much worse than the protection around. its similar to a massive wall around a castle. it might be hard to get over but once you're inside you just have to convince the doorman wiht a $30 to eat at the huge feast. the right person to let you walk around .
+
+
+ai models are much better at getting _in_ than humans. and once they're _in_, they can wreak all kinds of havic. think about your vibe coded project. if you're not specific enough about what you meant, you're never going to understand the changes it made. and even if you think you did a good job prompting it, it will wiggle free and do somethign ridiculous! "nooooo, i literally said don't do that!". 
+
+
+the reason they're so much better is an llm is harnessing electiity and the power of iteration towards human language and all code is written in human language. just as chess is a game that can be won and lost, code is a game that can be won and lost. there are twists and turns and techniques, attacks and defenese at aevery level. btu if you iterate and yo uiterate fast neoguh, there's not much of a limit
+
+
+
+i thin kthis is important to outline because i'm begining to see anthropic, openai, google as what star wars calls the empire. and they're building their death star. all the money and computation that could be used to solve he worlds probelsm they are using to create super intelligence. but for what? they haven't really specified that. a future where all food is super abundant, a future where there is universal healthcare and monthly checks? 
+
+look up how much they're spending on datacenters, ai infrastructure and compare that against health care costs, number of children in the coutnry that aren't hitting minimal nutritional numbers. 
+
+they could do those things right now. but they're not. what makes you think they're going to do it when they're even more powerful and rich?
+
+
 
 at teh same time as this is happening, chips are getting better and better and we are reaching 

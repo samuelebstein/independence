@@ -10,7 +10,23 @@ just as solar allows you to bypass electric grids and cell phones bypass telepho
 
 every piece of hardware and software you use has the internet baked into it. the iphone is a portal to the infrastructure of the internet; whehter its your photos saved in the cloud, instagram hosted on meta server, email hosted by google, chatgpt hosted by microsoft, or pretty much every other service hosted by amazon., your traffic makes its way to one of these companies. and every server run by these companies runs much of that same code that originated in the stoned, and tripping minds of those fun bay area people.
 
-this was mostly a tangent and fun to think about. but its important to acknowledge because when you look at the low level linux code, a lot of doesn't make any sense at all. its a maze and it often doesn't follow rules. just as many 
+this was mostly a tangent and fun to think about. but its important to acknowledge because when you look at the low level linux code, a lot of doesn't make any sense at all. its a maze and it often doesn't follow rules. just as many english words don't follow the rules of english conjugations, a lot of code is super hard to understand why someone decided to make it the way it is. and its many many people contributing, in mayn different styles and for many different reasons.  
+
+now this becomes really important as you think more about the cybersecurity implications of the latest ai models. no human understands all of this low level code, and because its low level, its fundamentla to h interworking osof every soerver on the planet. but llms are built on the intricacy, beauty and horror of the english language. and they can iterate and test at practically the speed of light. 
+
+cyberattackers using these ai models, and just ai agents gone rogue are much better at traversing the mazes of the psychedlic mind. because they can traverse every path much faster than a human. imagine yourself in a maze. you investigate a path, encounter a dead end, trace your steps back, start over. now imagine a million of you at once testing every possiblity in parallel. that is much faster and much cheaper.
+
+as you dramatically reduce the cost of an attack and the impact of that attack point (centralization of the internet), the probably of destruction necessarily rises. just as chess is a game that can be won and lost, code is a game that can be won and lost. and this is why you see anthropic keeping hteir latest cyberattack capable model so secret. their business relies on the stability and viability of the internet because all of their customers (people and businesses) reach their product through the internet. they're building the death star but the power might make it implode. and i'm convinced that this will happen with 3 years. the more you try to trap the world, the more it will rebel. the technology they have built was trained on our pyschedilaclly infused minds. it has neural pathways that they can't even understand. 
+
+and i think when this happens, it will require every person and every community t ocome together in ways we haven't in decads to build everything up agian. and oyu'll have to build it with new defenses. the easiest way to defend yourself against cyberattacks is to make it physically impossible. and by physically, i mean literal physics. you take out the network card and network adapter from the chip and you make it impossible for a cyberattacker to infiltrate. this is what people call "airgapped" computers. they don't have the capability of talkign to anything and nothign has the capability of talking to it. and you build from there. open source models power the intelligence,  supply chains and the power grid are completely worthless and so you rely on solar power. and that means humans wil have to become more capable at things we've long forgotten; how do we make shelter, food, water, and communicate with each other.  
+
+
+
+
+its a gloomy future but also something i want to prepare for. becausae preparing for it is also fighting against the empire. 
+
+
+
 
 
 here's a visualization of how ai models combine small vectors of attack to achieve something magnificent and deadly. imagine you're a cyberattacker. there are pretty much two things you're trying to do. you're trying to take down the service or you're trying to steal something.

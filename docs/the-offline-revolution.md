@@ -1,5 +1,36 @@
 # the offline revolution
+the internet began as a beautiful movement of counterculture during the 1960s that reframed computers from centralized governmental power into tools of collaboration and personal empowerment. it's not a coincidence that much of it was built at the same time and in the same place as the center of psychedelic experimentation and the rejection of traditional institutions. the creators of the internet hoped to democratize access to information.
+fast-forward to the present day, and our sources of information and intelligence increasingly come from three companies: openai, anthropic and google. and the internet, originally held up by universities around the world, has itself become centralized. 40% of all internet traffic goes through cloudflare, and nearly 2/3 of all data center capacity is controlled by hyperscalers, with the biggest shares held by amazon, google, and microsoft. tl;dr, we've lost most of what made the internet great.
+why does this matter?
+just as solar allows you to bypass electric grids and cell phones allow you to bypass telephone lines, offline compute and intelligence will similarly allow you to bypass the internet.
+the internet is baked into every piece of hardware and software you use. the iphone is a portal to the infrastructure of the internet; whether it's your photos saved in the cloud, instagram hosted on meta's servers, email hosted by google, chatgpt hosted by microsoft, or pretty much every other service hosted by amazon, your traffic makes its way to one of these companies. and every server run by these companies runs much of that same code that originated in the stoned and tripping minds of those fun bay area people.
+this was mostly a tangent and fun to think about. but it's important to acknowledge because when you look at low-level linux code, written by those bright minds, a lot of it doesn't make any sense at all. it's a maze, and it often doesn't follow rules. just as many english words don't follow the rules of english conjugation, it's often hard to understand why code is the way it is. and there’s a lot of it, written in many different styles and for many different reasons. on a generic amazon server (aka “ec2 instance”), there is: 1) physical infrastructure: cpu, ram, storage, network cards, firmware, and hardware; 2) a virtualization layer: hypervisor and cpu/memory isolation; 3) the linux kernel: scheduling and filesystems; 4) user space: generic tools; and 5) your application: code and database. the linux kernel alone is around 30-40 million lines of code. each one of these lines of code is a potential vector of attack. no human understands it all, and its all fundamental to the inner workings of every server on the planet.
+now this becomes important as you think more about the cybersecurity implications of the latest ai models. no human understands all of this low-level code, and because it's low-level, it's fundamental to the inner workings of every server on the planet. but llms are built on the intricacy, beauty, and horror of the english language. and they can iterate and test at practically the speed of light.
+by using these ai models, cyberattackers and rogue ai agents are much better at traversing the mazes of the psychedelic mind because they can traverse every path much faster than a human. imagine yourself in a maze. you investigate a path, encounter a dead end, trace your steps back, and start over. now, imagine a million of you at once testing every possibility in parallel. that is much faster and much cheaper.
+in reducing the cost of an attack, the probability of destruction necessarily rises. code is a game that can be won and lost. and this is scary for frontier labs for a few reasons, that when combined, are catastrophic: 1) their business relies on the stability of the internet because that is how customers access their product; 2) the internet is centralized; and 3) every server is running the same vulnerable code. they’re building the death star, but the power it brings, if not contained, will make it implode. and i’m convinced this will happen soon. the technology they built was trained on our psychedelically infused minds. it has neural pathways even the frontier labs, with all their money and data centers, can’t understand.
+when this happens, the internet, as we currently know it, will cease to exist, and we’ll have to build anew, with new defenses and a new way of thinking about compute and interconnectedness. the best defense isn’t better cybersecurity. it’s eliminating the attack surface. the easiest way to defend yourself against cyberattacks is to make it physically impossible. and by physically, i mean literal physics. you take out the network card and network adapter from the chip, and you make it impossible for a cyberattacker to infiltrate. this is what people call "air-gapped" computers—they don't have the capability of talking to anything, and nothing has the capability of talking to them. and then you build from there.
+we’ll have the compute from the overbuilt datacenters, and the intelligence from the open-source models. combine that with hopefully massive efficiency gains in solar power and you give every individual power to build, create, and think independently. the infrastructure for a new kind of technological independence is being built. and it’s the spark of the offline revolution.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+notes:
 the internet began as a beautiful movement of counterculture during the 1960s that reframed computers from centralized governmental power to tools of collaboration and personal empowerment. its not a coincidence that much of it was built at the same time and in the same place as the central point of psychedelic experimentation and rejction of traditional instittuions. the creators of the internet were trying to democratize access to information. 
 
 fast foreard to the present day and our source of information and intelligence is practically three companies. and the internet, originally held up by colleges and univerisites around the world has itself become centralized. 40% of all internet traffic goes through cloudflare and nearly 2/3 of all data center cpacity is hyperscalers with the biggest shares amazon, google and microsoft. tldr, we've lost most of what made the internet great. 

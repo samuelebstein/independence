@@ -437,8 +437,9 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
 
     // Profile resolution reads only command-line/environment configuration.
     // It intentionally happens before the security gate, while creating an
-    // Ollama client, opening an input device, loading Whisper, and opening an
-    // audio output all wait until the caller has entered Ephemeral Mode.
+    // local model client, opening an input device, loading Whisper, and
+    // opening an audio output all wait until the caller has entered
+    // Ephemeral Mode.
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
     if resolved.operating_mode == OperatingMode::Private {
@@ -470,7 +471,7 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
 
     let result = async {
         match (resolved.pipeline, resolved.backend) {
-            (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama) => {
+            (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama | ModelBackend::HailoVlm) => {
                 let client = configured_ollama_client(&resolved)?;
                 discover_model_capabilities(&client).await;
                 run_transcribe_and_speak(resolved, client).await
@@ -489,6 +490,15 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
                         let client = configured_ollama_client(&resolved)?;
                         discover_model_capabilities(&client).await;
                         Some(client)
+                    }
+                    // The Hailo bridge is intentionally visual/text only in
+                    // this milestone. Do not invent an audio request format
+                    // or open a microphone for it.
+                    ModelBackend::HailoVlm => {
+                        return Err(AppError::UnsupportedPipeline {
+                            backend: ModelBackend::HailoVlm.label(),
+                            pipeline: VoicePipeline::AudioToAudio.label(),
+                        });
                     }
                     ModelBackend::Fixture => None,
                 };
@@ -601,9 +611,10 @@ async fn await_button_ephemeral_entry(
     }
 }
 
-/// Creates an Ollama client only after runtime pipeline selection chose the
-/// Ollama adapter. Profile resolution intentionally does not decide whether a
-/// model can perform the selected operation.
+/// Creates the strict local Ollama-compatible client only after runtime
+/// pipeline selection chose a compatible adapter. Profile resolution
+/// intentionally does not decide whether a model can perform the selected
+/// operation.
 fn configured_ollama_client(resolved: &ResolvedVoiceProfile) -> Result<OllamaClient, AppError> {
     let config = resolved
         .ollama
@@ -3270,6 +3281,24 @@ mod tests {
             Err(AppError::UnsupportedPipeline {
                 backend: "fixture",
                 pipeline: "transcribe-and-speak",
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn hailo_direct_audio_is_rejected_before_model_or_microphone_setup() {
+        let result = run_voice_with_options(VoiceLaunchOptions {
+            backend: Some(ModelBackend::HailoVlm),
+            pipeline: Some(VoicePipeline::AudioToAudio),
+            ..VoiceLaunchOptions::default()
+        })
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::UnsupportedPipeline {
+                backend: "hailo-vlm",
+                pipeline: "audio-to-audio",
             })
         ));
     }

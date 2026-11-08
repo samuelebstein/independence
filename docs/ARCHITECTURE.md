@@ -18,10 +18,11 @@ the future encryption/authentication design in
 | `--voice --pipeline audio-to-audio` | `audio_to_audio::run` | Isolated recording-to-WAV plumbing experiment | Whisper, Piper, camera, text history, or a real audio model |
 | list/test commands | `app::list_*`, `app::run_speech_test` | Inspect devices or test local speech output | Start a normal interaction |
 
-The command parser accepts `--mode ephemeral|private`, `--profile raspberry-pi`, `--input terminal|buttons`,
-selected input/output device IDs, model/backend/pipeline choices, and an
-explicit button device. `src/profile.rs` resolves explicit command-line values
-over environment values and profile defaults. A Raspberry Pi profile is a
+The command parser accepts `--mode ephemeral|private`, `--profile
+raspberry-pi|raspberry-pi-hailo`, `--input terminal|buttons`, selected
+input/output device IDs, model/backend/pipeline choices, and an explicit
+button device. `src/profile.rs` resolves explicit command-line values over
+environment values and profile defaults. A Raspberry Pi profile is a
 configuration choice, not a separate application.
 
 `Ephemeral` is the default. `Private` is deliberately rejected before model or
@@ -126,10 +127,11 @@ one Ephemeral session.
 ## Think: local model integration
 
 `src/think/mod.rs` contains `OllamaClient` and the `/api/chat` request shape.
-It sends an editable system prompt from `src/think/teacher.txt`, accepted
-history, current question, and base64 image bytes when present. Responses are
-non-streaming. The client defaults to `http://127.0.0.1:11434` and
-`qwen3-vl:4b-instruct`; it accepts only loopback HTTP endpoints, disables
+Despite its historical name, it is a strict loopback-only client for the small
+Ollama-compatible protocol Independence uses. It sends an editable system
+prompt from `src/think/teacher.txt`, accepted history, current question, and
+base64 image bytes when present. Responses are non-streaming. The ordinary
+default is `http://127.0.0.1:11434` and `qwen3-vl:4b-instruct`; it disables
 redirects and ambient proxy routing, and has explicit 2-second connect and
 120-second request timeouts.
 
@@ -140,6 +142,17 @@ advertise image input. This is not a general security attestation of a model.
 An SSH tunnel can make a remote owner-controlled Ollama server appear on a
 local loopback port, but it is still a connection to another machine. There is
 no cloud fallback in the application.
+
+`ModelBackend::HailoVlm` reuses that deliberately narrow client contract but
+selects `tools/hailo_vlm_bridge.py` at `127.0.0.1:11435` by default. The bridge
+is a separate local Python process: it validates the same request, advertises
+`vision`, decodes up to four current images in capture order, converts each for
+Hailo Qwen2-VL, and returns the same non-streaming response shape. It owns neither
+conversation history nor camera access, clears Hailo context after each
+generation, and binds numeric loopback only. Its optional `hailo_vlm.*` JSONL
+metadata excludes prompts, image data, and answers. See
+[raspberry-pi-hailo.md](raspberry-pi-hailo.md) for installation and the
+hardware verification boundary.
 
 ## Terminal interface, diagnostics, and optional local audio
 
@@ -183,7 +196,7 @@ Current data lifetime:
 | Captured microphone samples and Piper WAV | Bounded process memory | Released after work/cancellation; no audio file written by the app |
 | `/look` source | No production Ephemeral Mode access | File loading is blocked before I/O; future Private Mode is not implemented |
 | Camera still | Process memory | App does not save it, but the model request contains its bytes |
-| Whisper/Piper/Ollama model artifacts | User-managed `local-data` or external runtime locations | Not application-owned private data storage |
+| Whisper/Piper/Ollama/Hailo model artifacts | User-managed `local-data` or external runtime locations | Not application-owned private data storage |
 | Terminal interface | Terminal scrollback/stdout/redirection | Current dialogue text is deliberately shown and can be retained outside app control |
 | Opt-in diagnostics | stderr or a developer-selected redirected file | Contains operational metadata only; it is not an archive of dialogue |
 | Optional JSONL/OTLP telemetry | Explicitly configured destination | Application redacts content, but files/exporters are not encrypted or retention-managed by the app |
@@ -193,12 +206,12 @@ locked or encrypted. See [security/THREAT_MODEL.md](security/THREAT_MODEL.md).
 
 ## Platform-specific integrations
 
-| Concern | Laptop/Linux default | Raspberry Pi profile |
-| --- | --- | --- |
-| Interaction input | Crossterm raw-key terminal controls | Explicit selected Linux evdev keyboard used as buttons; no stdin reader; five-second Talk hold gates Ephemeral Mode entry |
-| Microphone/output | CPAL/Rodio selected device or system default | Same libraries and device selectors; usually explicit USB device IDs |
-| Camera | V4L2 one-shot still capture | `rpicam-still` one-shot JPEG adapter |
-| Default model | `qwen3-vl:4b-instruct` | `gemma3:1b` for text-only experiments |
+| Concern | Laptop/Linux default | Raspberry Pi profile | Raspberry Pi Hailo profile |
+| --- | --- | --- | --- |
+| Interaction input | Crossterm raw-key terminal controls | Explicit selected Linux evdev keyboard used as buttons; no stdin reader; five-second Talk hold gates Ephemeral Mode entry | Same physical-button adapter and entry gate |
+| Microphone/output | CPAL/Rodio selected device or system default | Same libraries and device selectors; usually explicit USB device IDs | Same libraries and selectors |
+| Camera | V4L2 one-shot still capture | `rpicam-still` one-shot JPEG adapter | Same `rpicam-still` adapter; bridge allows up to four current images in capture order |
+| Default model runtime | local Ollama at `11434` | `gemma3:1b` for text-only experiments | Hailo VLM bridge at `127.0.0.1:11435`, alias `qwen2-vl:2b` |
 
 The profile does not prove hardware availability, a secure enclave, a TPM,
 trusted boot, or model suitability. Device capability and permissions are
@@ -213,7 +226,8 @@ camera, microphone, Ollama model, Piper executable, or GPU. It covers controller
 authorization/stale results, staged scenes, request shape and model errors,
 photo validation, dictation state and resampling, voice cancellation, speech
 queue order, telemetry redaction/timing, audio-to-audio fixture plumbing, and
-platform adapters. A few real hardware captures are intentionally ignored
+platform adapters. Python bridge contract tests use a fake VLM and do not load
+Hailo Apps or a HEF. A few real hardware captures are intentionally ignored
 manual tests. Standard repository checks are documented in the README:
 `cargo fmt --check`, `cargo check`, `cargo test`,
 `cargo clippy --all-targets -- -D warnings`, and `git diff --check`.

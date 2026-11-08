@@ -581,7 +581,70 @@ attached Pi keyboard, USB microphone/speaker, ARM64 Whisper/Piper installation,
 or Camera Module 3 Wide. Those remain separate, documented hardware checks in
 [`docs/rasberry-pi.md`](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
 
-## Latest milestone: separate pipeline, backend, and model choices
+## Latest milestone: local Hailo VLM bridge
+
+The Hailo integration adds a **transport adapter**, not another chat
+application. Hailo Apps owns the accelerator, VDevice, model loading, image
+preprocessing requirements, and VLM generation. Independence continues to own
+explicit camera intent, in-memory photo lifetime, accepted history, cancellation
+authorization, and voice output. That split matters because a Hailo inference
+exception must not get authority to capture a camera frame or append a turn.
+
+```text
+existing Controller / VoiceRuntime
+  owns: accepted history, TurnId, microphone, explicit P photo request
+  sends: existing stream=false /api/chat shape
+                       |
+                       v
+ModelBackend::HailoVlm + OllamaClient transport
+  owns: strict loopback endpoint and /api/show capability discovery
+                       |
+                       v
+tools/hailo_vlm_bridge.py at 127.0.0.1:11435
+  owns: request validation, ordered base64 image decode, Hailo prompt/frame
+        conversion, serialized VLM generation, clear_context(), safe API metadata
+                       |
+                       v
+Hailo Apps VDevice + Qwen2-VL HEF
+  owns: accelerator/model execution
+```
+
+The existing `OllamaClient` name describes the narrow compatibility contract,
+not exclusive ownership by the Ollama executable. Both local Ollama and the
+bridge answer `POST /api/show` and non-streaming `POST /api/chat`, so the Rust
+capability logic does not need an unsafe special case. `hailo-vlm` is explicit
+in `ModelBackend`; it shares the client only because it implements the same
+documented contract. The `raspberry-pi-hailo` profile selects that backend,
+`qwen2-vl:2b`, `127.0.0.1:11435`, physical buttons, and `rpicam-still`.
+Command-line backend/model choices still win. `INDEPENDENCE_HAILO_VLM_URL`
+can override that profile endpoint; the legacy compatible `OLLAMA_URL` remains
+the higher-precedence loopback override.
+
+The bridge's image boundary is intentionally bounded. It accepts up to four
+base64 images on the final user message, preserves their capture order, turns
+each into Hailo's RGB 336×336 central crop, and emits a matching Hailo image
+placeholder for each frame. It rejects a fifth image rather than making a
+collage or silently throwing one away. It clears the Hailo VLM context after
+every request; Independence resends its accepted text history in the next
+request. No prompt, image, base64 value, transcript, model response, or HEF
+path goes into bridge stdout or its optional JSONL telemetry. The latter records
+only safe operational metadata such as route, status, duration, count, and byte
+count.
+
+The Hailo bridge is numeric-loopback-only. It needs an explicitly downloaded
+HEF because model auto-download during a server start would create an invisible
+network dependency. `scripts/prepare_pi_hailo_vlm.sh` makes Hailo Apps package
+installation and model download opt-in flags; `scripts/run_pi_hailo_vlm_bridge.sh`
+activates the Hailo Apps environment and reports the exact server address.
+
+The Python contract tests use a fake VLM, so they establish the ordered
+multi-image API mapping, vision capability record, four-image boundary, and
+telemetry redaction. They do not establish that the Pi sees the HAT, that the
+HEF matches HailoRT, that text-only VLM requests work on a particular release,
+or that the camera/speech pipeline is physically connected. Follow
+[raspberry-pi-hailo.md](docs/raspberry-pi-hailo.md) for those device tests.
+
+## Previous milestone: separate pipeline, backend, and model choices
 
 The new path adds a second **pipeline**, not a second application or
 controller. This follow-up keeps the model runtime separate from that pipeline:
@@ -607,14 +670,15 @@ The three launch choices answer different questions:
 
 ```text
 --pipeline  transcribe-and-speak or audio-to-audio
---backend   ollama (default) or fixture (a direct-audio plumbing test)
+--backend   ollama, hailo-vlm (Pi Hailo profile), or fixture (direct-audio test)
 --model     the backend's selected model
 ```
 
-A Pi/laptop hardware profile still chooses only input, microphone, speaker,
-and camera defaults. It does not select a pipeline, backend, or model. Ollama
-is the default backend for both pipelines. The fixture is deliberately
-model-less and is valid only for the direct-audio route.
+The laptop/base Pi profiles default to Ollama. The `raspberry-pi-hailo` profile
+selects the documented local `hailo-vlm` bridge but still does not select a
+different pipeline. The fixture is deliberately model-less and is valid only
+for the direct-audio route; Hailo VLM rejects that route before microphone
+startup because it has no documented recording-to-WAV API.
 
 `CapturedAudio` now retains the actual capture sample rate after CPAL has
 converted/downmixed samples. That solves a small but important abstraction

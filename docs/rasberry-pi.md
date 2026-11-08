@@ -459,6 +459,22 @@ not download a model or alter Ollama globally. Independence has no separate
 image-support setting: the selected Ollama backend/model supplies that runtime
 decision through `/api/show`.
 
+### Hailo vision-language bridge
+
+The base `raspberry-pi` profile remains the ordinary local-Ollama/text-first
+path above. A Pi with a Hailo-10H-backed AI HAT+ 2 has a separate,
+`raspberry-pi-hailo` profile that starts from the same physical controls and
+camera adapter but uses the local Hailo VLM bridge on `127.0.0.1:11435`.
+It is not a Hailo-Ollama vision configuration: the bridge uses Hailo Apps'
+Python VLM API and exposes the narrow `/api/show` and `/api/chat` protocol
+Independence already verifies.
+
+Follow [the dedicated Pi Hailo runbook](raspberry-pi-hailo.md) for the explicit
+Hailo Apps install/model download, loopback server startup, telemetry policy,
+and physical acceptance test. Do not point this profile at a LAN service: the
+bridge is loopback-only and accepts up to four current photos in capture order
+for one request.
+
 ### End-to-end physical acceptance test
 
 After the independent checks pass, launch the button command over SSH. Type

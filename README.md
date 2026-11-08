@@ -9,7 +9,7 @@ unauthenticated, in-memory-only session. It can:
 
 - take keyboard input as its `listen` capability;
 - send a text question, or ordered fresh in-memory camera JPEG/PNG context
-  plus a question, to a local Ollama model as `think`;
+  plus a question, to a local Ollama-compatible model endpoint as `think`;
 - list local Linux V4L2 cameras (or a Raspberry Pi `rpicam-still` camera
   module when explicitly profiled) and explicitly capture one still image as
   `see` input;
@@ -68,16 +68,19 @@ Read these files in this order:
    editable teaching guidance.
 12. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
-13. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — a complete Raspberry Pi 5
-   text-only local installation path.
-14. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
+13. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — the base Raspberry Pi 5
+   hardware installation path.
+14. [`docs/raspberry-pi-hailo.md`](docs/raspberry-pi-hailo.md) — the
+   loopback-only Hailo VLM bridge, Pi HAT setup, and physical acceptance
+   runbook.
+15. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
    microphone-to-backend-to-speaker experiment and its current limits.
-15. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
+16. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
    [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md), and
    [`docs/security/ARCHITECTURE.md`](docs/security/ARCHITECTURE.md) — the
    current Ephemeral Mode boundary and the still-unimplemented cryptographic
    design.
-16. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
+17. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
    gates, and the next intentionally small milestones.
 
 ## Run it on the same laptop
@@ -202,6 +205,33 @@ Ephemeral Mode, then hold Enter again to record. SSH Enter, `P`, and Escape do
 not control the device. See the [Raspberry Pi guide](docs/rasberry-pi.md) for
 build prerequisites, permissions, stable input-device setup, and independent
 microphone/speaker/camera tests.
+
+### Raspberry Pi: Hailo VLM profile
+
+For a Pi with a Hailo-10H-backed AI HAT+ 2, use the deliberately separate
+`raspberry-pi-hailo` profile after starting the local bridge:
+
+```bash
+scripts/run_pi_hailo_vlm_bridge.sh
+
+./target/release/independence --voice \
+  --profile raspberry-pi-hailo \
+  --input buttons \
+  --input-device /dev/input/by-id/usb-Example-event-kbd \
+  --audio-input 'Exact CPAL input id' \
+  --audio-output 'Exact CPAL output id'
+```
+
+The bridge listens only at `http://127.0.0.1:11435`, advertises `vision`
+through the existing `/api/show` capability check, and accepts the same
+non-streaming `/api/chat` image shape as the local Linux Ollama vision setup.
+The profile selects backend `hailo-vlm`, model alias `qwen2-vl:2b`, and the
+existing `rpicam-still` camera backend. It does not make an image request
+without a verified `vision` response. It supports up to four current photos in
+capture order and rejects a fifth rather than silently losing an image. Full
+installation, explicit model download, telemetry boundary, and real-hardware
+checks are in the
+[Pi Hailo runbook](docs/raspberry-pi-hailo.md).
 
 ## Dictation and voice modes
 
@@ -838,7 +868,39 @@ application code.
 > Keep it grounded in the current code, show what changed, and distinguish the
 > implemented system from the next proposed milestone.
 
-### Current change: Terminal interface and diagnostic separation
+### Current change: local Hailo vision bridge and Pi profile
+
+The Pi can now use a Hailo-10H vision-language model without replacing its
+voice, camera, controller, or privacy boundaries. `tools/hailo_vlm_bridge.py`
+starts one local Hailo Qwen2-VL model on **`127.0.0.1:11435`** and exposes only
+the small non-streaming `/api/show` and `/api/chat` contract Independence
+already uses. `/api/show` advertises `vision`; the existing Rust client remains
+the authority that enables or keeps camera capture off.
+
+`--profile raspberry-pi-hailo` selects the existing physical Pi defaults plus
+backend `hailo-vlm`, logical model `qwen2-vl:2b`, and the bridge port. The new
+backend is intentionally protocol-compatible rather than a second controller:
+
+```text
+physical Talk/P buttons -> existing VoiceRuntime -> existing Controller
+                                           |
+                    base64 current JPEG + text / accepted text history
+                                           v
+             local Hailo VLM bridge (up to four ordered images, one VLM at a time)
+                                           |
+                                           v
+                  Hailo VDevice + Qwen2-VL -> existing Piper answer path
+```
+
+The bridge binds numeric loopback only, requires a pre-downloaded HEF instead
+of silently downloading one, clears Hailo context after every request, and can
+write opt-in metadata-only JSONL telemetry. It never records prompts, image
+bytes/base64, transcripts, or responses. Hailo-Ollama remains a different
+LLM-serving path; it is not used for this vision profile. See the
+[Pi Hailo runbook](docs/raspberry-pi-hailo.md) for the explicit Hailo Apps
+setup and device acceptance sequence.
+
+### Previously: Terminal interface and diagnostic separation
 
 The terminal is now a deliberate user interface rather than a `tracing`
 formatter. It shows short ready/listening/thinking messages, the final voice
@@ -1156,7 +1218,7 @@ src/
     camera.rs              V4L2 and rpicam-still one-still camera backends
 
   think/
-    mod.rs                 loopback-only Ollama /api/chat client
+    mod.rs                 loopback-only Ollama-compatible /api/chat client
     teacher.txt            editable model teaching instructions
 
   interface.rs             human-facing stdout interface
@@ -1167,6 +1229,13 @@ src/
     tts.rs                 Piper CLI adapter (text -> in-memory WAV)
     playback.rs            generic output listing/selection and Rodio playback
     worker.rs              ordered cancellable speech worker
+
+tools/
+  hailo_vlm_bridge.py      local Hailo VLM -> Ollama-compatible HTTP bridge
+
+scripts/
+  prepare_pi_hailo_vlm.sh  explicit Hailo Apps/model preflight
+  run_pi_hailo_vlm_bridge.sh activates Hailo Apps and starts port 11435
 ```
 
 ### Deliberately not present yet
@@ -1250,7 +1319,7 @@ TalkReleased -> recording is complete and microphone is released
        Whisper -> text Ollama                direct audio backend
        -> Piper -> Rodio                     -> returned WAV -> Rodio
 
---backend selects runtime: ollama (default) | fixture (direct-audio test)
+--backend selects runtime: ollama | hailo-vlm (Pi Hailo profile) | fixture (direct-audio test)
 --model selects a model within that runtime
 ```
 
@@ -1276,10 +1345,10 @@ plumbing, not a voice model.
 
 `src/launch.rs` now parses `--model`, `--backend`, and `--pipeline` as three
 independent choices. Backend precedence is `--backend`, then
-`INDEPENDENCE_BACKEND`, then the `ollama` default. Model precedence is
+`INDEPENDENCE_BACKEND`, then the selected profile's backend default. Model precedence is
 `--model`, then `INDEPENDENCE_MODEL`, then the compatible `OLLAMA_MODEL`, then
-the profile default. Hardware profiles still choose only physical-device
-defaults.
+the profile default. The base Pi profile chooses physical-device defaults; the
+Hailo Pi profile additionally chooses its documented local bridge default.
 
 When the Ollama backend is selected,
 `think::OllamaClient::discover_capabilities` calls `/api/show` once and caches
@@ -1290,10 +1359,12 @@ must also implement that operation's documented request/response format.
 
 `--backend ollama` currently reports an honest unsupported direct-audio
 exchange before opening a microphone or sending audio when no verified
-recording-to-WAV contract exists for the chosen model. Independence does not
-fall back to Whisper plus Piper in that mode. `fixture` is intentionally
-model-less and only valid with `--pipeline audio-to-audio`; use it explicitly
-to test local microphone → backend → speaker plumbing.
+recording-to-WAV contract exists for the chosen model. `hailo-vlm` also rejects
+that direct-audio pipeline before microphone startup: its bridge documents
+text/vision only. Independence does not fall back to Whisper plus Piper in
+either mode. `fixture` is intentionally model-less and only valid with
+`--pipeline audio-to-audio`; use it explicitly to test local microphone →
+backend → speaker plumbing.
 No Qwen3-Omni model or alternate runtime was installed or downloaded. See
 [the audio-to-audio guide](docs/audio-to-audio.md) for Pi/button examples,
 privacy bounds, test scope, and the next real-backend evaluation boundary.

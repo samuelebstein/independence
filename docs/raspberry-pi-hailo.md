@@ -1,334 +1,320 @@
-# Raspberry Pi + Hailo VLM bridge runbook
+# Raspberry Pi + AI HAT+ 2 Hailo VLM bridge
 
-This runbook connects a Raspberry Pi with a Hailo-10H-backed AI HAT+ 2 to
-Independence's existing voice-and-photo path. It is an implemented, local-only
-integration—not a claim that `hailo-ollama` can serve a vision model.
+This is the one installation and verification path for running Independence's
+local vision path on a Raspberry Pi 5 with an AI HAT+ 2 (Hailo-10H).
+It uses Hailo Apps' Python VLM API behind a small loopback HTTP bridge; it does
+not use Hailo-Ollama to serve vision.
 
-The bridge is deliberately small:
+Run one numbered gate at a time. A gate is passed only when its final check
+succeeds; do not compensate for a failed earlier gate by retrying a later one.
+That order separates operating-system, Hailo-device, model-installation,
+server, and Independence failures.
 
-```text
-Pi Camera still + spoken question
-          |
-          v
-Independence CameraService + Whisper
-          |
-          | existing non-streaming Ollama-shaped /api/chat request
-          | (UTF-8 text + up to four ordered base64 images)
-          v
-127.0.0.1:11435  tools/hailo_vlm_bridge.py
-          |
-          | decode -> RGB central crop -> Hailo VLM API
-          v
-one local Qwen2-VL HEF on the Hailo accelerator
-          |
-          v
-same /api/chat-shaped response -> existing Controller -> Piper
+## Before starting
+
+- Use a Pi 5 with 64-bit Raspberry Pi OS Trixie, the AI HAT+ 2 seated and
+  cooled, and reliable power.
+- On this home's router, connect the Pi to the **2.4 GHz** Wi-Fi SSID. Its
+  5 GHz option has not been reliable here; a failed 5 GHz connection is a
+  network issue, not a Hailo or Independence failure.
+- These steps download packages, source code, and one model only when the
+  command explicitly says so. The bridge does not download a model at startup
+  or send prompts/photos off the Pi.
+- Stop Hailo-Ollama or any other Hailo GenAI workload before Gate 5. Two GenAI
+  processes competing for the accelerator can make an otherwise correct
+  bridge fail to start or infer.
+
+The completed pieces are:
+
+| Piece | What it does | Success signal |
+| --- | --- | --- |
+| Independence | Builds the local application and its normal request path | release executable exists |
+| Hailo runtime | Lets Linux see the Hailo-10H | `hailortcli` identifies one device |
+| Hailo Apps + HEF | Installs the VLM runtime and local Qwen2-VL model | preflight prints one HEF path |
+| Python bridge | Translates Independence's Ollama-shaped vision request | `/healthz` and `/api/show` succeed on loopback |
+| Hailo profile | Connects the existing voice/photo controls to that bridge | spoken/photo test receives an answer |
+
+## 1. Prepare and prove the base Pi
+
+This gate installs Independence's native build dependencies before Cargo runs.
+Gate 4's Hailo installer owns its version-aligned Hailo Apps dependencies. The
+firmware/kernel update needs a reboot before the new Hailo driver is installed.
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo rpi-eeprom-update -a
+sudo apt install -y git curl ca-certificates build-essential pkg-config cmake clang libclang-dev libasound2-dev zstd python3-venv jq rpicam-apps
+sudo reboot
 ```
 
-`Controller` still owns accepted history and turn authorization. `VoiceRuntime`
-still owns the microphone/camera draft. The Python process only owns one Hailo
-VLM instance and its local HTTP translation. There is no cloud fallback.
+After reconnecting, confirm the supported OS/architecture and installed command
+set. `uname -m` must print `aarch64` and the `grep` command must print the
+Trixie codename.
 
-## What runs where
+```bash
+uname -m
+grep '^VERSION_CODENAME=trixie$' /etc/os-release
+command -v git curl cmake clang jq rpicam-still
+```
 
-| Component | Process | Address / ownership |
-| --- | --- | --- |
-| Hailo VLM bridge | `tools/hailo_vlm_bridge.py` | **`http://127.0.0.1:11435`** by default; numeric loopback only |
-| Capability discovery | bridge `POST /api/show` | returns `{"capabilities":["vision"]}` |
-| Inference | Hailo Apps Python `VLM` API | one pre-downloaded Qwen2-VL HEF; context cleared after each request |
-| Main application | Independence | profile `raspberry-pi-hailo`, backend `hailo-vlm` |
+If either OS check fails, re-image or update the Pi before continuing. If a
+command is absent, rerun the package installation and resolve APT's error; do
+not attempt a partial Cargo or Hailo installation.
 
-Port `11435` is intentionally different from ordinary Ollama's `11434`.
-The bridge prints its exact address, model alias, and capability at startup.
-Use `GET /healthz` to verify the same values without sending a prompt or image.
+Install the pinned Rust toolchain used by the base-Pi guide, then clone and
+build a fresh checkout. `-j 1` keeps peak memory lower on smaller Pis.
 
-The profile's logical model name is `qwen2-vl:2b`. It is a bridge alias, not
-an Ollama tag: the bridge maps it to the local Hailo Qwen2-VL 2B HEF selected
-by `HAILO_VLM_HEF`.
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+. "$HOME/.cargo/env"
+rustup toolchain install 1.99.1 --profile minimal --component rustfmt
+rustup default 1.99.1
+rustc --version
+cargo --version
+mkdir -p "$HOME/code"
+git clone https://github.com/samuelebstein/independence.git "$HOME/code/independence"
+cd "$HOME/code/independence"
+cargo test --locked
+cargo build --release --locked -j 1
+test -x ./target/release/independence
+```
 
-## Prerequisites and hardware check
+`git clone` deliberately stops if that destination already exists; do not
+overwrite an existing checkout. To update one later, use `git pull --ff-only`
+inside it, review the result, and rebuild.
 
-This bridge needs a Hailo-10H runtime, Hailo Apps' GenAI dependencies, and a
-downloaded VLM model. It does not use Hailo-Ollama for vision. Hailo's current
-GenAI documentation lists VLMs under the Python/C++ API rather than its
-Ollama-serving path; [Hailo Apps' GenAI guide](https://github.com/hailo-ai/hailo-apps/blob/main/hailo_apps/python/gen_ai_apps/README.md)
-and [VLM example](https://github.com/hailo-ai/hailo-apps/blob/main/hailo_apps/python/gen_ai_apps/simple_vlm_chat/simple_vlm_chat.py)
-are the upstream references this bridge follows.
+These checks only inspect local hardware; neither needs Hailo. A missing
+camera blocks only the later photo test, not the bridge itself.
 
-Before installing anything, verify that the Pi sees the attached Hailo device:
+```bash
+./target/release/independence --input-devices
+rpicam-still --list-cameras
+```
+
+## 2. Recommended no-accelerator baseline
+
+This optional diagnostic proves the Pi, local networking, Rust build, and
+ordinary local text path before Hailo is involved. It is standard Ollama, not
+Hailo-Ollama, and does not validate the accelerator.
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+sudo systemctl enable --now ollama
+systemctl is-active --quiet ollama
+ollama pull gemma3:1b
+OLLAMA_MODEL=gemma3:1b ./target/release/independence
+```
+
+Ask one typed question and use `/quit` to exit. If the service check fails,
+inspect `journalctl -u ollama -n 50 --no-pager` before proceeding. If this
+gate passes but a later Hailo gate fails, the problem is narrowed to Hailo or
+the bridge rather than the base application.
+
+## 3. Install and identify the AI HAT+ 2
+
+The AI HAT+ 2 is Hailo-10H. Install `hailo-h10-all`, not the Hailo-8
+`hailo-all` package. `dkms` ensures the driver is built for the running kernel.
+
+```bash
+sudo apt install -y dkms hailo-h10-all
+sudo reboot
+```
+
+After reconnecting, run the first accelerator gate:
 
 ```bash
 hailortcli fw-control identify
 ```
 
-The output must identify a Hailo-10H-capable device. Check cooling, power, and
-the HAT installation if it does not. Do not start Hailo-Ollama and this VLM
-bridge as two GenAI workloads at once: Hailo documents GenAI + GenAI as an
-unsupported concurrent combination. Stop the other GenAI process before
-starting the bridge. Ordinary Hailo vision pipelines use the shared virtual
-device group, but throughput still needs a real device test.
+It must identify one Hailo-10H device. If it does not, stop here: check the
+HAT seating, PCIe ribbon, cooling/power, OS update, and `dmesg | grep -i hailo`.
+Do not install Hailo Apps or download a model until this command works. The
+package and verification sequence follows Raspberry Pi's
+[AI documentation](https://www.raspberrypi.com/documentation/computers/ai.html).
 
-## One-time Hailo Apps setup
+## 4. Install Hailo Apps and explicitly prepare the model
 
-The following networked steps are explicit. They clone Hailo Apps, install its
-dependencies, and download a model only because you run the commands; neither
-Independence nor the bridge silently downloads a model at request time.
+`./install.sh --skip-gstreamer` creates Hailo Apps' `venv_hailo_apps` virtual
+environment and runs its version-aligned dependency setup. `--skip-gstreamer`
+omits only the unused GStreamer pipeline stack; this bridge needs the Python
+GenAI API. The checked-in Independence helper is the final dependency gate: it
+activates that environment, installs the GenAI Python extras, verifies imports,
+downloads the `vlm_chat` Hailo-10H resource, and requires exactly one supported
+Qwen2-VL 2B HEF.
 
 ```bash
 cd "$HOME/code"
 git clone https://github.com/hailo-ai/hailo-apps.git
-cd hailo-apps
-./install.sh
-source setup_env.sh
-python3 -m pip install -e '.[gen-ai]'
-hailo-download-resources --group vlm_chat --arch hailo10h
-```
-
-If `source setup_env.sh` says `venv_hailo_apps` is missing, as in the setup
-attempt that prompted this work, `./install.sh` did not finish or was not run
-from the Hailo Apps checkout. Run it first, then source `setup_env.sh` again.
-The `pip` command installs the GenAI Python extras that `vlm_chat` and this
-bridge need.
-
-From a freshly pulled Independence checkout, the checked-in helper performs a
-safe preflight. It changes Python dependencies or downloads model data only
-when its named flags are present:
-
-```bash
+cd "$HOME/code/hailo-apps"
+./install.sh --skip-gstreamer
+test -f setup_env.sh && test -d venv_hailo_apps && printf 'Hailo Apps environment exists\n'
 cd "$HOME/code/independence"
-HAILO_APPS_DIR="$HOME/code/hailo-apps" \
-  scripts/prepare_pi_hailo_vlm.sh \
-  --install-python-dependencies \
-  --download-model
+HAILO_APPS_DIR="$HOME/code/hailo-apps" scripts/prepare_pi_hailo_vlm.sh --install-python-dependencies --download-model
 ```
 
-Without flags it only verifies the environment:
+The final command must end with `Hailo VLM preflight passed` and one
+`HAILO_VLM_HEF=` path. It is intentionally the only step that installs the
+GenAI extras or downloads the VLM. Do not manually run `source setup_env.sh`,
+`pip install`, or `hailo-download-resources` as duplicate setup steps.
+If the Hailo installer exits nonzero or reports `Installation completed with
+errors`, stop and resolve that output; if it only warns about an optional
+package, the helper's import check remains the authoritative pass/fail check.
+As with the Independence checkout, `git clone` stops rather than overwriting
+an existing Hailo Apps checkout; use the reviewed existing checkout or update
+it deliberately.
 
-```bash
-HAILO_APPS_DIR="$HOME/code/hailo-apps" scripts/prepare_pi_hailo_vlm.sh
-```
-
-The helper expects exactly one Qwen2-VL 2B HEF under
-`/usr/local/hailo/resources/models/hailo10h` (or
-`HAILO_RESOURCES_DIR`). If you installed more than one matching VLM, select
-the intended model explicitly rather than letting the script guess:
+If `venv_hailo_apps` is missing, `./install.sh --skip-gstreamer` did not finish: rerun it from
+the Hailo Apps checkout and resolve its first error. If preflight reports zero
+HEFs, rerun the final command with `--download-model`. If it reports multiple
+matching HEFs, select the reviewed one when starting the bridge:
 
 ```bash
 export HAILO_VLM_HEF='/absolute/path/to/Qwen2-VL-2B-Instruct.hef'
 ```
 
-The bridge deliberately requires that file path. It does **not** call Hailo
-Apps' auto-download resolver, because starting an inference server should not
-silently create network traffic or install a model.
+Do not point that variable at a Qwen3-VL or other custom HEF without separately
+reviewing its prompt and image contract. Hailo Apps' own
+[installation guide](https://github.com/hailo-ai/hailo-apps/blob/main/doc/user_guide/installation.md)
+is the upstream reference for this environment. Keep that export in the same
+terminal that starts the bridge; a newly opened terminal needs it again.
 
-This first bridge is implemented and documented for Hailo's Qwen2-VL 2B
-resource. `HAILO_VLM_MODEL` changes only the API alias that Independence sends;
-it does not switch the HEF or make another VLM's preprocessing compatible. Do
-not point `HAILO_VLM_HEF` at Qwen3-VL or another custom HEF until its image
-format, prompt contract, and device test have been reviewed.
+## 5. Start and prove the local Python VLM bridge
 
-## Start and verify the bridge
-
-Run the service in a dedicated terminal on the Pi:
+Keep the bridge in terminal A. The wrapper activates Hailo Apps and starts one
+local VLM instance; the bridge binds only to `127.0.0.1:11435`, so it is not a
+LAN service.
 
 ```bash
 cd "$HOME/code/independence"
-scripts/run_pi_hailo_vlm_bridge.sh
+HAILO_APPS_DIR="$HOME/code/hailo-apps" scripts/run_pi_hailo_vlm_bridge.sh
 ```
 
-The wrapper activates `$HAILO_APPS_DIR/setup_env.sh`, discovers one downloaded
-Qwen2-VL HEF, and starts the server. Its expected startup lines are:
-
-```text
-Hailo VLM bridge listening on http://127.0.0.1:11435
-Health: http://127.0.0.1:11435/healthz | model: qwen2-vl:2b | capabilities: vision
-```
-
-Verify its address, model, and capability locally:
+Its expected startup lines name `http://127.0.0.1:11435`,
+`qwen2-vl:2b`, and `capabilities: vision`. Leave terminal A running. In
+terminal B, verify the server's address, model alias, and capability before
+launching Independence:
 
 ```bash
 curl --fail --silent http://127.0.0.1:11435/healthz | jq .
-curl --fail --silent \
-  --header 'Content-Type: application/json' \
-  --data '{"model":"qwen2-vl:2b"}' \
-  http://127.0.0.1:11435/api/show | jq .
-ss -ltnp '( sport = :11435 )'
+curl --fail --silent --header 'Content-Type: application/json' --data '{"model":"qwen2-vl:2b"}' http://127.0.0.1:11435/api/show | jq .
 ```
 
-The second response must include exactly the `vision` capability Independence
-requires. It is not an application-side image override: the normal runtime
-will still refuse camera capture if this lookup fails or omits `vision`.
+The health response must say `ready` and the show response must contain exactly
+the `vision` capability. Independence uses that response to decide whether a
+camera photo is permitted; do not bypass it with a configuration flag.
 
-For a direct multi-image API smoke test, use two non-sensitive local JPEGs with
-visibly different contents. This is the same base64 image field Independence
-already sends to a local Ollama vision model:
+Use Hailo Apps' bundled, non-personal image for the first real inference test.
+This tests image bytes in the same base64 field Independence uses, without
+needing a camera or a private photo.
 
 ```bash
-first_image_base64="$(base64 --wrap=0 ./known-test-image-1.jpg)"
-second_image_base64="$(base64 --wrap=0 ./known-test-image-2.jpg)"
-jq -n --arg first "$first_image_base64" --arg second "$second_image_base64" '{
-  model: "qwen2-vl:2b",
-  stream: false,
-  messages: [
-    {role: "system", content: "Answer briefly."},
-    {role: "user", content: "Compare these two images.", images: [$first, $second]}
-  ]
-}' | curl --fail --silent \
-  --header 'Content-Type: application/json' \
-  --data @- \
-  http://127.0.0.1:11435/api/chat | jq .
+sample_image="$HOME/code/hailo-apps/doc/images/barcode-example.png"
+test -r "$sample_image"
+image_base64="$(base64 --wrap=0 "$sample_image")"
+jq -n --arg image "$image_base64" '{model:"qwen2-vl:2b",stream:false,messages:[{role:"user",content:"Describe this image briefly.",images:[$image]}]}' | curl --fail --silent --header 'Content-Type: application/json' --data @- http://127.0.0.1:11435/api/chat | jq .
+unset image_base64 sample_image
 ```
 
-The bridge accepts zero through four images on the final user message and
-preserves their order: the first captured `P` photo is the first Hailo frame.
-It emits one Hailo image placeholder per frame rather than combining photos.
-The four-photo limit and the existing 14 MiB total JSON-request limit bound Pi
-memory, accelerator latency, and local API exposure; each decoded image also
-has its existing 10 MiB and 10-million-pixel limit. Text-only messages are
-still sent as text-only VLM requests; test that path on the installed Hailo
-Apps/HailoRT version before relying on it for normal conversation.
+The response must contain non-empty assistant text. A bind error means another
+local process owns port 11435; inspect
+`ss -ltnp '( sport = :11435 )'` and stop only the identified conflicting
+process, or choose another port. A Hailo resource error usually means a
+concurrent Hailo GenAI process, an unrecognized device, or a model/runtime
+version mismatch—return to Gates 3 and 4 rather than changing the client.
 
-To use a different local port or model alias, set these before the wrapper:
+The API accepts zero through four ordered images on the final user message.
+The bridge keeps the first captured image first, rather than merging images.
+It deliberately rejects a larger request, images over 10 MiB, or images over
+10 million pixels to bound local memory and latency.
+
+## 6. Connect the existing Independence voice/photo flow
+
+Gate 5 is sufficient to prove the Hailo server. This gate additionally needs
+the hardware-specific parts of [the base Pi guide](rasberry-pi.md):
+
+1. List and select the physical button keyboard, microphone, and speaker:
+
+   ```bash
+   ./target/release/independence --input-devices
+   ./target/release/independence --audio-input-devices
+   ./target/release/independence --audio-devices
+   ```
+
+2. Create a **device-specific** udev rule for only that keyboard; do not run
+   Independence as root or grant access to all input devices. The exact
+   inspection and rule template are in the base guide's
+   [keyboard-access section](rasberry-pi.md#give-access-only-to-the-selected-keyboard).
+3. Install local Whisper and Piper, then separately test the selected
+   microphone and speaker using the base guide's
+   [voice checks](rasberry-pi.md#verify-microphone-and-speaker-separately).
+4. Confirm `rpicam-still --list-cameras` sees the intended camera.
+
+Those values are intentionally not hard-coded here because they identify your
+own USB devices. With terminal A's bridge still running, launch terminal B
+using the exact IDs reported by those checks:
 
 ```bash
-export HAILO_VLM_PORT=11500
-export HAILO_VLM_MODEL='qwen2-vl:2b'
-export HAILO_VLM_HEF='/absolute/path/to/Qwen2-VL-2B-Instruct.hef'
-scripts/run_pi_hailo_vlm_bridge.sh
+cd "$HOME/code/independence"
+./target/release/independence --voice --profile raspberry-pi-hailo --input buttons --input-device /dev/input/independence/button-kbd --audio-input 'Exact CPAL input id' --audio-output 'Exact CPAL output id'
 ```
 
-When either port or alias differs from the profile defaults, give Independence
-the matching local endpoint and alias for its own launch:
+The `raspberry-pi-hailo` profile selects backend `hailo-vlm`,
+`http://127.0.0.1:11435`, and model alias `qwen2-vl:2b`. If you deliberately
+change the bridge port, make both sides agree:
 
 ```bash
-INDEPENDENCE_HAILO_VLM_URL='http://127.0.0.1:11500' \
-INDEPENDENCE_MODEL='qwen2-vl:2b' \
-./target/release/independence --voice \
-  --profile raspberry-pi-hailo \
-  --input buttons \
-  --input-device /dev/input/by-id/usb-Example-event-kbd
+# terminal A
+HAILO_VLM_PORT=11500 HAILO_APPS_DIR="$HOME/code/hailo-apps" scripts/run_pi_hailo_vlm_bridge.sh
+
+# terminal B
+INDEPENDENCE_HAILO_VLM_URL='http://127.0.0.1:11500' ./target/release/independence --voice --profile raspberry-pi-hailo --input buttons --input-device /dev/input/independence/button-kbd
 ```
 
-Only `127.0.0.1` or `::1` are accepted for `HAILO_VLM_HOST`; `0.0.0.0`, other
-LAN/loopback addresses, and hostnames are rejected. This is deliberate: a
-photo/prompt inference API should not accidentally become a network service,
-and Independence's own client accepts those same two endpoint hosts.
+For the physical acceptance test, hold Enter for five seconds and release to
+enter Ephemeral Mode. Then hold Enter again, wait for the listening cue, press
+`P` while still holding Enter to request a fresh in-memory photo, ask about
+the scene, and release Enter. For the ordered multi-image check, press `P`
+twice before release and ask a comparison question. A successful path is:
 
-## Run Independence against it
-
-Build Independence on the Pi, keep the bridge terminal running, then launch
-the existing physical-button experience:
-
-```bash
-cargo build --release
-./target/release/independence --voice \
-  --profile raspberry-pi-hailo \
-  --input buttons \
-  --input-device /dev/input/by-id/usb-Example-event-kbd \
-  --audio-input 'Exact CPAL input id' \
-  --audio-output 'Exact CPAL output id'
+```text
+local microphone -> local Whisper -> /api/show vision check -> fresh camera still(s)
+-> 127.0.0.1 Hailo bridge -> local Hailo Qwen2-VL -> local Piper
 ```
 
-`raspberry-pi-hailo` resolves these defaults:
+No photo is saved by this path. The bridge receives text plus image bytes and
+does not transcribe, translate, or choose the spoken language. The stock
+Whisper model is English-only; a different local Whisper model must be
+installed and tested separately before relying on another language.
 
-| Setting | Default |
-| --- | --- |
-| backend | `hailo-vlm` |
-| endpoint | `http://127.0.0.1:11435` |
-| model alias | `qwen2-vl:2b` |
-| input | physical buttons (requires the explicit device path) |
-| camera backend | `rpicam-still` |
-| pipeline | existing `transcribe-and-speak` |
+## Optional safe bridge telemetry
 
-The normal precedence remains explicit CLI choice, then environment, then
-profile default. `--backend hailo-vlm` may also be selected without the
-profile. `INDEPENDENCE_HAILO_VLM_URL` is the bridge-specific endpoint override;
-the compatible legacy `OLLAMA_URL` has higher precedence and remains useful for
-an intentional one-launch endpoint override. Both must be **loopback** URLs.
-For example, this runs the Hailo backend with an explicit endpoint/model:
+To retain only local API timing/count metadata, opt in with an existing
+directory when starting terminal A:
 
 ```bash
-OLLAMA_URL='http://127.0.0.1:11435' \
-./target/release/independence --voice \
-  --profile raspberry-pi \
-  --backend hailo-vlm \
-  --model qwen2-vl:2b \
-  --input buttons \
-  --input-device /dev/input/by-id/usb-Example-event-kbd
-```
-
-Hold the physical Talk/Enter button to record, press `P` once while still
-holding it to request one fresh in-memory camera still, then release Talk.
-Independence transcribes locally, verifies the bridge's `/api/show` result,
-encodes the still, and sends the normal request to the loopback bridge.
-
-The bridge forwards UTF-8 question text unchanged; it does not transcribe,
-translate, choose a spoken language, or send audio to Hailo. The stock
-Independence Whisper model is `ggml-base.en.bin`, so default speech recognition
-is English-only. A separately installed multilingual local Whisper model can
-be selected with `INDEPENDENCE_WHISPER_MODEL`; verify that model locally before
-depending on another spoken language. There is no remote translation fallback.
-
-`--pipeline audio-to-audio --backend hailo-vlm` is intentionally unsupported
-in this milestone. The bridge offers a documented text/vision contract only;
-Independence refuses before it opens a microphone for a made-up direct-audio
-API.
-
-## Safe API telemetry
-
-Independence already records its existing request-preparation and HTTP timing
-metadata. The bridge can additionally write local JSONL metadata when you
-choose a path in an existing directory:
-
-```bash
+cd "$HOME/code/independence"
 mkdir -p local-data/telemetry
-HAILO_VLM_TELEMETRY_JSONL="$PWD/local-data/telemetry/hailo-vlm.jsonl" \
-  scripts/run_pi_hailo_vlm_bridge.sh
+HAILO_VLM_TELEMETRY_JSONL="$PWD/local-data/telemetry/hailo-vlm.jsonl" HAILO_APPS_DIR="$HOME/code/hailo-apps" scripts/run_pi_hailo_vlm_bridge.sh
 ```
 
-Each API-call event has only the route, HTTP method/status, outcome, duration,
-model alias, message count, image count, and image byte count. Generation time
-is included when available. It never contains question text, transcript,
-system prompt, base64 image, decoded image, model response, or HEF path.
-Normal stdout still shows final Independence answers and transcripts, and the
-operating system, other local processes, dependencies, removable storage, and
-backups remain outside this bridge's privacy boundary.
+The JSONL records route, method/status, outcome, duration, model alias, and
+message/image counts and byte counts. It does not record prompt text,
+transcripts, image data, model responses, or HEF paths. Normal terminal output
+and the operating system remain outside that narrow telemetry guarantee.
 
-The existing Rust transport telemetry retains `ollama.*` names because the
-bridge deliberately speaks that narrow request/response protocol. Its server
-port (`11435`) and model alias distinguish this bridge; the Python records use
-the `hailo_vlm.*` event names.
+## Completion checklist
 
-## Troubleshooting
-
-| Symptom | Check / recovery |
+| Gate | Required proof |
 | --- | --- |
-| `venv_hailo_apps not found` | Run `./install.sh` inside Hailo Apps, then source `setup_env.sh`; do not source an uncreated environment. |
-| `Hailo Apps Python dependencies are unavailable` | Run `scripts/prepare_pi_hailo_vlm.sh --install-python-dependencies`. |
-| no HEF / zero or many matches | Run `--download-model`; if there are multiple VLM HEFs, set `HAILO_VLM_HEF` to the exact intended file. |
-| `could not bind http://127.0.0.1:11435` | Inspect `ss -ltnp '( sport = :11435 )'`, stop only the identified conflicting local process, or choose a different `HAILO_VLM_PORT`. |
-| capability remains unknown in Independence | Check the bridge is running, then call `POST /api/show` with `qwen2-vl:2b`; do not force camera support. |
-| Hailo device or resource error | Stop the concurrent Hailo-Ollama/other GenAI process, rerun `hailortcli fw-control identify`, and confirm the Hailo Apps/HailoRT versions match the downloaded model. |
-| a request with more than four photos is rejected | The bridge has a deliberate four-photo limit. Split the comparison into separate turns or reduce the selected photos. |
+| 1 | `cargo test --locked` and the release build pass |
+| 2 | one local typed Ollama answer, if the recommended baseline was run |
+| 3 | `hailortcli fw-control identify` reports Hailo-10H |
+| 4 | preflight prints one Qwen2-VL HEF path |
+| 5 | health, show/vision, and bundled-image chat all return successfully |
+| 6 | an explicit physical photo turn receives a local spoken answer |
 
-## Physical acceptance sequence
-
-The automated tests validate request shape, ordered multi-image mapping,
-capability advertisement, the four-photo boundary, and telemetry redaction
-without Hailo hardware. On the Pi, complete these checks before treating the
-integration as verified:
-
-1. Run the bridge and confirm `/healthz` and `/api/show` on port `11435`.
-2. Send the known, non-sensitive JPEG smoke test and confirm a non-empty local
-   response.
-3. Launch `raspberry-pi-hailo`, complete the five-second physical Ephemeral
-   Mode entry gesture, then perform one spoken turn with two `P` photos and a
-   comparison question. Confirm the answer distinguishes their capture order.
-4. Confirm `local-data/telemetry/hailo-vlm.jsonl`, if enabled, has counts and
-   timings but none of the known question/image/answer strings.
-5. Test a text-only spoken turn and any non-English Whisper configuration you
-   plan to use. Record the installed Hailo Apps/HailoRT/model versions with the
-   result.
-
-The bridge does not claim a successful Hailo device, camera, speech, or model
-test until those device-local steps have actually passed.
+Only mark hardware integration complete after the relevant Pi-local checks
+actually pass. Automated tests validate the bridge's request mapping and
+limits, but they do not prove this Pi's HAT, camera, microphone, speaker, or
+downloaded model.

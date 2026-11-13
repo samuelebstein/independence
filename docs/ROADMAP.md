@@ -67,6 +67,12 @@ manually verifiable, privacy-reviewed, and documented before the next begins.
 | 6.6 — Authentication capabilities | Add runtime discovery and adapters for supported authenticators without treating biometrics as encryption keys | 6.3; per-platform capability review |
 | 6.7 — Encrypted backup and restoration | Create authenticated export, nondestructive restore, and recovery-envelope migration | 6.2 and 6.4; approved backup policy |
 
+## Proposed inference/runtime milestone
+
+| Milestone | Objective | Depends on |
+| --- | --- | --- |
+| 7.1 — Model-agnostic local inference capabilities | Let a local backend declare versioned, effective media/context constraints so Independence can select a reviewed Hailo model with `--model` and make generic, bounded camera/context decisions | Owner approval of [`MILESTONE_7_1_MODEL_CAPABILITY_CONTRACT.md`](milestones/MILESTONE_7_1_MODEL_CAPABILITY_CONTRACT.md); verified Qwen2/Qwen3 artifacts and Hailo runtime compatibility |
+
 ## Rules for every future milestone
 
 Use [MILESTONE_TEMPLATE.md](milestones/MILESTONE_TEMPLATE.md). In particular,

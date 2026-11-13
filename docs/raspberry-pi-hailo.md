@@ -197,9 +197,18 @@ Use Hailo Apps' bundled non-personal image for the first real inference test:
 ```bash
 sample_image="$HOME/code/hailo-apps/doc/images/barcode-example.png"
 test -r "$sample_image"
-base64 --wrap=0 "$sample_image" | jq -Rs '{model:"qwen2-vl:2b",stream:false,messages:[{role:"user",content:"Describe this image briefly.",images:[.]}]}' | curl --fail --silent --header 'Content-Type: application/json' --data @- http://127.0.0.1:11435/api/chat | jq .
+base64 --wrap=0 "$sample_image" \
+  | jq -Rs '{model:"qwen2-vl:2b",stream:false,messages:[{role:"user",content:"Describe this image briefly.",images:[.]}]}' \
+  | curl --fail --silent --header 'Content-Type: application/json' --data @- \
+      http://127.0.0.1:11435/api/chat \
+  | jq .
 unset sample_image
 ```
+
+The base64 travels through standard input, so it never becomes a command-line
+argument. Do not use `image_base64="$(...)"` with `jq --arg image`: a normal
+photo can exceed Linux's argument-size limit and produce `Argument list too
+long` before the bridge receives anything.
 
 The response must contain non-empty assistant text. Immediately rerun the
 power gate from section 0; it must still exit successfully before continuing.

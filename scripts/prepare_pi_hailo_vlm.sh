@@ -32,8 +32,39 @@ if [[ ! -d "$hailo_apps_dir/venv_hailo_apps" ]]; then
   exit 2
 fi
 
-# shellcheck source=/dev/null
-source "$hailo_apps_dir/setup_env.sh"
+source_hailo_apps_environment() {
+  # Hailo Apps' setup script expects its own directory as $PWD and expands
+  # optional shell variables without defaults. Source it outside nounset, then
+  # restore this wrapper's safety setting before continuing.
+  local nounset_was_enabled=false
+  local setup_status=0
+
+  case $- in
+    *u*)
+      nounset_was_enabled=true
+      set +u
+      ;;
+  esac
+
+  pushd "$hailo_apps_dir" >/dev/null
+  # shellcheck source=/dev/null
+  if source ./setup_env.sh; then
+    setup_status=0
+  else
+    setup_status=$?
+  fi
+  popd >/dev/null
+
+  if [[ "$nounset_was_enabled" == true ]]; then
+    set -u
+  fi
+  return "$setup_status"
+}
+
+if ! source_hailo_apps_environment; then
+  printf 'Hailo Apps environment setup failed in %s. Resolve its output before continuing.\n' "$hailo_apps_dir" >&2
+  exit 2
+fi
 
 if "$install_python_dependencies"; then
   (

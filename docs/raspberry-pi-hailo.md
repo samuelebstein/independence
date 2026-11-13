@@ -44,9 +44,52 @@ cargo build --release --locked -j 1
 Then rerun the three file checks. Once merged, use the reviewed default branch
 instead; the file checks, not the branch name, are the source of truth.
 
-Keep the AI HAT+ 2 seated, cooled, and powered. Stop Hailo-Ollama or any other
-Hailo GenAI workload before Gate 3: competing GenAI processes can make an
-otherwise correct bridge fail to acquire the accelerator.
+### Required power source and power gate
+
+Keep the AI HAT+ 2 seated and actively cooled. Use a USB-C power supply that
+can provide **5 V / 5 A (25 W)**, ideally the official Raspberry Pi 27 W
+supply. A charger advertising more watts at other voltages is not equivalent:
+the Pi uses its 5 V USB-PD mode. Do not treat an unverified battery, phone
+charger, or Mac USB-C charger as accepted deployment power merely because the
+Pi boots. Raspberry Pi documents the 5 V / 5 A recommendation and the reduced
+peripheral power available from a 3 A supply in its
+[power guide](https://www.raspberrypi.com/documentation/hardware/raspberrypi/power.html).
+
+After every boot, run this read-only check before starting the bridge and again
+immediately after the first real image request:
+
+```bash
+cd "$HOME/code/independence"
+scripts/check_pi_hailo_power.sh
+```
+
+It reports the current `EXT5V_V` rail, temperature, and the firmware's
+current-plus-historical throttling flags. Only `throttled=0x0` passes. A
+nonzero result makes the script exit 1; it is not safe to accept a successful
+model answer as a power pass. Switch to a verified source, reboot to clear the
+per-boot history, and repeat both checks. Do not connect two USB-C power
+sources to the Pi at once.
+
+This exact failure signature was observed after one successful Qwen2-VL image
+request on a Mac USB-C charger:
+
+```text
+2026-11-13T20:57:16+00:00
+EXT5V_V volt(24)=4.99552000V
+temp=51.6'C
+throttled=0x50000
+```
+
+`0x50000` means **under-voltage occurred since boot** (`0x10000`) and
+**throttling occurred since boot** (`0x40000`), per Raspberry Pi's
+[`get_throttled` bit table](https://www.raspberrypi.com/documentation/computers/os.html#vcgencmd).
+It is a failed power gate even though the instantaneous voltage and temperature
+looked healthy. A battery is accepted only if it passes this same pre- and
+post-inference gate.
+
+Stop Hailo-Ollama or any other Hailo GenAI workload before Gate 3: competing
+GenAI processes can make an otherwise correct bridge fail to acquire the
+accelerator.
 
 ## 1. Install and identify the Hailo-10H runtime
 
@@ -107,6 +150,7 @@ helper's import check is the authoritative pass/fail result.
 | Preflight failure | Recovery |
 | --- | --- |
 | `venv_hailo_apps` missing | Rerun `./install.sh --skip-gstreamer` from the Hailo Apps checkout and resolve its first error. |
+| `ZSH_VERSION: unbound variable` | Update to the current Independence checkout. Its Hailo wrappers source Hailo Apps from the correct directory without propagating Bash `nounset`. |
 | Zero HEFs | Rerun the helper with `--download-model`. |
 | Multiple matching HEFs | Select the reviewed Qwen2-VL 2B file only for the bridge command below. |
 
@@ -153,13 +197,13 @@ Use Hailo Apps' bundled non-personal image for the first real inference test:
 ```bash
 sample_image="$HOME/code/hailo-apps/doc/images/barcode-example.png"
 test -r "$sample_image"
-image_base64="$(base64 --wrap=0 "$sample_image")"
-jq -n --arg image "$image_base64" '{model:"qwen2-vl:2b",stream:false,messages:[{role:"user",content:"Describe this image briefly.",images:[$image]}]}' | curl --fail --silent --header 'Content-Type: application/json' --data @- http://127.0.0.1:11435/api/chat | jq .
-unset image_base64 sample_image
+base64 --wrap=0 "$sample_image" | jq -Rs '{model:"qwen2-vl:2b",stream:false,messages:[{role:"user",content:"Describe this image briefly.",images:[.]}]}' | curl --fail --silent --header 'Content-Type: application/json' --data @- http://127.0.0.1:11435/api/chat | jq .
+unset sample_image
 ```
 
-The response must contain non-empty assistant text. A bind error means another
-local process owns port 11435; inspect
+The response must contain non-empty assistant text. Immediately rerun the
+power gate from section 0; it must still exit successfully before continuing.
+A bind error means another local process owns port 11435; inspect
 `ss -ltnp '( sport = :11435 )'` and stop only that process, or choose another
 port. A Hailo resource error means return to Gates 1–2 and check for a
 concurrent Hailo GenAI process or a model/runtime mismatch.
@@ -239,6 +283,7 @@ outside that narrow guarantee.
 | Gate | Required proof |
 | --- | --- |
 | Base | a typed local Ollama answer from the base guide |
+| Power | `scripts/check_pi_hailo_power.sh` passes before and after the bundled-image chat |
 | 1 | `hailortcli fw-control identify` reports Hailo-10H |
 | 2 | preflight prints exactly one Qwen2-VL HEF path |
 | 3 | health, show/vision, and bundled-image chat succeed |

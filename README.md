@@ -213,6 +213,7 @@ For a Pi with a Hailo-10H-backed AI HAT+ 2, use the deliberately separate
 `raspberry-pi-hailo` profile after starting the local bridge:
 
 ```bash
+scripts/check_pi_hailo_power.sh
 scripts/run_pi_hailo_vlm_bridge.sh
 
 ./target/release/independence --voice \
@@ -226,6 +227,9 @@ scripts/run_pi_hailo_vlm_bridge.sh
 The bridge listens only at `http://127.0.0.1:11435`, advertises `vision`
 through the existing `/api/show` capability check, and accepts the same
 non-streaming `/api/chat` image shape as the local Linux Ollama vision setup.
+The power check is read-only and must report `throttled=0x0` before and after a
+first image request; it rejects historical undervoltage/throttling too, rather
+than treating a single successful response as proof of adequate power.
 The profile selects backend `hailo-vlm`, model alias `qwen2-vl:2b`, and the
 existing `rpicam-still` camera backend. It does not make an image request
 without a verified `vision` response. It supports up to four current photos in
@@ -898,7 +902,7 @@ write opt-in metadata-only JSONL telemetry. It never records prompts, image
 bytes/base64, transcripts, or responses. Hailo-Ollama remains a different
 LLM-serving path; it is not used for this vision profile. See the
 [Pi Hailo runbook](docs/raspberry-pi-hailo.md) for the explicit Hailo Apps
-setup and device acceptance sequence.
+setup, power gate, and device acceptance sequence.
 
 `--dictate --audio-input <exact device id>` now uses the same explicit
 microphone selection form as `--voice`. The selected ID is carried through the
@@ -1240,6 +1244,7 @@ tools/
   hailo_vlm_bridge.py      local Hailo VLM -> Ollama-compatible HTTP bridge
 
 scripts/
+  check_pi_hailo_power.sh    Pi voltage/temperature/throttling acceptance gate
   prepare_pi_hailo_vlm.sh  explicit Hailo Apps/model preflight
   run_pi_hailo_vlm_bridge.sh activates Hailo Apps and starts port 11435
 ```

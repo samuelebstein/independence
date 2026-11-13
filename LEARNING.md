@@ -579,7 +579,7 @@ cancellation, explicit text-only camera rejection, direct subprocess arguments,
 bounded output, and child cancellation/reaping. It does **not** prove an
 attached Pi keyboard, USB microphone/speaker, ARM64 Whisper/Piper installation,
 or Camera Module 3 Wide. Those remain separate, documented hardware checks in
-[`docs/rasberry-pi.md`](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
+[`docs/raspberry-pi.md`](docs/raspberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
 
 ## Latest milestone: local Hailo VLM bridge
 

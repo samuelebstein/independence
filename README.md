@@ -68,7 +68,7 @@ Read these files in this order:
    editable teaching guidance.
 12. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
-13. [`docs/rasberry-pi.md`](docs/rasberry-pi.md) — the base Raspberry Pi 5
+13. [`docs/raspberry-pi.md`](docs/raspberry-pi.md) — the base Raspberry Pi 5
    hardware installation path.
 14. [`docs/raspberry-pi-hailo.md`](docs/raspberry-pi-hailo.md) — the
    loopback-only Hailo VLM bridge, Pi HAT setup, and physical acceptance
@@ -173,18 +173,19 @@ OLLAMA_MODEL=gemma3:1b \
 
 For the attached-keyboard button controller, USB microphone/speaker, local
 Whisper, and Piper, use this explicit Gemma command. Replace the input-device
-path and ALSA IDs with your own selected values; prefer a stable
-`/dev/input/by-id/...` or `/dev/input/independence/button-kbd` path rather than
-assuming `/dev/input/event7` stays the same after reconnecting hardware.
+path and ALSA IDs with values from the [Raspberry Pi guide](docs/raspberry-pi.md).
+Rerun `--input-devices` after reconnecting hardware or rebooting, then use the
+current matching `/dev/input/eventN` path.
 
 ```bash
+PI_BUTTON_DEVICE='/dev/input/event2' # replace with the current matching keyboard
 INDEPENDENCE_PIPER_COMMAND="$HOME/.local/share/independence/piper-venv/bin/piper" \
 ./target/release/independence \
   --voice \
   --mode ephemeral \
   --profile raspberry-pi \
   --input buttons \
-  --input-device /dev/input/event7 \
+  --input-device "$PI_BUTTON_DEVICE" \
   --audio-input 'alsa:plughw:CARD=Device,DEV=0' \
   --audio-output 'alsa:plughw:CARD=Device,DEV=0' \
   --backend ollama \
@@ -202,8 +203,8 @@ memory use and slower responses.
 In Pi button mode, launch from SSH if convenient, then use the **physically
 attached** keyboard: hold Enter for five seconds and release to enter
 Ephemeral Mode, then hold Enter again to record. SSH Enter, `P`, and Escape do
-not control the device. See the [Raspberry Pi guide](docs/rasberry-pi.md) for
-build prerequisites, permissions, stable input-device setup, and independent
+not control the device. See the [Raspberry Pi guide](docs/raspberry-pi.md) for
+the short hardware checks, current keyboard-path selection, and independent
 microphone/speaker/camera tests.
 
 ### Raspberry Pi: Hailo VLM profile
@@ -1300,8 +1301,8 @@ use. Select a vision model with `--model` or `OLLAMA_MODEL`; the Ollama
 backend's own `/api/show` metadata is the authority for camera use. There is
 no application image-support override. The Pi profile also selects
 `rpicam-still`; its direct child process writes one bounded JPEG to memory, is
-validated, and is released before Ollama is asked. Details, permissions, and
-the physical acceptance sequence are in [the Raspberry Pi guide](docs/rasberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
+validated, and is released before Ollama is asked. The physical acceptance
+sequence is in [the Raspberry Pi guide](docs/raspberry-pi.md#4-five-to-ten-minute-hardware-check).
 
 ### Latest: pipelines, model backends, and isolated audio-to-audio plumbing
 

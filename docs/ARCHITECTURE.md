@@ -13,7 +13,7 @@ the future encryption/authentication design in
 | Invocation | Entry function | Current purpose | Does not do |
 | --- | --- | --- | --- |
 | `cargo run` | `app::run_with_mode` | Typed **Ephemeral Mode** question, `/camera`, and temporary follow-ups | Open microphone or speaker; load local files with `/look`; access private storage |
-| `cargo run -- --dictate` | `app::run_dictation` / `dictation::run` | One local ephemeral recording → Whisper transcript → terminal display | Call Ollama, run a spoken command, or open camera |
+| `cargo run -- --dictate [--audio-input <exact device id>]` | `app::run_dictation` / `dictation::run` | One local ephemeral recording → Whisper transcript → terminal display | Call Ollama, run a spoken command, or open camera |
 | `cargo run -- --voice` | `app::run_voice_with_options` | Hold-to-talk → local Whisper → main controller → local Ollama; optional Piper/Rodio speech | Automatic listening, command parsing from speech, or echo cancellation |
 | `--voice --pipeline audio-to-audio` | `audio_to_audio::run` | Isolated recording-to-WAV plumbing experiment | Whisper, Piper, camera, text history, or a real audio model |
 | list/test commands | `app::list_*`, `app::run_speech_test` | Inspect devices or test local speech output | Start a normal interaction |

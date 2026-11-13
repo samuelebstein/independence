@@ -157,7 +157,7 @@ pub struct VoiceLaunchOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchCommand {
     Interactive { mode: OperatingMode },
-    Dictate,
+    Dictate { audio_input: Option<String> },
     Voice(VoiceLaunchOptions),
     ListAudioOutputs,
     ListAudioInputs,
@@ -183,7 +183,8 @@ pub fn parse_arguments(arguments: &[OsString]) -> Result<LaunchCommand, String> 
         ["--mode", mode] => Ok(LaunchCommand::Interactive {
             mode: OperatingMode::parse(mode)?,
         }),
-        ["--dictate"] => Ok(LaunchCommand::Dictate),
+        ["--dictate", remaining @ ..] => parse_dictate_options(remaining)
+            .map(|audio_input| LaunchCommand::Dictate { audio_input }),
         ["--audio-devices"] => Ok(LaunchCommand::ListAudioOutputs),
         ["--audio-input-devices"] => Ok(LaunchCommand::ListAudioInputs),
         ["--input-devices"] => Ok(LaunchCommand::ListInputDevices),
@@ -244,6 +245,14 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
         index += 2;
     }
     Ok(options)
+}
+
+fn parse_dictate_options(values: &[&str]) -> Result<Option<String>, String> {
+    match values {
+        [] => Ok(None),
+        ["--audio-input", value] => Ok(Some((*value).to_owned())),
+        _ => Err("--dictate accepts only --audio-input <exact device id>".into()),
+    }
 }
 
 fn parse_speak_test_options(values: &[&str]) -> Result<Option<String>, String> {
@@ -318,9 +327,34 @@ mod tests {
     }
 
     #[test]
+    fn dictate_accepts_one_explicit_audio_input() {
+        assert_eq!(
+            parse(&["--dictate"]),
+            Ok(LaunchCommand::Dictate { audio_input: None })
+        );
+        assert_eq!(
+            parse(&["--dictate", "--audio-input", "alsa:usb-microphone"]),
+            Ok(LaunchCommand::Dictate {
+                audio_input: Some("alsa:usb-microphone".into())
+            })
+        );
+    }
+
+    #[test]
     fn rejects_unknown_or_duplicate_options() {
         assert!(parse(&["--voice", "--input", "touch"]).is_err());
         assert!(parse(&["--voice", "--input", "terminal", "--input", "buttons"]).is_err());
+        assert!(parse(&["--dictate", "--audio-output", "alsa:usb-speaker"]).is_err());
+        assert!(
+            parse(&[
+                "--dictate",
+                "--audio-input",
+                "first",
+                "--audio-input",
+                "second"
+            ])
+            .is_err()
+        );
         assert!(parse(&["--input-devices", "--voice"]).is_err());
     }
 

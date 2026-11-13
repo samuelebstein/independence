@@ -134,8 +134,8 @@ pub trait RecordingHandle: Send {
     fn wait(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
-/// CPAL implementation selected by the optional `INDEPENDENCE_MICROPHONE`
-/// exact device-name environment variable.
+/// CPAL implementation selected by an exact device identifier or name from the
+/// launch boundary, with the existing environment fallback for compatibility.
 #[derive(Clone, Debug, Default)]
 pub struct CpalRecorder {
     requested_name: Option<String>,
@@ -178,7 +178,7 @@ impl CpalRecorder {
             }
 
             return Err(format!(
-                "microphone `{requested_name}` was not found; unset INDEPENDENCE_MICROPHONE or choose an exact ID/name from --audio-input-devices"
+                "microphone `{requested_name}` was not found; choose an exact ID/name from --audio-input-devices"
             ));
         }
 

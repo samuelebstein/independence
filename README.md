@@ -142,7 +142,7 @@ not available until a later authentication milestone.
 | What you want to do | Command | Model and device behavior |
 | --- | --- | --- |
 | Typed local conversation, with an optional fresh V4L2 camera still | `cargo run -- --mode ephemeral` | Uses the configured/default local Ollama model: currently `qwen3-vl:4b-instruct` unless `OLLAMA_MODEL` is set for that launch. |
-| Transcribe only; never contact Ollama | `cargo run -- --dictate` | Uses the default or explicitly configured microphone and local Whisper. |
+| Transcribe only; never contact Ollama | `cargo run -- --dictate [--audio-input 'Exact CPAL input id']` | Uses the default or explicitly selected microphone and local Whisper. |
 | Hold-to-talk voice conversation | `cargo run -- --voice --mode ephemeral --input terminal --model qwen3-vl:4b-instruct` | Uses the terminal Enter/P/Escape controls, local Whisper, local Ollama, and Piper when configured. The default microphone and speaker are used unless selected explicitly. |
 
 For a specific laptop microphone or speaker, append the exact IDs reported by
@@ -389,15 +389,15 @@ its exact CPAL device name or ID, first inspect it without opening a stream:
 cargo run -- --audio-input-devices
 ```
 
-`--dictate` uses the existing environment selector for one launch:
+Select a particular microphone for either mode with the same explicit
+`--audio-input` option:
 
 ```bash
-INDEPENDENCE_MICROPHONE='Exact microphone name' cargo run -- --dictate
+cargo run -- --dictate --audio-input 'Exact CPAL input id'
 ```
 
-That command changes neither the default device nor shell configuration. If
-the requested name is unavailable, READY reports the problem and recording
-does not start.
+That choice applies only to this launch. If the requested ID is unavailable,
+READY reports the problem and recording does not start.
 
 To use the speech-to-controller bridge, first ensure the same local Ollama
 setup described above is running, then launch:
@@ -413,15 +413,14 @@ example, this selects both an input device and a model without changing system
 defaults or shell configuration:
 
 ```bash
-INDEPENDENCE_MICROPHONE='Exact microphone name' \
 OLLAMA_MODEL=qwen3-vl:4b-instruct \
-cargo run -- --voice
+cargo run -- --voice --audio-input 'Exact CPAL input id'
 ```
 
-For `--voice`, the explicit `--audio-input 'Exact CPAL input id'` option has
-the same selection behavior and wins over `INDEPENDENCE_MICROPHONE`. It is
-especially useful alongside the Raspberry Pi button profile; run
-`cargo run -- --input-devices` to list a separate attached-keyboard controller.
+The same `--audio-input 'Exact CPAL input id'` form selects a microphone for
+both `--dictate` and `--voice`. It is especially useful alongside the Raspberry
+Pi button profile; run `cargo run -- --input-devices` to list a separate
+attached-keyboard controller.
 
 `--dictate` retains its original tap-Enter controls. `--voice` has separate,
 button-controlled behavior and requires a terminal that supports Kitty/CSI-u
@@ -901,6 +900,12 @@ LLM-serving path; it is not used for this vision profile. See the
 [Pi Hailo runbook](docs/raspberry-pi-hailo.md) for the explicit Hailo Apps
 setup and device acceptance sequence.
 
+`--dictate --audio-input <exact device id>` now uses the same explicit
+microphone selection form as `--voice`. The selected ID is carried through the
+launch path to the local recorder; it does not expose audio or start a model
+service. Omitting the flag keeps the existing default/legacy configuration
+fallback for compatibility.
+
 ### Previously: Terminal interface and diagnostic separation
 
 The terminal is now a deliberate user interface rather than a `tracing`
@@ -998,11 +1003,11 @@ Enter press / typed dispatch
 ```mermaid
 flowchart TD
     Main[src/main.rs] --> Typed["cargo run"]
-    Main --> Dictate["cargo run -- --dictate"]
+    Main --> Dictate["cargo run -- --dictate [--audio-input ID]"]
     Main --> Voice["cargo run -- --voice"]
 
     Typed --> TypedApp["app::run_with_mode(Ephemeral)"]
-    Dictate --> DictationApp["app::run_dictation()"]
+    Dictate --> DictationApp["app::run_dictation(audio_input)"]
     Voice --> VoiceApp["app::run_voice()"]
 
     TypedApp --> LineInput["listen/mod.rs\nstdin line reader"]
@@ -1013,7 +1018,7 @@ flowchart TD
 | Mode | What it does | What it deliberately does not do |
 | --- | --- | --- |
 | `cargo run` | Typed Ephemeral questions, `/camera`, accepted temporary-photo follow-ups | Use microphone input or load local files with `/look` |
-| `cargo run -- --dictate` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
+| `cargo run -- --dictate [--audio-input <exact device id>]` | Record → local Whisper → display transcript | Contact Ollama or execute spoken commands |
 | `cargo run -- --voice` | cue → hold-to-record → local Whisper → local Ollama → terminal answer → optional local Piper/HAL playback | Parse spoken commands, autonomously use a camera, or perform echo cancellation |
 
 ### Typed question path

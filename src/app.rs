@@ -259,11 +259,13 @@ async fn discover_model_capabilities(client: &OllamaClient) {
 
 /// Runs standalone local dictation without constructing Ollama or camera
 /// services. Its transcript deliberately stops at terminal display.
-pub async fn run_dictation() -> Result<(), AppError> {
+pub async fn run_dictation(audio_input: Option<String>) -> Result<(), AppError> {
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
     let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)?;
-    let result = dictation::run().await.map_err(AppError::Dictation);
+    let result = dictation::run(audio_input)
+        .await
+        .map_err(AppError::Dictation);
     finish_ephemeral_session(&mut security, session)?;
     result
 }

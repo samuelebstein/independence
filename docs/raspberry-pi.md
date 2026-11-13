@@ -190,14 +190,12 @@ You should hear: “Hello, Steve. I'm here to help.” If not, choose the exact
 
 ### Microphone input
 
-This records and transcribes locally without calling Ollama. `--dictate`
-currently has no `--audio-input` flag, so its one required device selector is
-`INDEPENDENCE_MICROPHONE`; the full voice command below uses flags for both
-devices.
+This records and transcribes locally without calling Ollama. It uses the same
+explicit `--audio-input` parameter as the full voice command below.
 
 ```bash
-INDEPENDENCE_MICROPHONE="$PI_TEST_MIC" \
-  ./target/release/independence --dictate
+./target/release/independence --dictate \
+  --audio-input "$PI_TEST_MIC"
 ```
 
 When it says it is ready, press **Enter once**, speak a short sentence, then

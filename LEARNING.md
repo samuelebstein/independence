@@ -64,6 +64,10 @@ tap-to-start/tap-to-finish interaction. `--voice` uses a terminal that can
 report real press and release events, so it does not guess when Enter was
 released:
 
+Both modes accept `--audio-input <exact device id>` when a non-default
+microphone is needed. That is a per-launch device choice; omitting it keeps
+the default/legacy selection behavior.
+
 ```text
 hold-to-talk Enter press
   -> VoiceRuntime queues the fixed "i'm listening" cue to SpeechService
@@ -389,17 +393,18 @@ For dictation, after completing the setup in `README.md`, run this from the
 repository root:
 
 ```bash
-cargo run -- --dictate
+cargo run -- --dictate --audio-input 'Exact CPAL input id'
 ```
 
-At READY, press Enter, say one short sentence, then press Enter again. The
-microphone indicator should become TRANSCRIBING only after the stream has been
-released. Press Enter for a second recording and Esc to discard it; no text
-from it should appear. Finally record a third, distinct sentence. The first
-and third texts may appear, but never the cancelled second text. If model
-loading or recognition takes longer than expected, Esc is still processed by
-the raw-key thread; the UI waits for cooperative native cleanup before it
-returns to READY.
+Replace the quoted value with the exact ID from `--audio-input-devices`, or
+omit the option to use the default microphone. At READY, press Enter, say one
+short sentence, then press Enter again. The microphone indicator should become
+TRANSCRIBING only after the stream has been released. Press Enter for a second
+recording and Esc to discard it; no text from it should appear. Finally record
+a third, distinct sentence. The first and third texts may appear, but never
+the cancelled second text. If model loading or recognition takes longer than
+expected, Esc is still processed by the raw-key thread; the UI waits for
+cooperative native cleanup before it returns to READY.
 
 For the integrated bridge, use a running local Ollama server and launch:
 

@@ -54,6 +54,11 @@ pub(crate) async fn run(
                 client.expect("Ollama backend was initialized before audio runtime launch");
             backend_for_ollama(client.model(), client.capabilities())?
         }
+        ModelBackend::HailoVlm => {
+            return Err(AudioToAudioError::HailoVlmAudioUnsupported {
+                model: configured_model,
+            });
+        }
     };
     let (main_sender, mut main_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (capture_sender, mut capture_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -86,7 +91,7 @@ pub(crate) async fn run(
     speak::process("voice_pipeline", "audio-to-audio");
     let model_label = match resolved.backend {
         ModelBackend::Fixture => format!("{configured_model} (not used by fixture)"),
-        ModelBackend::Ollama => configured_model,
+        ModelBackend::Ollama | ModelBackend::HailoVlm => configured_model,
     };
     speak::process("voice_model", model_label);
     speak::process(
@@ -1032,6 +1037,10 @@ pub enum AudioToAudioError {
         "Ollama model `{model}` advertised audio input and output, but Independence has no documented direct-audio request/response schema for this server. No microphone was opened and no audio was sent."
     )]
     OllamaAudioProtocolUndocumented { model: String },
+    #[error(
+        "Hailo VLM model `{model}` cannot run direct audio-to-audio. The local bridge implements text and vision only; no microphone was opened and no audio was sent."
+    )]
+    HailoVlmAudioUnsupported { model: String },
 }
 
 #[cfg(test)]

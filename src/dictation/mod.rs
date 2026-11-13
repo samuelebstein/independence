@@ -145,9 +145,13 @@ pub enum DictationError {
 }
 
 /// Runs the deliberately separate dictation-only terminal experience.
-pub async fn run() -> Result<(), DictationError> {
+pub async fn run(audio_input: Option<String>) -> Result<(), DictationError> {
+    let recorder = match audio_input {
+        Some(audio_input) => CpalRecorder::with_requested_name(Some(audio_input)),
+        None => CpalRecorder::from_environment(),
+    };
     run_with_services(
-        Arc::new(CpalRecorder::from_environment()),
+        Arc::new(recorder),
         Arc::new(WhisperTranscriber::from_environment()),
     )
     .await

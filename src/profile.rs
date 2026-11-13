@@ -17,8 +17,12 @@ use crate::{
 };
 
 const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
+const DEFAULT_HAILO_VLM_URL: &str = "http://127.0.0.1:11435";
 const LAPTOP_MODEL: &str = "qwen3-vl:4b-instruct";
 const PI_TEXT_MODEL: &str = "gemma3:1b";
+/// This is the local bridge's model alias, not an Ollama model tag. The bridge
+/// maps it to the pre-downloaded Hailo Qwen2-VL HEF.
+const HAILO_VLM_MODEL: &str = "qwen2-vl:2b";
 const DEFAULT_WHISPER_MODEL: &str = "local-data/whisper/ggml-base.en.bin";
 
 /// Camera backends that the one existing camera service can select.
@@ -74,8 +78,9 @@ pub(crate) struct ResolvedVoiceProfile {
     /// The selected model's name belongs to the backend choice, not to a
     /// hardware profile. The fixture backend deliberately leaves it unused.
     pub model: String,
-    /// Ollama-only connection configuration. This is absent for the fixture
-    /// plumbing backend so it cannot accidentally probe or contact Ollama.
+    /// Strict loopback-only configuration for an Ollama-compatible endpoint.
+    /// This is absent for the fixture plumbing backend so it cannot
+    /// accidentally probe or contact a model server.
     pub ollama: Option<OllamaConfig>,
     pub camera_backend: CameraBackendSelection,
     pub pipeline: VoicePipeline,
@@ -94,6 +99,7 @@ struct EnvironmentOverrides {
     backend: Option<String>,
     model: Option<String>,
     ollama_url: Option<String>,
+    hailo_vlm_url: Option<String>,
     // Kept for compatibility with the existing typed/Ollama launch path.
     ollama_model: Option<String>,
     camera_backend: Option<String>,
@@ -111,6 +117,7 @@ impl EnvironmentOverrides {
             backend: nonempty_var("INDEPENDENCE_BACKEND"),
             model: nonempty_var("INDEPENDENCE_MODEL"),
             ollama_url: nonempty_var("OLLAMA_URL"),
+            hailo_vlm_url: nonempty_var("INDEPENDENCE_HAILO_VLM_URL"),
             ollama_model: nonempty_var("OLLAMA_MODEL"),
             camera_backend: nonempty_var("INDEPENDENCE_CAMERA_BACKEND"),
         }
@@ -125,6 +132,7 @@ fn nonempty_var(key: &str) -> Option<String> {
 struct ProfileDefaults {
     input: VoiceInputMode,
     model: &'static str,
+    backend: ModelBackend,
     camera_backend: CameraBackendSelection,
 }
 
@@ -133,11 +141,19 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
         Some(HardwareProfile::RaspberryPi) => ProfileDefaults {
             input: VoiceInputMode::Buttons,
             model: PI_TEXT_MODEL,
+            backend: ModelBackend::Ollama,
+            camera_backend: CameraBackendSelection::RpiCamStill,
+        },
+        Some(HardwareProfile::RaspberryPiHailo) => ProfileDefaults {
+            input: VoiceInputMode::Buttons,
+            model: HAILO_VLM_MODEL,
+            backend: ModelBackend::HailoVlm,
             camera_backend: CameraBackendSelection::RpiCamStill,
         },
         None => ProfileDefaults {
             input: VoiceInputMode::Terminal,
             model: LAPTOP_MODEL,
+            backend: ModelBackend::Ollama,
             camera_backend: CameraBackendSelection::V4l,
         },
     }
@@ -148,8 +164,9 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
 ///
 /// `--input` / `--input-device` / `--audio-input` / `--audio-output` /
 /// `--model` / `--pipeline` / `--backend` > environment > profile defaults >
-/// ordinary laptop defaults. Hardware profiles choose only hardware defaults;
-/// model capabilities are discovered from the selected backend at runtime.
+/// ordinary laptop defaults. The Hailo Pi profile also chooses its documented
+/// local bridge backend; model capabilities are still discovered from that
+/// backend at runtime rather than assumed from a profile name.
 pub(crate) fn resolve_voice_profile(
     options: &VoiceLaunchOptions,
 ) -> Result<ResolvedVoiceProfile, ProfileError> {
@@ -176,7 +193,7 @@ fn resolve_with_environment(
         Some(backend) => backend,
         None => match environment.backend.as_deref() {
             Some(value) => ModelBackend::parse(value).map_err(ProfileError::InvalidBackend)?,
-            None => ModelBackend::Ollama,
+            None => defaults.backend,
         },
     };
     let model = options
@@ -184,7 +201,13 @@ fn resolve_with_environment(
         .clone()
         .or(environment.model)
         .or(environment.ollama_model)
-        .unwrap_or_else(|| defaults.model.to_owned());
+        .unwrap_or_else(|| {
+            if backend == ModelBackend::HailoVlm {
+                HAILO_VLM_MODEL.to_owned()
+            } else {
+                defaults.model.to_owned()
+            }
+        });
     if model.trim().is_empty() {
         return Err(ProfileError::EmptyModel);
     }
@@ -193,10 +216,19 @@ fn resolve_with_environment(
     // deliberately does not declare model capabilities or pipeline support:
     // the selected backend decides those at runtime from its own metadata and
     // implemented request/response contract.
-    let ollama = if backend == ModelBackend::Ollama {
+    let ollama = if backend.uses_ollama_compatible_http() {
         let endpoint = environment
             .ollama_url
-            .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_owned());
+            .or(if backend == ModelBackend::HailoVlm {
+                environment.hailo_vlm_url
+            } else {
+                None
+            })
+            .unwrap_or_else(|| match backend {
+                ModelBackend::HailoVlm => DEFAULT_HAILO_VLM_URL.to_owned(),
+                ModelBackend::Ollama => DEFAULT_OLLAMA_URL.to_owned(),
+                ModelBackend::Fixture => unreachable!("fixture has no HTTP endpoint"),
+            });
         Some(OllamaConfig::new(&endpoint, model.clone()).map_err(ProfileError::Ollama)?)
     } else {
         None
@@ -248,7 +280,7 @@ pub enum ProfileError {
     TerminalDevicePath,
     #[error("INDEPENDENCE_CAMERA_BACKEND must be `v4l2` or `rpicam-still`, not `{0}")]
     InvalidCameraBackend(String),
-    #[error("unknown backend `{0}`; use `ollama` or `fixture`")]
+    #[error("unknown backend `{0}`; use `ollama`, `hailo-vlm`, or `fixture`")]
     InvalidBackend(String),
     #[error("model name must not be empty")]
     EmptyModel,
@@ -273,7 +305,64 @@ mod tests {
         let defaults = defaults_for(Some(HardwareProfile::RaspberryPi));
         assert_eq!(defaults.input, VoiceInputMode::Buttons);
         assert_eq!(defaults.model, "gemma3:1b");
+        assert_eq!(defaults.backend, ModelBackend::Ollama);
         assert_eq!(defaults.camera_backend, CameraBackendSelection::RpiCamStill);
+    }
+
+    #[test]
+    fn hailo_pi_profile_selects_the_local_bridge_but_not_its_capabilities() {
+        let defaults = defaults_for(Some(HardwareProfile::RaspberryPiHailo));
+        assert_eq!(defaults.input, VoiceInputMode::Buttons);
+        assert_eq!(defaults.model, "qwen2-vl:2b");
+        assert_eq!(defaults.backend, ModelBackend::HailoVlm);
+        assert_eq!(defaults.camera_backend, CameraBackendSelection::RpiCamStill);
+
+        let resolved = resolve_with_environment(
+            &VoiceLaunchOptions {
+                profile: Some(HardwareProfile::RaspberryPiHailo),
+                input_device: Some("/dev/input/by-id/hailo-buttons".into()),
+                ..VoiceLaunchOptions::default()
+            },
+            EnvironmentOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.backend, ModelBackend::HailoVlm);
+        assert_eq!(resolved.model, "qwen2-vl:2b");
+        assert_eq!(
+            resolved.ollama,
+            Some(crate::think::OllamaConfig::new("http://127.0.0.1:11435", "qwen2-vl:2b").unwrap())
+        );
+    }
+
+    #[test]
+    fn hailo_endpoint_override_is_specific_and_still_loopback_validated() {
+        let options = VoiceLaunchOptions {
+            profile: Some(HardwareProfile::RaspberryPiHailo),
+            input_device: Some("/dev/input/by-id/hailo-buttons".into()),
+            ..VoiceLaunchOptions::default()
+        };
+        let resolved = resolve_with_environment(
+            &options,
+            EnvironmentOverrides {
+                hailo_vlm_url: Some("http://127.0.0.1:11500".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.ollama,
+            Some(crate::think::OllamaConfig::new("http://127.0.0.1:11500", "qwen2-vl:2b").unwrap())
+        );
+
+        let error = resolve_with_environment(
+            &options,
+            EnvironmentOverrides {
+                hailo_vlm_url: Some("http://192.0.2.10:11500".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("loopback"));
     }
 
     #[test]

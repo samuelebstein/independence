@@ -9,24 +9,30 @@ use std::{ffi::OsString, path::PathBuf};
 
 use crate::security::OperatingMode;
 
-/// The one hardware profile currently understood by the application.
+/// Hardware profiles understood by the application.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HardwareProfile {
     RaspberryPi,
+    /// A Raspberry Pi with a local Hailo VLM bridge. This keeps the ordinary
+    /// Pi physical defaults while selecting the explicitly supported local
+    /// inference adapter for that attached accelerator.
+    RaspberryPiHailo,
 }
 
 impl HardwareProfile {
     pub fn label(self) -> &'static str {
         match self {
             Self::RaspberryPi => "raspberry-pi",
+            Self::RaspberryPiHailo => "raspberry-pi-hailo",
         }
     }
 
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "raspberry-pi" => Ok(Self::RaspberryPi),
+            "raspberry-pi-hailo" => Ok(Self::RaspberryPiHailo),
             _ => Err(format!(
-                "unknown profile `{value}`; the only supported profile is `raspberry-pi`"
+                "unknown profile `{value}`; use `raspberry-pi` or `raspberry-pi-hailo`"
             )),
         }
     }
@@ -69,13 +75,17 @@ impl VoicePipeline {
 
 /// The runtime responsible for serving the selected model.
 ///
-/// `ollama` is the ordinary local model runtime. `fixture` is deliberately
-/// model-less: it is a deterministic direct-audio plumbing check, not an
-/// alternate conversational model. Keeping this distinct from `VoicePipeline`
-/// lets a future backend use either pipeline without changing hardware setup.
+/// `ollama` is the ordinary local model runtime. `hailo-vlm` is Independence's
+/// loopback-only Hailo VLM bridge, which deliberately implements the narrow
+/// Ollama HTTP request/response contract Independence already uses. `fixture`
+/// is deliberately model-less: it is a deterministic direct-audio plumbing
+/// check, not an alternate conversational model. Keeping this distinct from
+/// `VoicePipeline` lets a backend select its documented operations without
+/// changing hardware setup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelBackend {
     Ollama,
+    HailoVlm,
     Fixture,
 }
 
@@ -83,16 +93,25 @@ impl ModelBackend {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Ollama => "ollama",
+            Self::HailoVlm => "hailo-vlm",
             Self::Fixture => "fixture",
         }
+    }
+
+    /// Both native Ollama and the local Hailo bridge use the same deliberately
+    /// narrow, loopback-only HTTP contract. The transport still verifies the
+    /// advertised capabilities at runtime instead of trusting this selection.
+    pub(crate) const fn uses_ollama_compatible_http(self) -> bool {
+        matches!(self, Self::Ollama | Self::HailoVlm)
     }
 
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "ollama" => Ok(Self::Ollama),
+            "hailo-vlm" => Ok(Self::HailoVlm),
             "fixture" => Ok(Self::Fixture),
             _ => Err(format!(
-                "unknown backend `{value}`; use `ollama` or `fixture`"
+                "unknown backend `{value}`; use `ollama`, `hailo-vlm`, or `fixture`"
             )),
         }
     }
@@ -138,7 +157,7 @@ pub struct VoiceLaunchOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchCommand {
     Interactive { mode: OperatingMode },
-    Dictate,
+    Dictate { audio_input: Option<String> },
     Voice(VoiceLaunchOptions),
     ListAudioOutputs,
     ListAudioInputs,
@@ -164,7 +183,8 @@ pub fn parse_arguments(arguments: &[OsString]) -> Result<LaunchCommand, String> 
         ["--mode", mode] => Ok(LaunchCommand::Interactive {
             mode: OperatingMode::parse(mode)?,
         }),
-        ["--dictate"] => Ok(LaunchCommand::Dictate),
+        ["--dictate", remaining @ ..] => parse_dictate_options(remaining)
+            .map(|audio_input| LaunchCommand::Dictate { audio_input }),
         ["--audio-devices"] => Ok(LaunchCommand::ListAudioOutputs),
         ["--audio-input-devices"] => Ok(LaunchCommand::ListAudioInputs),
         ["--input-devices"] => Ok(LaunchCommand::ListInputDevices),
@@ -225,6 +245,14 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
         index += 2;
     }
     Ok(options)
+}
+
+fn parse_dictate_options(values: &[&str]) -> Result<Option<String>, String> {
+    match values {
+        [] => Ok(None),
+        ["--audio-input", value] => Ok(Some((*value).to_owned())),
+        _ => Err("--dictate accepts only --audio-input <exact device id>".into()),
+    }
 }
 
 fn parse_speak_test_options(values: &[&str]) -> Result<Option<String>, String> {
@@ -299,9 +327,34 @@ mod tests {
     }
 
     #[test]
+    fn dictate_accepts_one_explicit_audio_input() {
+        assert_eq!(
+            parse(&["--dictate"]),
+            Ok(LaunchCommand::Dictate { audio_input: None })
+        );
+        assert_eq!(
+            parse(&["--dictate", "--audio-input", "alsa:usb-microphone"]),
+            Ok(LaunchCommand::Dictate {
+                audio_input: Some("alsa:usb-microphone".into())
+            })
+        );
+    }
+
+    #[test]
     fn rejects_unknown_or_duplicate_options() {
         assert!(parse(&["--voice", "--input", "touch"]).is_err());
         assert!(parse(&["--voice", "--input", "terminal", "--input", "buttons"]).is_err());
+        assert!(parse(&["--dictate", "--audio-output", "alsa:usb-speaker"]).is_err());
+        assert!(
+            parse(&[
+                "--dictate",
+                "--audio-input",
+                "first",
+                "--audio-input",
+                "second"
+            ])
+            .is_err()
+        );
         assert!(parse(&["--input-devices", "--voice"]).is_err());
     }
 
@@ -346,6 +399,25 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.contains("renamed to `--backend`"));
+    }
+
+    #[test]
+    fn hailo_profile_and_backend_are_explicit_choices() {
+        let options = match parse(&[
+            "--voice",
+            "--profile",
+            "raspberry-pi-hailo",
+            "--backend",
+            "hailo-vlm",
+        ])
+        .unwrap()
+        {
+            LaunchCommand::Voice(options) => options,
+            _ => unreachable!(),
+        };
+        assert_eq!(options.profile, Some(HardwareProfile::RaspberryPiHailo));
+        assert_eq!(options.backend, Some(ModelBackend::HailoVlm));
+        assert!(ModelBackend::HailoVlm.uses_ollama_compatible_http());
     }
 
     #[test]

@@ -29,7 +29,7 @@ delivered capability and the relevant commits/docs instead.
 | Complete | Simple hold-to-talk voice/photo interaction restored after automatic-turn experiments | `cbbca77`, `4802af6`, `src/listen/`, `src/app.rs` |
 | Complete | Local Piper/HAL speech queue and cancellation | `5bb0ebd`, `src/speak/` |
 | Complete | Correlated redacted telemetry/JSONL/optional OTLP | `40fabae`, `src/telemetry.rs` |
-| Complete | Raspberry Pi setup guide, evdev button adapter, `rpicam-still` adapter | `48dba28`, `cff0ff6`, `docs/rasberry-pi.md` |
+| Complete | Raspberry Pi setup guide, evdev button adapter, `rpicam-still` adapter | `48dba28`, `cff0ff6`, `docs/raspberry-pi.md` |
 | Complete | Runtime model capability discovery and isolated audio-to-audio fixture path | `e878e09`, `e12f267`, `d570372`, `docs/audio-to-audio.md` |
 | Complete | Current learning/vision essays | `a955012` and `docs/` |
 | Implemented; manual hardware check pending | 6.1 security lifecycle boundary and default Ephemeral Mode | `src/security.rs`, `src/controller.rs`, `docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md` |

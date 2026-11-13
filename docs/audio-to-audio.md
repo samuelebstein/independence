@@ -35,10 +35,12 @@ The launch configuration deliberately separates three questions:
 --model     Which model should that runtime select?
 ```
 
-`ollama` is the default backend for both pipelines. `fixture` is an explicit,
-model-less test backend for `audio-to-audio`; it returns a known WAV and does
-not load, contact, or interpret the configured model. A hardware profile only
-chooses device defaults—it does not choose any of these three values.
+`ollama` is the ordinary default backend. `fixture` is an explicit, model-less
+test backend for `audio-to-audio`; it returns a known WAV and does not load,
+contact, or interpret the configured model. `hailo-vlm` is a local text/vision
+bridge used by the `raspberry-pi-hailo` profile; it is deliberately not a
+direct-audio backend. That Hailo profile chooses its documented local bridge
+default, while the base Pi profile and laptop retain the ordinary defaults.
 
 ## What starts where
 
@@ -132,12 +134,12 @@ precedence; the fixture itself does not contact or load that model.
 
 ## Configuration and capability discovery
 
-Hardware profiles choose hardware defaults only. Pipeline, backend, and model
-are independent choices:
+Pipeline, backend, and model remain independent explicit choices. The Hailo Pi
+profile additionally provides a documented local bridge default:
 
 ```text
 --model               > INDEPENDENCE_MODEL > OLLAMA_MODEL > profile model default
---backend             > INDEPENDENCE_BACKEND > ollama default
+--backend             > INDEPENDENCE_BACKEND > profile backend default
 --pipeline             > transcribe-and-speak default
 --audio-input/output   > corresponding environment variable > profile/default
 ```
@@ -180,9 +182,12 @@ cargo run --release -- --voice \
 
 The current Ollama adapter has no verified direct recording-to-WAV exchange, so
 it reports that gap and does **not** silently substitute Whisper plus Piper.
-The local Ollama version and model remain untouched. `--pipeline
-audio-to-audio` with no backend flag therefore selects Ollama and reports its
-compatibility result; use `--backend fixture` for the plumbing proof.
+The local Ollama version and model remain untouched. `hailo-vlm` likewise
+rejects this pipeline before microphone startup because its bridge implements
+only text/vision. With no backend flag, laptop and base Pi profiles select
+Ollama; use `--backend fixture` for the plumbing proof. See
+[raspberry-pi-hailo.md](raspberry-pi-hailo.md) for the distinct Hailo vision
+path.
 
 ## Current bounds and privacy
 

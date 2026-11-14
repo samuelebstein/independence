@@ -262,9 +262,10 @@ git -C "$HAILO_APPS_DIR" describe --tags --exact-match
 python3 -m venv --system-site-packages "$HAILO_SMOKE_VENV"
 "$HAILO_SMOKE_VENV/bin/python" --version
 "$HAILO_SMOKE_VENV/bin/python" -m pip install \
+  python-dotenv \
   https://dev-public.hailo.ai/2026_04/Hailo10/hailort-5.3.0-cp313-cp313-linux_aarch64.whl
 "$HAILO_SMOKE_VENV/bin/python" -c \
-  'from hailo_platform import VDevice; from hailo_platform.genai import VLM; import cv2, numpy; print("Hailo VLM imports OK")'
+  'from dotenv import load_dotenv; from hailo_platform import VDevice; from hailo_platform.genai import VLM; import cv2, numpy; print("Hailo Apps and Hailo VLM imports OK")'
 ```
 
 `git describe` must print `26.03.1`, and the virtual environment must report
@@ -272,7 +273,18 @@ Python 3.13.x; the HailoRT wheel is built for that Python version. The wheel
 belongs in `$HAILO_SMOKE_VENV`, not Independence's Piper environment. This
 test runs the upstream source file directly, so it intentionally does not call
 Hailo Apps' broader `install.sh` or `setup_env.sh`. The final import command
-must print `Hailo VLM imports OK`.
+must print `Hailo Apps and Hailo VLM imports OK`. `python-dotenv` is required
+because the Hailo Apps example imports Hailo Apps' shared environment loader;
+installing only the HailoRT wheel does not install Hailo Apps' Python
+dependencies. If you already created the venv and reached
+`ModuleNotFoundError: No module named 'dotenv'`, install the missing package
+without recreating the venv, then rerun the import check:
+
+```bash
+"$HAILO_SMOKE_VENV/bin/python" -m pip install python-dotenv
+"$HAILO_SMOKE_VENV/bin/python" -c \
+  'from dotenv import load_dotenv; from hailo_platform import VDevice; from hailo_platform.genai import VLM; import cv2, numpy; print("Hailo Apps and Hailo VLM imports OK")'
+```
 
 The next block modifies only the upstream example file after first confirming
 that it has no existing local changes. Keep using the same terminal so the

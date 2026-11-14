@@ -74,8 +74,8 @@ Read these files in this order:
    — the Independence build plus speaker, microphone, keyboard, and camera
    checks.
 15. [`docs/raspberry-pi-hailo-qwen3.md`](docs/raspberry-pi-hailo-qwen3.md)
-   — the pinned HailoRT 5.3/Qwen3 model-artifact setup; it is not yet an
-   Independence backend.
+   — the pinned HailoRT 5.3/Qwen3 standalone image-request smoke test; it is
+   not yet an Independence backend.
 16. [`docs/raspberry-pi-hailo.md`](docs/raspberry-pi-hailo.md) — the
    current loopback-only Qwen2 Hailo VLM bridge and physical acceptance
    runbook.
@@ -245,7 +245,7 @@ capture order and rejects a fifth rather than silently losing an image. Full
 installation, explicit model download, telemetry boundary, and real-hardware
 checks are in the
 [Pi Hailo runbook](docs/raspberry-pi-hailo.md).
-For the separate experimental HailoRT 5.3/Qwen3 artifact setup, see
+For the separate experimental HailoRT 5.3/Qwen3 standalone inference test, see
 [the Qwen3 guide](docs/raspberry-pi-hailo-qwen3.md); it does not alter this
 current Qwen2 bridge.
 

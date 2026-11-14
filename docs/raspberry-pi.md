@@ -85,8 +85,9 @@ continuing.
   local application and proves the speaker, microphone, attached keyboard, and
   Camera Module 3.
 - [HailoRT 5.3 + Qwen3-VL-2B-Instruct](raspberry-pi-hailo-qwen3.md) links the
-  pinned AI HAT+ 2 system setup, verifies the accelerator, and downloads the
-  Qwen3 model artifact. It does not yet make Qwen3 an Independence backend.
+  pinned AI HAT+ 2 system setup, verifies the accelerator, and proves one
+  standalone Qwen3 image request. It does not yet make Qwen3 an Independence
+  backend.
 - [Qwen2-VL Hailo bridge](raspberry-pi-hailo.md) is the existing, working
   Independence Hailo path. It is a separate 5.1/Qwen2 setup; do not combine
   its Hailo installation commands with the Qwen3 guide on one SD card.

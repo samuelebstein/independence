@@ -68,19 +68,25 @@ Read these files in this order:
    editable teaching guidance.
 12. [`LEARNING.md`](LEARNING.md) — a walkthrough of one request and the Rust
    choices behind it.
-13. [`docs/raspberry-pi.md`](docs/raspberry-pi.md) — the base Raspberry Pi 5
-   hardware installation path.
-14. [`docs/raspberry-pi-hailo.md`](docs/raspberry-pi-hailo.md) — the
-   loopback-only Hailo VLM bridge, Pi HAT setup, and physical acceptance
+13. [`docs/raspberry-pi.md`](docs/raspberry-pi.md) — first boot, 2.4 GHz
+   Wi-Fi, SSH, and the required Raspberry Pi OS identity.
+14. [`docs/raspberry-pi-independence.md`](docs/raspberry-pi-independence.md)
+   — the Independence build plus speaker, microphone, keyboard, and camera
+   checks.
+15. [`docs/raspberry-pi-hailo-qwen3.md`](docs/raspberry-pi-hailo-qwen3.md)
+   — the pinned HailoRT 5.3/Qwen3 model-artifact setup; it is not yet an
+   Independence backend.
+16. [`docs/raspberry-pi-hailo.md`](docs/raspberry-pi-hailo.md) — the
+   current loopback-only Qwen2 Hailo VLM bridge and physical acceptance
    runbook.
-15. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
+17. [`docs/audio-to-audio.md`](docs/audio-to-audio.md) — the isolated
    microphone-to-backend-to-speaker experiment and its current limits.
-16. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
+18. [`docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md`](docs/milestones/MILESTONE_6_1_SECURITY_FOUNDATION_EPHEMERAL_MODE.md),
    [`docs/security/THREAT_MODEL.md`](docs/security/THREAT_MODEL.md), and
    [`docs/security/ARCHITECTURE.md`](docs/security/ARCHITECTURE.md) — the
    current Ephemeral Mode boundary and the still-unimplemented cryptographic
    design.
-17. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
+19. [`docs/ROADMAP.md`](docs/ROADMAP.md) — delivered capabilities, approval
    gates, and the next intentionally small milestones.
 
 ## Run it on the same laptop
@@ -173,8 +179,9 @@ OLLAMA_MODEL=gemma3:1b \
 
 For the attached-keyboard button controller, USB microphone/speaker, local
 Whisper, and Piper, use this explicit Gemma command. Replace the input-device
-path and ALSA IDs with values from the [Raspberry Pi guide](docs/raspberry-pi.md).
-Rerun `--input-devices` after reconnecting hardware or rebooting, then use the
+path and ALSA IDs with values from the
+[Independence hardware guide](docs/raspberry-pi-independence.md). Rerun
+`--input-devices` after reconnecting hardware or rebooting, then use the
 current matching `/dev/input/eventN` path.
 
 ```bash
@@ -203,8 +210,9 @@ memory use and slower responses.
 In Pi button mode, launch from SSH if convenient, then use the **physically
 attached** keyboard: hold Enter for five seconds and release to enter
 Ephemeral Mode, then hold Enter again to record. SSH Enter, `P`, and Escape do
-not control the device. See the [Raspberry Pi guide](docs/raspberry-pi.md) for
-the short hardware checks, current keyboard-path selection, and independent
+not control the device. See the
+[Independence hardware guide](docs/raspberry-pi-independence.md) for the short
+hardware checks, current keyboard-path selection, and independent
 microphone/speaker/camera tests.
 
 ### Raspberry Pi: Hailo VLM profile
@@ -237,6 +245,9 @@ capture order and rejects a fifth rather than silently losing an image. Full
 installation, explicit model download, telemetry boundary, and real-hardware
 checks are in the
 [Pi Hailo runbook](docs/raspberry-pi-hailo.md).
+For the separate experimental HailoRT 5.3/Qwen3 artifact setup, see
+[the Qwen3 guide](docs/raspberry-pi-hailo-qwen3.md); it does not alter this
+current Qwen2 bridge.
 
 ## Dictation and voice modes
 
@@ -1312,7 +1323,8 @@ backend's own `/api/show` metadata is the authority for camera use. There is
 no application image-support override. The Pi profile also selects
 `rpicam-still`; its direct child process writes one bounded JPEG to memory, is
 validated, and is released before Ollama is asked. The physical acceptance
-sequence is in [the Raspberry Pi guide](docs/raspberry-pi.md#4-five-to-ten-minute-hardware-check).
+sequence is in [the Independence hardware
+guide](docs/raspberry-pi-independence.md#4-hardware-check).
 
 ### Latest: pipelines, model backends, and isolated audio-to-audio plumbing
 

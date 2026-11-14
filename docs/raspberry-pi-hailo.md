@@ -1,21 +1,20 @@
-# Raspberry Pi AI HAT+ 2: Hailo VLM extension
+# Raspberry Pi AI HAT+ 2: Qwen2-VL bridge (current working path)
 
-This is an extension to [the Raspberry Pi base guide](raspberry-pi.md), not a
-second Pi installation guide. It adds the AI HAT+ 2 (Hailo-10H), Hailo Apps,
-one local Qwen2-VL model, and a loopback Python bridge. It does **not** use
-Hailo-Ollama to serve vision.
+This is the implemented Independence Hailo path: Hailo-10H, Hailo Apps,
+Qwen2-VL, and one loopback Python bridge. It deliberately uses the Raspberry
+Pi repository's 5.1 Hailo stack and does **not** use Hailo-Ollama to serve
+vision.
 
-## 0. Complete the base guide first
+For a fresh-card HailoRT 5.3/Qwen3 setup, use
+[the separate Qwen3 guide](raspberry-pi-hailo-qwen3.md). Do not combine the
+Hailo installation commands from these two guides on one SD card: the current
+bridge is Qwen2-specific and cannot serve Qwen3.
 
-Complete [sections 1–2 of the base guide](raspberry-pi.md) before starting
-here. They are the only place for the first local monitor/keyboard bootstrap,
-2.4 GHz Wi-Fi and SSH setup, OS/firmware updates, Rust, the Independence
-checkout/build, and the ordinary local Ollama text baseline.
+## 0. Prerequisites and current bridge files
 
-| Intended result | Base-guide prerequisite |
-| --- | --- |
-| Hailo server only | Sections 1–2 |
-| Voice + camera + Hailo | Complete the base guide through its section 4 hardware check |
+Complete [first boot](raspberry-pi.md), then
+[Independence hardware setup](raspberry-pi-independence.md) through the build.
+For voice/photo use, complete that guide's hardware check too.
 
 The current checkout must contain the Hailo bridge before any Hailo package or
 model is installed:
@@ -27,22 +26,9 @@ test -x scripts/run_pi_hailo_vlm_bridge.sh
 test -f tools/hailo_vlm_bridge.py
 ```
 
-If one of those checks fails, stop and switch to the reviewed Independence
-revision that contains this runbook; the historical text-only revision in the
-base guide predates this extension. Until this work is merged to the default
-branch, a fresh checkout can switch to its current integration branch:
-
-```bash
-cd "$HOME/code/independence"
-git fetch origin research/pihat2-integration
-git switch --track origin/research/pihat2-integration
-git pull --ff-only
-cargo test --locked
-cargo build --release --locked -j 1
-```
-
-Then rerun the three file checks. Once merged, use the reviewed default branch
-instead; the file checks, not the branch name, are the source of truth.
+If any check fails, stop and switch to the reviewed Independence revision that
+contains this bridge. The file checks—not a historical branch name—are the
+source of truth.
 
 ### Required power source and power gate
 
@@ -93,7 +79,7 @@ accelerator.
 
 ## 1. Install and identify the Hailo-10H runtime
 
-This gate installs only dependencies not owned by the base guide:
+This gate installs the Qwen2-specific runtime dependencies:
 
 - `hailo-h10-all` is the AI HAT+ 2 / Hailo-10H host runtime. Do not substitute
   the Hailo-8 `hailo-all` package.
@@ -221,12 +207,13 @@ The API accepts zero through four ordered images on the final user message.
 It preserves capture order and rejects a larger request, images over 10 MiB,
 or images over 10 million pixels to bound local memory and latency.
 
-## 4. Use the Hailo profile with the base hardware adapters
+## 4. Use the Hailo profile with the Independence hardware adapters
 
-For a voice/photo turn, first complete the base guide's button, microphone,
-speaker, Whisper, Piper, and camera checks. In terminal B, rerun the short
+For a voice/photo turn, first complete the Independence hardware guide's
+button, microphone, speaker, Whisper, Piper, and camera checks. In terminal B,
+rerun the short
 `PI_TEST_MIC`, `PI_TEST_SPEAKER`, `PI_PIPER_BIN`, and `PI_BUTTON_DEVICE` blocks
-from [base-guide section 4](raspberry-pi.md#4-five-to-ten-minute-hardware-check);
+from [Independence hardware check](raspberry-pi-independence.md#4-hardware-check);
 shell variables do not survive a new SSH session. Then keep terminal A running
 and launch terminal B:
 
@@ -260,9 +247,10 @@ INDEPENDENCE_PIPER_COMMAND="$PI_PIPER_BIN" \
   --audio-output "$PI_TEST_SPEAKER"
 ```
 
-Run the base guide's physical acceptance controls with this profile. For the
-Hailo-specific multi-image proof, request two fresh `P` photos during one held
-Talk turn and ask a comparison question. The expected pipeline is:
+Run the Independence hardware guide's physical acceptance controls with this
+profile. For the Hailo-specific multi-image proof, request two fresh `P`
+photos during one held Talk turn and ask a comparison question. The expected
+pipeline is:
 
 ```text
 local microphone -> local Whisper -> /api/show vision check -> fresh camera still(s)
@@ -291,7 +279,7 @@ outside that narrow guarantee.
 
 | Gate | Required proof |
 | --- | --- |
-| Base | a typed local Ollama answer from the base guide |
+| Independence | Independence builds; complete its hardware check for a voice/photo turn |
 | Power | `scripts/check_pi_hailo_power.sh` passes before and after the bundled-image chat |
 | 1 | `hailortcli fw-control identify` reports Hailo-10H |
 | 2 | preflight prints exactly one Qwen2-VL HEF path |

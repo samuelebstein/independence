@@ -20,34 +20,182 @@ run `vcgencmd get_throttled`; it must report `throttled=0x0`. A nonzero value
 means under-voltage or throttling occurred during that boot, even if the Pi
 currently appears healthy.
 
-## 1. Install the exact 5.3 system stack
+## 1. Install the verified 5.3 system stack
 
-Complete the pinned external guide through **Option B: Install 5.3.0 from Hailo
-dev-public**, then reboot and run its verification step:
+The installation instructions in this section were taken from the pinned
+external [AI HAT+ 2 system setup guide — commit
+`cad57e0`](https://github.com/gregm123456/raspberry_pi_hailo_ai_services/blob/cad57e09a4b454cebecd28dfe2df9c8fb66ad3c3/reference_documentation/system_setup.md),
+then modified to produce a successful current Raspberry Pi OS Trixie
+installation.
+Its plain HailoRT 5.3 PCIe-driver package does not compile on the current Pi
+6.18 kernel because it calls the removed `del_timer_sync` kernel function.
+This runbook applies Hailo's narrowly scoped upstream compatibility fix before
+finishing that package.
 
-[AI HAT+ 2 System Setup for Raspberry Pi 5 — pinned commit
-`cad57e0`](https://github.com/gregm123456/raspberry_pi_hailo_ai_services/blob/cad57e09a4b454cebecd28dfe2df9c8fb66ad3c3/reference_documentation/system_setup.md)
+Do **not** install the external guide's older Option A (`hailo-h10-all`) on
+this card, and do not mix its 5.1 packages with this 5.3 setup.
 
-That guide owns the OS/firmware update and the three matching 5.3.0 packages:
-the PCIe driver, HailoRT, and TAPPAS core. Do **not** follow its older Option A
-(`hailo-h10-all`) on this card, and do not mix 5.1 packages from the Qwen2
-runbook with this 5.3 setup.
+### 1.1 Update the Pi first
 
-Back on the Pi, prove the installed stack before downloading a 3 GiB model:
+Update Raspberry Pi OS and firmware before choosing the kernel headers used to
+build the driver, then reconnect after the reboot.
 
 ```bash
-hailortcli fw-control identify
-dpkg-query -W -f='${Package}\t${Version}\n' \
-  hailort hailort-pcie-driver hailo-tappas-core
-dmesg | grep -i hailo
+sudo apt-get update
+sudo apt-get full-upgrade -y
+sudo rpi-eeprom-update -a
+sudo reboot
 ```
 
-`hailortcli` must identify `Device Architecture: HAILO10H` and report firmware
-`5.3.0`. If it does not, stop here and fix the physical HAT, power, cooling, or
-the external guide's first failing command. Do not install Hailo Apps or
-download a HEF to diagnose a missing accelerator.
+After reconnecting, confirm that this is a 64-bit Trixie Pi kernel with
+matching headers available:
 
-### Why this is marked experimental
+```bash
+uname -r
+test -d "/lib/modules/$(uname -r)/build"
+```
+
+The second command must exit successfully. The verified path below used
+`6.18.60+rpt-rpi-2712`.
+
+### 1.2 Install build prerequisites and download matching packages
+
+DKMS builds the PCIe kernel module for the exact running kernel. The three
+packages below are the matching HailoRT 5.3.0 driver, runtime, and TAPPAS core.
+
+```bash
+sudo apt-get install -y build-essential dkms git wget \
+  "linux-headers-$(uname -r)"
+command -v dkms
+
+HAILO_5_3_DIR="$HOME/downloads/hailo-5.3.0"
+mkdir -p "$HAILO_5_3_DIR"
+cd "$HAILO_5_3_DIR"
+wget --continue --show-progress \
+  https://dev-public.hailo.ai/2026_04/Hailo10/hailort-pcie-driver_5.3.0_all.deb
+wget --continue --show-progress \
+  https://dev-public.hailo.ai/2026_04/Hailo10/hailort_5.3.0_arm64.deb
+wget --continue --show-progress \
+  https://dev-public.hailo.ai/2026_04/Hailo10/hailo-tappas-core_5.3.0_arm64.deb
+
+test -s "$HAILO_5_3_DIR/hailort-pcie-driver_5.3.0_all.deb"
+test -s "$HAILO_5_3_DIR/hailort_5.3.0_arm64.deb"
+test -s "$HAILO_5_3_DIR/hailo-tappas-core_5.3.0_arm64.deb"
+```
+
+`command -v dkms` must print a path. A local-package warning about the `_apt`
+user being unable to read a file in your home directory is not the driver
+failure; apt falls back to root to read the local file you explicitly supplied.
+
+### 1.3 Unpack the known-broken driver source once
+
+On kernel 6.18, the following driver-install command is expected to fail with
+`del_timer_sync` and leave `hailort-pcie-driver` half-configured. That failure
+unpacks the source and firmware under `/usr/src`, which is what the next step
+repairs. Do not run `dpkg --configure -a` yet.
+
+```bash
+sudo apt-get install -y "$HAILO_5_3_DIR/hailort-pcie-driver_5.3.0_all.deb"
+
+sudo grep -n 'del_timer_sync' /var/log/hailort-pcie-driver.deb.log
+dpkg -l hailort-pcie-driver
+```
+
+Proceed only if the log shows the expected compiler error and the package status
+starts with `iF`. A different error means stop and diagnose that error rather
+than applying this kernel-specific fix.
+
+### 1.4 Apply Hailo's kernel compatibility fix and finish the driver
+
+Hailo's open upstream PR `#52`, commit `bf5b66b`, changes the compatibility
+helper and VDMA monitor source while retaining driver version 5.3.0. These
+commands confirm both source trees are 5.3.0, back up the original package
+source, replace only those two files, and let `dpkg` complete the package.
+
+```bash
+mkdir -p "$HOME/code"
+HAILO_DRIVER_FIX_DIR="$HOME/code/hailort-drivers-pr52"
+test ! -e "$HAILO_DRIVER_FIX_DIR"
+git clone https://github.com/hailo-ai/hailort-drivers.git "$HAILO_DRIVER_FIX_DIR"
+git -C "$HAILO_DRIVER_FIX_DIR" fetch origin pull/52/head:pr-52
+git -C "$HAILO_DRIVER_FIX_DIR" checkout --detach pr-52
+git -C "$HAILO_DRIVER_FIX_DIR" rev-parse --short HEAD
+
+grep -E '^#define HAILO_DRV_VER_(MAJOR|MINOR|REVISION)' \
+  "$HAILO_DRIVER_FIX_DIR/common/hailo_ioctl_common.h"
+sudo grep -E '^#define HAILO_DRV_VER_(MAJOR|MINOR|REVISION)' \
+  /usr/src/hailort-pcie-driver/common/hailo_ioctl_common.h
+
+sudo test ! -e /usr/src/hailort-pcie-driver.before-kernel-6.18-fix
+sudo cp -a /usr/src/hailort-pcie-driver \
+  /usr/src/hailort-pcie-driver.before-kernel-6.18-fix
+sudo install -m 0644 \
+  "$HAILO_DRIVER_FIX_DIR/linux/utils/compact.h" \
+  /usr/src/hailort-pcie-driver/linux/utils/compact.h
+sudo install -m 0644 \
+  "$HAILO_DRIVER_FIX_DIR/linux/vdma/monitor.c" \
+  /usr/src/hailort-pcie-driver/linux/vdma/monitor.c
+
+sudo dpkg --configure hailort-pcie-driver
+```
+
+The checkout must identify `bf5b66b`, and both version checks must print
+major `5`, minor `3`, revision `0`. The final command must print `Hailo PCIe
+Driver Installed!`. The backup is intentional: keep it until the full
+acceptance gate passes. Do not run the final `dpkg --configure` command again;
+an `already installed and configured` response only means there is nothing left
+to configure.
+
+### 1.5 Install the runtime, reboot, and prove the whole stack
+
+Install the two remaining matching packages, confirm no package remains
+half-configured, then reboot so the new DKMS module and Hailo firmware load.
+
+```bash
+sudo apt-get install -y "$HAILO_5_3_DIR/hailort_5.3.0_arm64.deb"
+sudo apt-get install -y "$HAILO_5_3_DIR/hailo-tappas-core_5.3.0_arm64.deb"
+sudo dpkg --audit
+sudo reboot
+```
+
+After reconnecting, run every check:
+
+```bash
+dpkg -l hailort hailort-pcie-driver hailo-tappas-core
+dkms status
+modinfo hailo1x_pci | grep -E '^(filename|version):'
+hailortcli fw-control identify
+vcgencmd get_throttled
+```
+
+This exact gate was successfully verified on a Raspberry Pi 5 / AI HAT+ 2
+running kernel `6.18.60+rpt-rpi-2712`. Pass only when all of these are true:
+
+| Check | Required result |
+| --- | --- |
+| Packages | `ii` for `hailort`, `hailort-pcie-driver`, and `hailo-tappas-core`, all at 5.3.0 |
+| DKMS | `hailo1x_pci/5.3.0, 6.18.60+rpt-rpi-2712, aarch64: installed` (substitute the current kernel if it differs) |
+| Module | A filename below `/lib/modules/<kernel>/updates/dkms/` and `version: 5.3.0` |
+| Device | `Firmware Version: 5.3.0` and `Device Architecture: HAILO10H` |
+| Power | `throttled=0x0` |
+
+Do not download the model or proceed to the Python test if any check fails.
+
+### What the driver repair means
+
+`hailort-pcie-driver` provides both Hailo firmware and the Linux PCIe kernel
+module. DKMS compiles that module when the package is configured and installs
+it under `/lib/modules/<kernel>/updates/dkms/`. Linux 6.18 rejects the old
+`del_timer_sync` call; the Hailo fix maps it to the supported current kernel
+function without changing the driver ABI, so the resulting module, HailoRT,
+and firmware all remain version 5.3.0.
+
+This is experimental because PR #52 is not merged into a Hailo release. Do not
+run `apt reinstall hailort-pcie-driver` without repeating this repair: a
+reinstall restores the broken source. After a future kernel upgrade, run the
+five acceptance commands above before relying on the HAT.
+
+### Why Qwen3 remains experimental
 
 Hailo's v5.3 release notes say that Qwen3-VL-2B-Instruct was added in v5.3.0,
 but the current model table labels its version compatibility `> 5.3.0`. That is
@@ -62,7 +210,6 @@ The HEF is a precompiled Hailo executable, not an Ollama model. It is roughly
 the connection drops.
 
 ```bash
-sudo apt install -y wget
 df -h "$HOME"
 
 mkdir -p "$HOME/models/hailo10h"
@@ -106,8 +253,7 @@ test ! -e "$HAILO_APPS_DIR"
 mkdir -p "$HOME/.venvs"
 test ! -e "$HAILO_SMOKE_VENV"
 
-sudo apt-get update
-sudo apt-get install -y git python3-venv python3-opencv python3-numpy
+sudo apt-get install -y python3-venv python3-opencv python3-numpy
 
 git clone --depth 1 --branch "$HAILO_APPS_VERSION" \
   https://github.com/hailo-ai/hailo-apps.git "$HAILO_APPS_DIR"
@@ -218,7 +364,8 @@ clean; do not make the changed file a permanent local fork.
 
 ## Sources
 
-- [Pinned 5.3 system setup](https://github.com/gregm123456/raspberry_pi_hailo_ai_services/blob/cad57e09a4b454cebecd28dfe2df9c8fb66ad3c3/reference_documentation/system_setup.md)
+- [Source 5.3 system setup guide (adapted above)](https://github.com/gregm123456/raspberry_pi_hailo_ai_services/blob/cad57e09a4b454cebecd28dfe2df9c8fb66ad3c3/reference_documentation/system_setup.md)
+- [Hailo kernel-6.18 driver compatibility fix, PR #52 / commit bf5b66b](https://github.com/hailo-ai/hailort-drivers/pull/52)
 - [Hailo GenAI v5.3 release notes](https://github.com/hailo-ai/hailo_model_zoo_genai/blob/v5.3.0/docs/CHANGELOG.rst)
 - [Hailo model table](https://github.com/hailo-ai/hailo_model_zoo_genai/blob/main/docs/MODELS.rst)
 - [Hailo-Ollama API limits](https://github.com/hailo-ai/hailo_model_zoo_genai/blob/main/docs/USAGE.rst)

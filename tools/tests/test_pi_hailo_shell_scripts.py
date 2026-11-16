@@ -26,7 +26,7 @@ class PiHailoShellScriptTests(unittest.TestCase):
         (self.hailo_apps / "venv_hailo_apps" / "bin").mkdir(parents=True)
         self.resources.mkdir(parents=True)
         self.bin_directory.mkdir()
-        (self.resources / "Qwen2-VL-2B-Instruct.hef").touch()
+        (self.resources / "Qwen3-VL-2B-Instruct.hef").touch()
 
         self._write_executable(
             self.hailo_apps / "setup_env.sh",

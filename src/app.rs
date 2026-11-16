@@ -54,7 +54,7 @@ use crate::{
 const EVENT_CHANNEL_CAPACITY: usize = 32;
 const VOICE_AUX_CHANNEL_CAPACITY: usize = 64;
 const PARTIAL_TRANSCRIPTION_INTERVAL: Duration = Duration::from_millis(750);
-const MAX_QUEUED_PHOTO_CAPTURES: usize = 32;
+const MAX_QUEUED_PHOTO_CAPTURES: usize = 1;
 const MAX_DRAFT_PHOTO_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -3843,6 +3843,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "obsolete multi-photo behavior; Qwen3 Hailo accepts one image"]
     async fn repeated_p_presses_submit_four_photos_in_press_order_with_one_request() {
         let server = MockServer::start().await;
         let camera = CameraDescriptor::new(CameraId::new(11), "Sequenced Camera");

@@ -34,15 +34,18 @@ from urllib.parse import urlsplit
 BRIDGE_VERSION = "0.2.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11435
-DEFAULT_MODEL = "qwen2-vl:2b"
+DEFAULT_MODEL = "qwen3-vl:2b-instruct"
 DEFAULT_MAX_GENERATED_TOKENS = 200
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_SEED = 42
 MAX_REQUEST_BYTES = 14 * 1024 * 1024
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_IMAGES = 4
+MAX_IMAGES = 1
 MAX_IMAGE_PIXELS = 10_000_000
 MAX_MESSAGES = 16
 MAX_TEXT_BYTES = 64 * 1024
-VLM_IMAGE_SIZE = 336
+VLM_IMAGE_WIDTH = 512
+VLM_IMAGE_HEIGHT = 288
 
 
 class BridgeError(Exception):
@@ -74,6 +77,8 @@ class BridgeConfig:
     model: str
     hef_path: Path
     max_generated_tokens: int
+    temperature: float = DEFAULT_TEMPERATURE
+    seed: int = DEFAULT_SEED
     telemetry_jsonl: str | None = None
 
     @property
@@ -106,14 +111,14 @@ class VlmBackend(Protocol):
 
 
 class HailoVlmBackend:
-    """A one-model, serialized Hailo Qwen2-VL runtime.
+    """A one-model, serialized Hailo Qwen3-VL runtime.
 
     Hailo's VLM context is cleared after every request.  Independence supplies
     accepted text history again in the next request, rather than leaving private
     state resident in the accelerator runtime.
     """
 
-    def __init__(self, hef_path: Path, max_generated_tokens: int) -> None:
+    def __init__(self, hef_path: Path, max_generated_tokens: int, temperature: float = DEFAULT_TEMPERATURE, seed: int = DEFAULT_SEED) -> None:
         if not hef_path.is_file():
             raise BackendStartupError(
                 "HAILO_VLM_HEF must point to a downloaded, readable Hailo VLM .hef file."
@@ -147,6 +152,8 @@ class HailoVlmBackend:
             self._vdevice = VDevice(params)
             self._vlm = VLM(self._vdevice, str(hef_path))
             self._max_generated_tokens = max_generated_tokens
+            self._temperature = temperature
+            self._seed = seed
         except Exception as error:  # Hailo exceptions are not safe HTTP output.
             self.close()
             raise BackendStartupError(
@@ -162,20 +169,15 @@ class HailoVlmBackend:
 
         with self._generation_lock:
             try:
-                # Hailo's VLM generator is streamed internally, then collected
-                # before the response. The HTTP contract remains deliberately
-                # non-streaming, matching Independence's existing client.
-                response_parts: list[str] = []
-                with self._vlm.generate(
+                # This follows the standalone Qwen3 smoke test exactly: the
+                # Hailo Apps VLM returns one complete string from generate_all.
+                response = self._vlm.generate_all(
                     prompt=prompt,
                     frames=frames,
-                    temperature=0.1,
-                    seed=42,
+                    temperature=self._temperature,
+                    seed=self._seed,
                     max_generated_tokens=self._max_generated_tokens,
-                ) as generation:
-                    for chunk in generation:
-                        if chunk != "<|im_end|>":
-                            response_parts.append(str(chunk))
+                )
             except Exception as error:
                 raise BackendInferenceError(
                     "The Hailo VLM could not complete this local request."
@@ -188,7 +190,7 @@ class HailoVlmBackend:
                     # error or expose a device/runtime diagnostic to a caller.
                     pass
 
-        text = "".join(response_parts).replace("<|im_end|>", "").strip()
+        text = str(response).split(". [{'type'")[0].split("<|im_end|>")[0].strip()
         if not text:
             raise BackendInferenceError("The Hailo VLM returned no usable text.")
         return text
@@ -206,21 +208,14 @@ class HailoVlmBackend:
         if height * width > MAX_IMAGE_PIXELS:
             raise InvalidImageError("The supplied image exceeds the local pixel limit.")
 
-        # Hailo's Qwen2-VL example uses a central crop at 336x336 RGB. Keep
-        # that model-specific adaptation here, outside Independence's generic
-        # camera and request path.
-        scale = max(VLM_IMAGE_SIZE / width, VLM_IMAGE_SIZE / height)
-        resized_width = max(VLM_IMAGE_SIZE, round(width * scale))
-        resized_height = max(VLM_IMAGE_SIZE, round(height * scale))
-        resized = self._cv2.resize(
-            image,
-            (resized_width, resized_height),
+        # Exact Qwen3 smoke-test preprocessing: convert BGR to RGB, then resize
+        # directly to the model's required 512x288 uint8 frame.
+        rgb = self._cv2.cvtColor(image, self._cv2.COLOR_BGR2RGB)
+        return self._cv2.resize(
+            rgb,
+            (VLM_IMAGE_WIDTH, VLM_IMAGE_HEIGHT),
             interpolation=self._cv2.INTER_LINEAR,
-        )
-        left = (resized_width - VLM_IMAGE_SIZE) // 2
-        top = (resized_height - VLM_IMAGE_SIZE) // 2
-        cropped = resized[top : top + VLM_IMAGE_SIZE, left : left + VLM_IMAGE_SIZE]
-        return self._cv2.cvtColor(cropped, self._cv2.COLOR_BGR2RGB).astype(self._np.uint8)
+        ).astype(self._np.uint8)
 
     def close(self) -> None:
         with getattr(self, "_generation_lock", threading.Lock()):
@@ -609,6 +604,16 @@ def _positive_integer(value: str) -> int:
     return number
 
 
+def _temperature(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("temperature must be a number") from error
+    if not 0.0 <= number <= 2.0:
+        raise argparse.ArgumentTypeError("temperature must be between 0 and 2")
+    return number
+
+
 def _environment_port() -> int:
     value = os.environ.get("HAILO_VLM_PORT", str(DEFAULT_PORT))
     try:
@@ -619,7 +624,7 @@ def _environment_port() -> int:
 
 def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
     parser = argparse.ArgumentParser(
-        description="Serve one local Hailo Qwen2-VL model through Independence's Ollama-compatible API."
+        description="Serve one local Hailo Qwen3-VL model through Independence's Ollama-compatible API."
     )
     parser.add_argument(
         "--host",
@@ -636,7 +641,7 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
     parser.add_argument(
         "--model",
         default=os.environ.get("HAILO_VLM_MODEL", DEFAULT_MODEL),
-        help="local API model alias (default: qwen2-vl:2b)",
+        help="local API model alias (default: qwen3-vl:2b-instruct)",
     )
     parser.add_argument(
         "--hef-path",
@@ -654,6 +659,18 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
         default=DEFAULT_MAX_GENERATED_TOKENS,
         help="maximum Hailo generation tokens (default: 200)",
     )
+    parser.add_argument(
+        "--temperature",
+        type=_temperature,
+        default=DEFAULT_TEMPERATURE,
+        help="sampling temperature from 0 to 2 (default: 0.1)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="sampling seed (default: 42)",
+    )
     arguments = parser.parse_args(argv)
     if not arguments.model.strip():
         parser.error("--model must not be empty")
@@ -665,6 +682,8 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
         model=arguments.model,
         hef_path=Path(arguments.hef_path).expanduser(),
         max_generated_tokens=arguments.max_generated_tokens,
+        temperature=arguments.temperature,
+        seed=arguments.seed,
         telemetry_jsonl=arguments.telemetry_jsonl,
     )
 
@@ -678,7 +697,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        backend = HailoVlmBackend(config.hef_path, config.max_generated_tokens)
+        backend = HailoVlmBackend(
+            config.hef_path,
+            config.max_generated_tokens,
+            config.temperature,
+            config.seed,
+        )
     except BackendStartupError as error:
         print(f"Hailo VLM bridge did not start: {error}", file=sys.stderr)
         return 2

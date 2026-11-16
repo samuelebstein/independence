@@ -86,9 +86,9 @@ if [[ ! -d "$resources_dir" ]]; then
   printf 'No Hailo model directory at %s. Re-run with --download-model to make the explicit model download.\n' "$resources_dir" >&2
   exit 2
 fi
-mapfile -t hef_candidates < <(find "$resources_dir" -type f -iname '*qwen2*vl*2b*.hef' -print | sort)
+mapfile -t hef_candidates < <(find "$resources_dir" -type f -iname '*qwen3*vl*2b*.hef' -print | sort)
 if [[ ${#hef_candidates[@]} -ne 1 ]]; then
-  printf 'Expected exactly one Qwen2-VL 2B HEF below %s; found %s. Set HAILO_VLM_HEF explicitly when starting the bridge.\n' "$resources_dir" "${#hef_candidates[@]}" >&2
+  printf 'Expected exactly one Qwen3-VL 2B HEF below %s; found %s. Set HAILO_VLM_HEF explicitly when starting the bridge.\n' "$resources_dir" "${#hef_candidates[@]}" >&2
   exit 2
 fi
 

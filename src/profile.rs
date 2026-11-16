@@ -21,8 +21,8 @@ const DEFAULT_HAILO_VLM_URL: &str = "http://127.0.0.1:11435";
 const LAPTOP_MODEL: &str = "qwen3-vl:4b-instruct";
 const PI_TEXT_MODEL: &str = "gemma3:1b";
 /// This is the local bridge's model alias, not an Ollama model tag. The bridge
-/// maps it to the pre-downloaded Hailo Qwen2-VL HEF.
-const HAILO_VLM_MODEL: &str = "qwen2-vl:2b";
+/// maps it to the pre-downloaded Hailo Qwen3-VL HEF.
+const HAILO_VLM_MODEL: &str = "qwen3-vl:2b-instruct";
 const DEFAULT_WHISPER_MODEL: &str = "local-data/whisper/ggml-base.en.bin";
 
 /// Camera backends that the one existing camera service can select.
@@ -313,7 +313,7 @@ mod tests {
     fn hailo_pi_profile_selects_the_local_bridge_but_not_its_capabilities() {
         let defaults = defaults_for(Some(HardwareProfile::RaspberryPiHailo));
         assert_eq!(defaults.input, VoiceInputMode::Buttons);
-        assert_eq!(defaults.model, "qwen2-vl:2b");
+        assert_eq!(defaults.model, "qwen3-vl:2b-instruct");
         assert_eq!(defaults.backend, ModelBackend::HailoVlm);
         assert_eq!(defaults.camera_backend, CameraBackendSelection::RpiCamStill);
 
@@ -327,10 +327,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.backend, ModelBackend::HailoVlm);
-        assert_eq!(resolved.model, "qwen2-vl:2b");
+        assert_eq!(resolved.model, "qwen3-vl:2b-instruct");
         assert_eq!(
             resolved.ollama,
-            Some(crate::think::OllamaConfig::new("http://127.0.0.1:11435", "qwen2-vl:2b").unwrap())
+            Some(
+                crate::think::OllamaConfig::new("http://127.0.0.1:11435", "qwen3-vl:2b-instruct")
+                    .unwrap()
+            )
         );
     }
 
@@ -351,7 +354,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolved.ollama,
-            Some(crate::think::OllamaConfig::new("http://127.0.0.1:11500", "qwen2-vl:2b").unwrap())
+            Some(
+                crate::think::OllamaConfig::new("http://127.0.0.1:11500", "qwen3-vl:2b-instruct")
+                    .unwrap()
+            )
         );
 
         let error = resolve_with_environment(

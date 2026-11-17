@@ -609,8 +609,8 @@ def _temperature(value: str) -> float:
         number = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("temperature must be a number") from error
-    if not 0.0 <= number <= 2.0:
-        raise argparse.ArgumentTypeError("temperature must be between 0 and 2")
+    if not 0.0 < number <= 2.0:
+        raise argparse.ArgumentTypeError("temperature must be greater than 0 and at most 2")
     return number
 
 

@@ -5,10 +5,24 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 hailo_apps_dir="${HAILO_APPS_DIR:-$HOME/code/hailo-apps}"
 resources_dir="${HAILO_RESOURCES_DIR:-/usr/local/hailo/resources/models/hailo10h}"
+hailo_python="${HAILO_VLM_PYTHON:-}"
 
 if [[ ! -f "$hailo_apps_dir/setup_env.sh" ]]; then
   printf 'Hailo Apps was not found at %s. Set HAILO_APPS_DIR or follow docs/raspberry-pi-hailo.md.\n' "$hailo_apps_dir" >&2
   exit 2
+fi
+
+if [[ -n "$hailo_python" ]]; then
+  if [[ ! -x "$hailo_python" ]]; then
+    printf 'HAILO_VLM_PYTHON is not executable: %s\n' "$hailo_python" >&2
+    exit 2
+  fi
+  # The dedicated Qwen3 smoke-test venv contains HailoRT, OpenCV, NumPy, and
+  # python-dotenv; expose the checked-out Hailo Apps package without sourcing
+  # its optional venv_hailo_apps environment.
+  export PYTHONPATH="$hailo_apps_dir${PYTHONPATH:+:$PYTHONPATH}"
+else
+  hailo_python='python3'
 fi
 
 source_hailo_apps_environment() {
@@ -40,9 +54,11 @@ source_hailo_apps_environment() {
   return "$setup_status"
 }
 
-if ! source_hailo_apps_environment; then
-  printf 'Hailo Apps environment setup failed in %s. Resolve its output before continuing.\n' "$hailo_apps_dir" >&2
-  exit 2
+if [[ -z "${HAILO_VLM_PYTHON:-}" ]]; then
+  if ! source_hailo_apps_environment; then
+    printf 'Hailo Apps environment setup failed in %s. Set HAILO_VLM_PYTHON to the proven Qwen3 smoke-test Python environment or resolve this output.\n' "$hailo_apps_dir" >&2
+    exit 2
+  fi
 fi
 
 if [[ -z "${HAILO_VLM_HEF:-}" ]]; then
@@ -58,4 +74,4 @@ if [[ -z "${HAILO_VLM_HEF:-}" ]]; then
   export HAILO_VLM_HEF="${hef_candidates[0]}"
 fi
 
-exec python3 "$repository_root/tools/hailo_vlm_bridge.py" "$@"
+exec "$hailo_python" "$repository_root/tools/hailo_vlm_bridge.py" "$@"

@@ -366,12 +366,15 @@ Start the bridge with the explicit Qwen3 HEF:
 ```bash
 HAILO_VLM_HEF="$QWEN3_VL_HEF" \
   HAILO_APPS_DIR="$HOME/code/hailo-apps" \
+  HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
   scripts/run_pi_hailo_vlm_bridge.sh
 ```
 
 It serves `qwen3-vl:2b-instruct` on loopback port `11435`, advertises vision,
 and rejects requests containing more than one image. The existing Rust camera
-permission and JPEG transport remain in use.
+permission and JPEG transport remain in use. `HAILO_VLM_PYTHON` points at the
+same dedicated environment that passed the standalone Qwen3 smoke test; this
+avoids requiring Hailo Apps' separate optional `venv_hailo_apps` environment.
 
 The smoke-test generation settings are startup-configurable. Defaults remain
 `temperature=0.1`, `seed=42`, and `max-generated-tokens=200`:
@@ -379,11 +382,12 @@ The smoke-test generation settings are startup-configurable. Defaults remain
 ```bash
 HAILO_VLM_HEF="$QWEN3_VL_HEF" \
   HAILO_APPS_DIR="$HOME/code/hailo-apps" \
+  HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
   scripts/run_pi_hailo_vlm_bridge.sh \
   --temperature 0.2 --seed 42 --max-generated-tokens 128
 ```
 
-Temperature accepts `0` through `2`; token count must be positive. These values
+Temperature must be greater than `0` and at most `2`; token count must be positive. These values
 affect generation only and are reported nowhere with prompt or image content.
 
 The Hailo Apps test remains a deliberately temporary upstream edit, not the

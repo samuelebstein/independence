@@ -159,29 +159,28 @@ pub fn emit(output: Output) {
     }
 }
 
-/// Renders controller diagnostics as person-facing messages. The controller
-/// owns which condition occurred; this boundary prevents backend error text
-/// and implementation names from becoming the terminal interface.
+/// Renders controller diagnostics as person-facing messages. Camera and local
+/// inference workers provide bounded, request-free failure details here so a
+/// person can diagnose the device without exposing prompts or image bytes.
 fn diagnostic(message: &str) {
     if message.starts_with("activating camera ") {
         status("Capturing a photo...");
     } else if message.starts_with("captured camera ") {
         status("Photo captured. Thinking...");
-    } else if message.starts_with("could not list cameras")
-        || message.starts_with("could not prepare camera")
-        || message.starts_with("could not capture camera")
-    {
-        warning("The camera is unavailable. Check its connection and permissions, then try again.");
+    } else if let Some(detail) = message.strip_prefix("could not list cameras: ") {
+        warning(&format!("Camera listing failed: {detail}"));
+    } else if let Some(detail) = message.strip_prefix("could not prepare camera: ") {
+        warning(&format!("Camera preparation failed: {detail}"));
+    } else if let Some(detail) = message.strip_prefix("could not capture camera: ") {
+        warning(&format!("Camera capture failed: {detail}"));
     } else if message.starts_with("camera/photo request was not started") {
         warning(
             "The selected model cannot interpret photos. Choose a vision-capable model to use the camera.",
         );
     } else if message.starts_with("could not use photo") {
         warning("The photo could not be used. Choose a supported image and try again.");
-    } else if message.starts_with("local inference failed") {
-        warning(
-            "The local model could not complete that request. Check that it is running, then try again.",
-        );
+    } else if let Some(detail) = message.strip_prefix("local inference failed: ") {
+        warning(&format!("Local model request failed: {detail}"));
     } else if message.starts_with("direct audio request failed") {
         warning("The voice request could not be completed. Please try again.");
     } else if message.starts_with("worker returned")
@@ -259,7 +258,7 @@ pub fn voice_status(message: &str) {
     }
 
     if message.starts_with("photo capture request rejected") {
-        warning("Too many photo captures are already waiting. Please wait for them to finish.");
+        warning(message.trim_start_matches("photo capture request rejected — "));
         return;
     }
 
@@ -268,8 +267,8 @@ pub fn voice_status(message: &str) {
         return;
     }
 
-    if message.starts_with("photo capture failed") {
-        warning("The photo could not be captured. Check the camera and try again.");
+    if let Some(detail) = message.strip_prefix("photo capture failed — ") {
+        warning(&format!("Photo capture failed: {detail}"));
         return;
     }
 

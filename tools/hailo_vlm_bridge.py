@@ -31,7 +31,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 
-BRIDGE_VERSION = "0.2.0"
+BRIDGE_VERSION = "0.3.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11435
 DEFAULT_MODEL = "qwen3-vl:2b-instruct"
@@ -63,11 +63,73 @@ class BackendStartupError(Exception):
 
 
 class BackendInferenceError(Exception):
-    """A concise, safe diagnosis for one failed Hailo generation."""
+    """A bounded, safe diagnosis for one failed Hailo generation."""
+
+    def __init__(self, message: str, code: str, detail: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.detail = detail
+
+    def public_message(self) -> str:
+        if self.detail:
+            return f"{self.message}: {self.detail}"
+        return self.message
 
 
 class InvalidImageError(Exception):
     """A client input error discovered while decoding image bytes locally."""
+
+
+def _safe_exception_detail(error: BaseException, limit: int = 240) -> str:
+    """Keep runtime diagnostics bounded and free of request payload formatting."""
+
+    detail = " ".join(str(error).split())
+    if not detail:
+        detail = type(error).__name__
+    else:
+        detail = f"{type(error).__name__}: {detail}"
+    if len(detail) > limit:
+        detail = f"{detail[:limit]}…"
+    return detail
+
+
+@dataclass(frozen=True)
+class BackendHealthSnapshot:
+    status: str
+    error_code: str | None = None
+    error: str | None = None
+
+
+class BackendHealth:
+    """Tracks runtime readiness without recording prompts, images, or answers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._snapshot = BackendHealthSnapshot("ready")
+
+    def snapshot(self) -> BackendHealthSnapshot:
+        with self._lock:
+            return self._snapshot
+
+    def mark_failure(self, error: BackendInferenceError) -> None:
+        snapshot = BackendHealthSnapshot("degraded", error.code, error.public_message())
+        with self._lock:
+            changed = snapshot != self._snapshot
+            self._snapshot = snapshot
+        if changed:
+            print(
+                f"Hailo VLM health degraded: {error.code}: {error.public_message()}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def mark_ready(self) -> None:
+        with self._lock:
+            recovered = self._snapshot.status != "ready"
+            self._snapshot = BackendHealthSnapshot("ready")
+        if recovered:
+            print("Hailo VLM health recovered: ready", file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -154,17 +216,18 @@ class HailoVlmBackend:
             self._max_generated_tokens = max_generated_tokens
             self._temperature = temperature
             self._seed = seed
-        except Exception as error:  # Hailo exceptions are not safe HTTP output.
+        except Exception as error:  # Expose only bounded, request-free detail.
             self.close()
             raise BackendStartupError(
-                "The Hailo VLM could not initialize. Check the HAT, HailoRT version, "
+                "The Hailo VLM could not initialize. "
+                f"{_safe_exception_detail(error)} Check the HAT, HailoRT version, "
                 "and downloaded VLM model."
             ) from error
 
     def generate(self, prompt: list[dict[str, Any]], images: list[bytes]) -> str:
         # Hailo validates that each image placeholder in ``prompt`` has a
-        # matching frame. Preserve Independence's capture order in both lists;
-        # do not make a collage or discard a later photo.
+        # matching frame. The bridge accepts one image, so these lists contain
+        # either one matching pair or no image at all.
         frames = [self._prepare_image(image_bytes) for image_bytes in images]
 
         with self._generation_lock:
@@ -180,7 +243,9 @@ class HailoVlmBackend:
                 )
             except Exception as error:
                 raise BackendInferenceError(
-                    "The Hailo VLM could not complete this local request."
+                    "Hailo VLM inference failed",
+                    "hailo_inference_failed",
+                    _safe_exception_detail(error),
                 ) from error
             finally:
                 try:
@@ -192,7 +257,10 @@ class HailoVlmBackend:
 
         text = str(response).split(". [{'type'")[0].split("<|im_end|>")[0].strip()
         if not text:
-            raise BackendInferenceError("The Hailo VLM returned no usable text.")
+            raise BackendInferenceError(
+                "Hailo VLM returned no usable text",
+                "empty_generation",
+            )
         return text
 
     def _prepare_image(self, image_bytes: bytes) -> Any:
@@ -265,10 +333,12 @@ class BridgeApplication:
         config: BridgeConfig,
         backend: VlmBackend,
         telemetry: SafeTelemetry,
+        health: BackendHealth | None = None,
     ) -> None:
         self._config = config
         self._backend = backend
         self._telemetry = telemetry
+        self._health = health or BackendHealth()
 
     def handle(self, method: str, raw_path: str, body: bytes = b"") -> BridgeResponse:
         route = urlsplit(raw_path).path
@@ -277,14 +347,20 @@ class BridgeApplication:
         outcome = "ok"
         try:
             if method == "GET" and route == "/healthz":
+                health = self._health.snapshot()
+                health_body: dict[str, Any] = {
+                    "status": health.status,
+                    "endpoint": self._config.endpoint,
+                    "model": self._config.model,
+                    "capabilities": ["vision"],
+                }
+                if health.error_code is not None:
+                    health_body["error_code"] = health.error_code
+                if health.error is not None:
+                    health_body["error"] = health.error
                 response = BridgeResponse(
-                    200,
-                    {
-                        "status": "ready",
-                        "endpoint": self._config.endpoint,
-                        "model": self._config.model,
-                        "capabilities": ["vision"],
-                    },
+                    200 if health.status == "ready" else 503,
+                    health_body,
                 )
             elif method == "GET" and route == "/api/version":
                 response = BridgeResponse(200, {"version": f"independence-hailo-vlm-bridge/{BRIDGE_VERSION}"})
@@ -296,7 +372,24 @@ class BridgeApplication:
             elif method == "POST" and route == "/api/show":
                 request = self._json_request(body)
                 self._require_served_model(request)
-                response = BridgeResponse(200, {"capabilities": ["vision"]})
+                health = self._health.snapshot()
+                if health.status != "ready":
+                    response = BridgeResponse(
+                        503,
+                        {
+                            "error": "the local Hailo VLM bridge is not ready",
+                            "code": health.error_code or "backend_degraded",
+                            "health": health.status,
+                        },
+                    )
+                else:
+                    response = BridgeResponse(
+                        200,
+                        {
+                            "capabilities": ["vision"],
+                            "health": health.status,
+                        },
+                    )
             elif method == "POST" and route == "/api/chat":
                 response, metadata = self._chat(body)
             else:
@@ -304,11 +397,16 @@ class BridgeApplication:
         except BridgeError as error:
             outcome = error.outcome
             response = BridgeResponse(error.status, {"error": error.message})
-        except BackendInferenceError:
+        except BackendInferenceError as error:
             outcome = "hailo_inference_failed"
+            self._health.mark_failure(error)
             response = BridgeResponse(
                 503,
-                {"error": "the local Hailo VLM could not complete the request"},
+                {
+                    "error": error.public_message(),
+                    "code": error.code,
+                    "health": "degraded",
+                },
             )
         except InvalidImageError:
             outcome = "invalid_image"
@@ -451,6 +549,7 @@ class BridgeApplication:
         generation_started = time.monotonic()
         answer = self._backend.generate(prompt, image_bytes)
         metadata.generation_ms = int((time.monotonic() - generation_started) * 1000)
+        self._health.mark_ready()
         return (
             BridgeResponse(
                 200,
@@ -558,13 +657,22 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._respond(self.server.application.handle("POST", self.path, body))
 
     def _respond(self, response: BridgeResponse) -> None:
-        body = json.dumps(response.body, separators=(",", ":")).encode("utf-8")
-        self.send_response(response.status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(response.body, separators=(",", ":")).encode("utf-8")
+            self.send_response(response.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Cancellation or a client timeout can close the loopback socket
+            # while Hailo is still generating. This is not a backend failure.
+            print(
+                "Hailo VLM client disconnected before the response was sent",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def log_message(self, _format: str, *_args: object) -> None:
         # BaseHTTPRequestHandler's default access log can contain request paths
@@ -728,7 +836,9 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
     print(f"Hailo VLM bridge listening on {config.endpoint}")
-    print(f"Health: {config.endpoint}/healthz | model: {config.model} | capabilities: vision")
+    print(
+        f"Health: {config.endpoint}/healthz | status: ready | model: {config.model} | capabilities: vision"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

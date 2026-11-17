@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -19,6 +21,9 @@ from tools.hailo_vlm_bridge import (  # noqa: E402
     BridgeApplication,
     BridgeConfig,
     BridgeHttpServer,
+    BridgeRequestHandler,
+    BridgeResponse,
+    BackendInferenceError,
     HailoVlmBackend,
     MAX_IMAGES,
     SafeTelemetry,
@@ -68,8 +73,83 @@ class HailoVlmBridgeTests(unittest.TestCase):
         self.assertEqual(show.status, 200)
         self.assertEqual(show.body["capabilities"], ["vision"])
         self.assertEqual(health.status, 200)
+        self.assertEqual(health.body["status"], "ready")
         self.assertEqual(health.body["endpoint"], "http://127.0.0.1:11435")
         self.assertEqual(health.body["model"], "qwen3-vl:2b-instruct")
+
+    def test_backend_failure_marks_health_degraded_and_exposes_bounded_reason(self) -> None:
+        class FailingBackend(FakeBackend):
+            def generate(self, prompt: list[dict[str, object]], images: list[bytes]) -> str:
+                raise BackendInferenceError(
+                    "Hailo VLM inference failed",
+                    "hailo_inference_failed",
+                    "RuntimeError: device queue stopped",
+                )
+
+        application = BridgeApplication(
+            self.config,
+            FailingBackend(),
+            SafeTelemetry(None),
+        )
+        request = {
+            "model": "qwen3-vl:2b-instruct",
+            "stream": False,
+            "messages": [{"role": "user", "content": "look", "images": []}],
+        }
+
+        response = application.handle("POST", "/api/chat", json.dumps(request).encode())
+        health = application.handle("GET", "/healthz")
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.body["code"], "hailo_inference_failed")
+        self.assertEqual(response.body["health"], "degraded")
+        self.assertIn("device queue stopped", response.body["error"])
+        self.assertEqual(health.status, 503)
+        self.assertEqual(health.body["status"], "degraded")
+        self.assertEqual(health.body["error_code"], "hailo_inference_failed")
+
+        show = application.handle(
+            "POST",
+            "/api/show",
+            json.dumps({"model": "qwen3-vl:2b-instruct"}).encode(),
+        )
+        self.assertEqual(show.status, 503)
+        self.assertEqual(show.body["health"], "degraded")
+
+    def test_successful_generation_recovers_degraded_health(self) -> None:
+        application = self.app()
+        application._health.mark_failure(  # type: ignore[attr-defined]
+            BackendInferenceError("Hailo VLM inference failed", "hailo_inference_failed", "device stopped")
+        )
+        request = {
+            "model": "qwen3-vl:2b-instruct",
+            "stream": False,
+            "messages": [{"role": "user", "content": "look", "images": []}],
+        }
+
+        response = application.handle("POST", "/api/chat", json.dumps(request).encode())
+        health = application.handle("GET", "/healthz")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(health.status, 200)
+        self.assertEqual(health.body["status"], "ready")
+
+    def test_client_disconnect_during_response_is_logged_without_traceback(self) -> None:
+        class DisconnectedWriter:
+            def write(self, _body: bytes) -> int:
+                raise BrokenPipeError("client closed the loopback socket")
+
+        handler = object.__new__(BridgeRequestHandler)
+        handler.wfile = DisconnectedWriter()  # type: ignore[assignment]
+        handler.send_response = lambda _status: None  # type: ignore[method-assign]
+        handler.send_header = lambda _name, _value: None  # type: ignore[method-assign]
+        handler.end_headers = lambda: None  # type: ignore[method-assign]
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            handler._respond(BridgeResponse(200, {"status": "ready"}))
+
+        self.assertIn("client disconnected before the response was sent", stderr.getvalue())
 
     def test_server_host_matches_independence_loopback_policy(self) -> None:
         self.assertEqual(_loopback_host("127.0.0.1"), "127.0.0.1")

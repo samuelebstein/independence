@@ -29,6 +29,13 @@ application can:
 The current user session is Ephemeral Mode: unauthenticated, in-memory, and
 discarded when the process ends.
 
+## Teach Sam About the Latest Milestone
+
+The Hailo path now uses Qwen3-VL-2B-Instruct as a single-photo local backend.
+Independence replaces the previous accepted photo when a new one is captured,
+never sends a failed capture as a text-only vision request, and reports the
+bridge's bounded health and inference reason locally.
+
 ## Try it locally
 
 From the repository root, with a local Ollama server and model already

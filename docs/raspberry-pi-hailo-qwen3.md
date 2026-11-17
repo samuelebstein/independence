@@ -365,7 +365,7 @@ Start the bridge with the explicit Qwen3 HEF:
 
 ```bash
 HAILO_VLM_HEF="$QWEN3_VL_HEF" \
-  HAILO_APPS_DIR="$HOME/code/hailo-apps" \
+  HAILO_APPS_DIR="$HOME/code/hailo-apps-26.03.1" \
   HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
   scripts/run_pi_hailo_vlm_bridge.sh
 ```
@@ -381,7 +381,7 @@ The smoke-test generation settings are startup-configurable. Defaults remain
 
 ```bash
 HAILO_VLM_HEF="$QWEN3_VL_HEF" \
-  HAILO_APPS_DIR="$HOME/code/hailo-apps" \
+  HAILO_APPS_DIR="$HOME/code/hailo-apps-26.03.1" \
   HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
   scripts/run_pi_hailo_vlm_bridge.sh \
   --temperature 0.2 --seed 42 --max-generated-tokens 128
@@ -389,6 +389,38 @@ HAILO_VLM_HEF="$QWEN3_VL_HEF" \
 
 Temperature must be greater than `0` and at most `2`; token count must be positive. These values
 affect generation only and are reported nowhere with prompt or image content.
+
+### Health, errors, and one-photo behavior
+
+The bridge is ready only after the HEF and Hailo device initialize. In the
+bridge terminal, `Health: ... status: ready` confirms startup. Check it from a
+second terminal without sending a photograph:
+
+```bash
+curl --silent --show-error --include http://127.0.0.1:11435/healthz
+```
+
+The response is HTTP 200 with `"status":"ready"` when healthy. This is a
+last-known runtime health state: a device that fails while idle is detected on
+the next generation request. A failed Hailo generation
+changes the response to HTTP 503 with `"status":"degraded"`; the bridge
+terminal prints the bounded failure reason. The next successful generation
+prints a recovery message and returns health to `ready`. The Rust application
+also displays the HTTP status, failure code, health state, and bounded local
+reason; in voice mode Piper speaks a fixed “check the Hailo bridge” notice, not
+the raw backend diagnostic.
+
+`BrokenPipeError` is not a Hailo inference failure. It means Independence (or a
+manual client) cancelled or timed out after generation began and closed the
+loopback connection before the response was written. The bridge now reports
+this as a client disconnect and does not mark the model unhealthy.
+
+Qwen3 accepts one photograph per request. Pressing `P` after a photo has already
+been captured is rejected, and a photo captured in a new request replaces the
+previous accepted photo instead of being appended to it. If an explicitly
+requested photo cannot be captured, Independence sends **no** text-only request
+and asks you to try the photo again; it will not present a text-only answer as
+visual analysis.
 
 The Hailo Apps test remains a deliberately temporary upstream edit, not the
 Independence implementation. Restore that source file after the smoke test;

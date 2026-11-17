@@ -25,6 +25,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3-vl:4b-instruct";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_IMAGES_PER_REQUEST: usize = 1;
 
 /// The editable behavioral guidance sent as Ollama's system message.
 pub const TEACHER_INSTRUCTIONS: &str = include_str!("teacher.txt");
@@ -422,6 +423,11 @@ impl OllamaClient {
         images: &[&[u8]],
         interaction: Option<&Interaction>,
     ) -> Result<OllamaAnswer, ThinkError> {
+        if images.len() > MAX_IMAGES_PER_REQUEST {
+            return Err(ThinkError::TooManyImages {
+                max: MAX_IMAGES_PER_REQUEST,
+            });
+        }
         if !images.is_empty() && !self.supports_images() {
             return Err(match self.capabilities().image_input {
                 CapabilityStatus::Unsupported => ThinkError::ImagesUnsupported {
@@ -653,8 +659,19 @@ async fn http_error(status: StatusCode, response: reqwest::Response) -> ThinkErr
         .json::<OllamaErrorResponse>()
         .await
         .ok()
-        .and_then(|body| body.error)
-        .map(|message| format!(": {}", truncate_for_diagnostic(&message)))
+        .map(|body| {
+            let message = body
+                .error
+                .map(|message| truncate_for_diagnostic(&message))
+                .unwrap_or_else(|| "no error detail".into());
+            let metadata = match (body.code, body.health) {
+                (Some(code), Some(health)) => format!(" [code={code}; health={health}]"),
+                (Some(code), None) => format!(" [code={code}]"),
+                (None, Some(health)) => format!(" [health={health}]"),
+                (None, None) => String::new(),
+            };
+            format!(": {message}{metadata}")
+        })
         .unwrap_or_default();
 
     ThinkError::Http { status, detail }
@@ -775,6 +792,8 @@ struct ResponseMessage {
 #[derive(Deserialize)]
 struct OllamaErrorResponse {
     error: Option<String>,
+    code: Option<String>,
+    health: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -829,6 +848,9 @@ pub enum ThinkError {
     #[error("model `{model}` does not advertise vision through Ollama /api/show")]
     ImagesUnsupported { model: String },
 
+    #[error("Qwen3 accepts at most {max} image per request; no multi-image request was sent")]
+    TooManyImages { max: usize },
+
     #[error(
         "could not verify whether configured model `{model}` accepts images; camera capture remains off until /api/show succeeds"
     )]
@@ -853,6 +875,7 @@ impl ThinkError {
             | Self::EndpointHasPath(_)
             | Self::EmptyModel
             | Self::ImagesUnsupported { .. }
+            | Self::TooManyImages { .. }
             | Self::ImageCapabilitiesUnknown { .. } => "configuration",
         }
     }
@@ -1154,35 +1177,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_multiple_image_bytes_in_input_order() {
+    async fn rejects_multiple_image_bytes_before_http() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/chat"))
-            .and(body_json(json!({
-                "model": "test-model",
-                "stream": false,
-                "messages": [
-                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
-                    {"role": "user", "content": "Compare these.", "images": ["AQI=", "AwQF"]}
-                ]
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "They differ."},
-                "done": true,
-                "done_reason": "stop"
-            })))
-            .mount(&server)
-            .await;
-
-        let answer = within_test_timeout(client(&server).answer(
+        let error = within_test_timeout(client(&server).answer(
             &[],
             "Compare these.",
             &[&[1, 2], &[3, 4, 5]],
         ))
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(answer.text, "They differ.");
+        assert!(matches!(error, ThinkError::TooManyImages { max: 1 }));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -38,10 +38,7 @@ use crate::{
         CameraPreparation, CapturedAudio, DictationEvent, DictationInput, DictationOutput, Effect,
         Event, Input, RecordingId, TurnFinished, TurnId, TurnRequest, TurnResult, VisualRequest,
     },
-    security::{
-        EphemeralEntryControl, EphemeralEntryGesture, EphemeralEntryOutcome, EphemeralSession,
-        OperatingMode, SecurityError, SecurityManager,
-    },
+    security::{EphemeralSession, SecurityError, SecurityManager},
     see::{
         Photo, PhotoSource,
         camera::{CameraRunError, CameraService, select_camera},
@@ -155,19 +152,13 @@ impl MainEventResult {
 }
 
 /// Runs the interactive terminal application until `/quit`, EOF, or Ctrl+C.
-pub async fn run() -> Result<(), AppError> {
-    run_with_mode(OperatingMode::Ephemeral).await
-}
-
-/// Runs the line-oriented application in the requested operating mode.
 ///
-/// The default is Ephemeral Mode.  Private Mode is deliberately rejected in
-/// Milestone 6.1 before an Ollama client, terminal reader, camera, or private
-/// storage could be initialized: no authenticator exists yet.
-pub async fn run_with_mode(mode: OperatingMode) -> Result<(), AppError> {
+/// Ephemeral Mode is the only mode offered. Private Mode has no launch option
+/// until Ephemeral Mode is mature and an authenticator exists.
+pub async fn run() -> Result<(), AppError> {
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
-    let session = enter_requested_ephemeral_mode(&mut security, mode)?;
+    let session = enter_ephemeral_mode(&mut security)?;
 
     let result = async {
         let client = OllamaClient::from_environment()?;
@@ -216,26 +207,17 @@ fn announce_security_lifecycle(security: &SecurityManager) {
     );
 }
 
-/// Acquires the only production session type Milestone 6.1 can authorize.
-/// Keeping this decision in `SecurityManager` prevents the controller or a
-/// presentation adapter from treating a CLI selection as authentication.
-fn enter_requested_ephemeral_mode(
-    security: &mut SecurityManager,
-    requested: OperatingMode,
-) -> Result<EphemeralSession, AppError> {
-    match requested {
-        OperatingMode::Ephemeral => {
-            let session = security.enter_ephemeral().map_err(AppError::Security)?;
-            speak::process(
-                "operating_mode",
-                "Ephemeral Mode active — temporary context only; private data is unavailable",
-            );
-            Ok(session)
-        }
-        OperatingMode::Private => Err(AppError::PrivateModeUnavailable {
-            state: security.state(),
-        }),
-    }
+/// Acquires the only production session type that exists. Starting the
+/// program is the explicit action that begins Ephemeral Mode; there is no
+/// separate entry gesture. Keeping this in `SecurityManager` means no adapter
+/// can obtain any other kind of session.
+fn enter_ephemeral_mode(security: &mut SecurityManager) -> Result<EphemeralSession, AppError> {
+    let session = security.enter_ephemeral().map_err(AppError::Security)?;
+    speak::process(
+        "operating_mode",
+        "Ephemeral Mode active — temporary context only; private data is unavailable",
+    );
+    Ok(session)
 }
 
 fn finish_ephemeral_session(
@@ -287,7 +269,7 @@ async fn discover_model_capabilities(client: &OllamaClient) {
 pub async fn run_dictation(audio_input: Option<String>) -> Result<(), AppError> {
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
-    let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)?;
+    let session = enter_ephemeral_mode(&mut security)?;
     let result = dictation::run(audio_input)
         .await
         .map_err(AppError::Dictation);
@@ -463,38 +445,13 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     let resolved = profile::resolve_voice_profile(&options).map_err(AppError::Profile)?;
 
     // Profile resolution reads only command-line/environment configuration.
-    // It intentionally happens before the security gate, while creating an
-    // local model client, opening an input device, loading Whisper, and
-    // opening an audio output all wait until the caller has entered
-    // Ephemeral Mode.
+    // Ephemeral Mode begins immediately at launch in every input mode; the
+    // local model client, input device, Whisper, and audio output are created
+    // only after the session lease exists, and the microphone opens only while
+    // Talk/ENTER is held.
     let mut security = SecurityManager::new();
     announce_security_lifecycle(&security);
-    if resolved.operating_mode == OperatingMode::Private {
-        return Err(AppError::PrivateModeUnavailable {
-            state: security.state(),
-        });
-    }
-
-    let session = match &resolved.input {
-        // Terminal mode remains the existing laptop interaction: selecting
-        // the default safe mode enters it immediately. The terminal reader is
-        // created later by the actual voice runtime.
-        ResolvedVoiceInput::Terminal => {
-            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
-        }
-        // A physical Pi controller uses its existing Talk button for a
-        // deliberate 5-second hold. This gate opens only the evdev device;
-        // it does not start microphone, camera, Whisper, Piper, or Ollama.
-        ResolvedVoiceInput::Buttons(path) => {
-            if matches!(
-                await_button_ephemeral_entry(path.clone()).await?,
-                EphemeralEntryResult::Shutdown
-            ) {
-                return Ok(());
-            }
-            enter_requested_ephemeral_mode(&mut security, resolved.operating_mode)?
-        }
-    };
+    let session = enter_ephemeral_mode(&mut security)?;
 
     let result = async {
         match (resolved.pipeline, resolved.backend) {
@@ -542,100 +499,6 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     // their application-owned buffers during their own shutdown.
     finish_ephemeral_session(&mut security, session)?;
     result
-}
-
-/// Waits for physical entry into Ephemeral Mode without starting the ordinary
-/// voice runtime.  The selected evdev adapter is the sole input owner here;
-/// SSH/stdin and Crossterm are never opened for button mode.
-enum EphemeralEntryResult {
-    Entered,
-    Shutdown,
-}
-
-async fn await_button_ephemeral_entry(
-    path: std::path::PathBuf,
-) -> Result<EphemeralEntryResult, AppError> {
-    let (sender, mut receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    let mut input = EvdevButtonInputSource::open(path, sender).map_err(AppError::ButtonInput)?;
-    let mut gesture = EphemeralEntryGesture::new();
-    speak::process(
-        "ephemeral_entry_waiting",
-        "hold the physical Talk/Enter button for five seconds, then release to enter Ephemeral Mode",
-    );
-
-    loop {
-        let event = tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                input.shutdown();
-                return Ok(EphemeralEntryResult::Shutdown);
-            }
-            event = receiver.recv() => event,
-        };
-        let Some(event) = event else {
-            input.shutdown();
-            return Err(AppError::EphemeralEntryInputClosed);
-        };
-
-        let control = match event {
-            VoiceInputEvent::Control(VoiceControlEvent::TalkPressed) => {
-                EphemeralEntryControl::TalkPressed
-            }
-            VoiceInputEvent::Control(VoiceControlEvent::TalkReleased) => {
-                EphemeralEntryControl::TalkReleased
-            }
-            VoiceInputEvent::Control(VoiceControlEvent::Cancel) | VoiceInputEvent::Interrupt => {
-                EphemeralEntryControl::Cancelled
-            }
-            VoiceInputEvent::Control(VoiceControlEvent::PhotoPressed) => {
-                EphemeralEntryControl::Other
-            }
-            VoiceInputEvent::SourceLost { source, message } => {
-                gesture.reset();
-                speak::warning(
-                    "ephemeral_entry_input_lost",
-                    format!("{source} was lost while waiting for Ephemeral Mode entry: {message}"),
-                );
-                continue;
-            }
-            VoiceInputEvent::SourceRecovered { source } => {
-                gesture.reset();
-                speak::process(
-                    "ephemeral_entry_input_recovered",
-                    format!("{source} is available again; hold Talk/Enter for five seconds"),
-                );
-                continue;
-            }
-            VoiceInputEvent::SourceFailed { source, message } => {
-                input.shutdown();
-                return Err(AppError::EphemeralEntryInputFailed {
-                    input_source: source,
-                    message,
-                });
-            }
-        };
-
-        match gesture.handle(control, Instant::now()) {
-            EphemeralEntryOutcome::Waiting => {}
-            EphemeralEntryOutcome::TooShort => speak::process(
-                "ephemeral_entry_not_confirmed",
-                "Talk/Enter was released before five seconds; no microphone or camera was started",
-            ),
-            EphemeralEntryOutcome::Cancelled => {
-                speak::process(
-                    "ephemeral_entry_cancelled",
-                    "entry gesture cancelled; hold Talk/Enter for five seconds to try again",
-                );
-            }
-            EphemeralEntryOutcome::Entered => {
-                input.shutdown();
-                speak::process(
-                    "ephemeral_entry_confirmed",
-                    "Ephemeral Mode selected; release consumed, press Talk/Enter again to record",
-                );
-                return Ok(EphemeralEntryResult::Entered);
-            }
-        }
-    }
 }
 
 /// Creates the strict local Ollama-compatible client only after runtime
@@ -712,6 +575,15 @@ async fn run_transcribe_and_speak(
         dictation.model_is_available(),
     );
 
+    let live_partial_transcription = resolved.live_partial_transcription;
+    speak::process(
+        "voice_live_partials",
+        if live_partial_transcription {
+            "live partial transcription enabled"
+        } else {
+            "live partial transcription disabled for this profile; final transcript only"
+        },
+    );
     let mut runtime = VoiceRuntime::new(
         Controller::new_ephemeral(),
         TurnRuntime::new(
@@ -726,6 +598,7 @@ async fn run_transcribe_and_speak(
         voice_aux_sender,
         speech,
     );
+    runtime.live_partial_transcription = live_partial_transcription;
     let mut partial_tick = tokio::time::interval(PARTIAL_TRANSCRIPTION_INTERVAL);
     partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -746,7 +619,7 @@ async fn run_transcribe_and_speak(
                 Some(event) => VoiceEvent::Speech(event),
                 None => VoiceEvent::SpeechChannelClosed,
             },
-            _ = partial_tick.tick() => VoiceEvent::PartialTick,
+            _ = partial_tick.tick(), if live_partial_transcription => VoiceEvent::PartialTick,
         };
 
         let keep_running = match event {
@@ -1195,10 +1068,10 @@ struct VoiceRuntime {
     aux_sender: mpsc::Sender<VoiceAuxEvent>,
     speech: speak::SpeechService,
     draft: Option<VoiceDraft>,
-    /// Capture starts only after this exact listening cue completed or failed.
-    /// A release/Escape clears it first, so a late speech event cannot activate
-    /// the microphone after the user changed their mind.
-    pending_listening_cue: Option<PendingListeningCue>,
+    /// Whether partial ticks may ask for a live snapshot. When false (the
+    /// Hailo Pi profile), the recording is never copied or transcribed until
+    /// Talk/ENTER is released.
+    live_partial_transcription: bool,
     /// At most one camera request is dispatched at a time, in `P` press
     /// order. The camera service has its own hardware gate too; this queue
     /// preserves user-visible attachment order before work reaches that gate.
@@ -1231,12 +1104,6 @@ struct VoiceDraft {
     final_transcript: Option<String>,
     submitted: bool,
     interaction: Interaction,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingListeningCue {
-    draft_id: u64,
-    utterance_id: speak::UtteranceId,
 }
 
 impl VoiceDraft {
@@ -1335,7 +1202,7 @@ impl VoiceRuntime {
             aux_sender,
             speech,
             draft: None,
-            pending_listening_cue: None,
+            live_partial_transcription: true,
             active_photo_capture: None,
             live_transcription: None,
             pending_snapshot: None,
@@ -1346,7 +1213,17 @@ impl VoiceRuntime {
         }
     }
 
+    /// Prints "Ready" only when nothing for the person is still in progress:
+    /// no held or pending draft, no model turn, and dictation idle. This keeps
+    /// the prompt after the answer or failure instead of before it.
+    fn announce_ready_if_idle(&self) {
+        if self.draft.is_none() && !self.controller.has_active_turn() && self.dictation.is_ready() {
+            speak::voice_log("ready — hold enter to start recording/transcription");
+        }
+    }
+
     async fn handle_main_event(&mut self, event: Event) -> bool {
+        let turn_finished = matches!(event, Event::TurnFinished(_));
         let interaction = match &event {
             Event::TurnFinished(finished) => self.turns.active_interaction(finished.id),
             _ => None,
@@ -1364,6 +1241,10 @@ impl VoiceRuntime {
         .await;
         if let Some((utterance_id, interaction)) = result.pending_answer_speech {
             self.pending_answer_speech.insert(utterance_id, interaction);
+        }
+        if turn_finished && result.keep_running {
+            // The answer or the model failure has now been displayed.
+            self.announce_ready_if_idle();
         }
         result.keep_running
     }
@@ -1466,8 +1347,8 @@ impl VoiceRuntime {
                 unreachable!("unavailable snapshots return before dictation handling")
             }
             DictationEvent::Input(DictationInput::HoldStart) => {
-                // Capture is deliberately delayed until the listening cue has
-                // played. The cue completion comes back as `SpeechEvent`.
+                // Capture starts immediately on press. There is no spoken cue
+                // to wait for, so the first word after pressing is recorded.
                 return self.begin_draft().await;
             }
             // `Enter` is not emitted by the hold-to-talk adapter. Retaining
@@ -1524,6 +1405,15 @@ impl VoiceRuntime {
                     self.speech.handle().cancel_all("dictation_failed");
                 }
                 Some((*recording_id, "cancelled"))
+            }
+            DictationEvent::RecordingTooShort { recording_id } => {
+                // A tap or sticky button. Drop the draft (including any photo
+                // request) quietly; the dictation controller shows the
+                // "hold longer" notice. Nothing is transcribed or sent.
+                if self.draft_matches_recording(*recording_id) {
+                    self.cancel_draft();
+                }
+                Some((*recording_id, "too_short"))
             }
             DictationEvent::RecordingFailed { recording_id, .. }
             | DictationEvent::TranscriptionFailed { recording_id, .. } => {
@@ -1618,28 +1508,31 @@ impl VoiceRuntime {
 
     fn display_dictation_log(&mut self, output: DictationOutput) {
         match output {
-            DictationOutput::Ready => {
-                speak::voice_log("ready — hold enter to start recording/transcription")
-            }
+            // The dictation controller is ready again as soon as a transcript
+            // is accepted, but the person's turn is not over until the answer
+            // (or a failure) has been shown. "Ready" is printed only then.
+            DictationOutput::Ready => self.announce_ready_if_idle(),
             DictationOutput::Recording { .. } => {}
+            // Voice mode has already shown "Cancelled." for this Escape; a
+            // second "Cancelling recording..." line would appear after it.
             DictationOutput::Discarding => {
-                speak::voice_log("discarding recording and releasing microphone")
+                info!(target: "process", event = "voice_recording_discarding", "releasing microphone after cancellation");
             }
             DictationOutput::Transcribing => {
                 // Dictation emits this only after the CPAL recording owner has
-                // produced `RecordingFinished`, which means its stream is
-                // already released. Speaking now avoids recording our cue.
+                // produced `RecordingFinished`. "Thinking..." is terminal
+                // status and a diagnostic marker only; it is never spoken.
                 speak::voice_log("microphone released; finishing local transcription");
                 if let Some(draft) = self.draft.as_ref() {
                     draft
                         .interaction
                         .mark("whisper.final_transcription_started");
-                    let _ = self.say(speak::SpeechOwner::Draft(draft.id), "i'm thinking");
                 }
             }
             // `AcceptedTranscript` below provides the exact, one-time final
             // transcript log. Avoid printing it once here and once there.
             DictationOutput::Transcript(_) => {}
+            DictationOutput::TooShort => speak::voice_log(speak::TOO_SHORT_VOICE_LOG),
             DictationOutput::Diagnostic(message) => speak::warning("dictation", message),
         }
     }
@@ -1663,55 +1556,14 @@ impl VoiceRuntime {
             .checked_add(1)
             .expect("voice draft identifiers exhausted");
         self.draft = Some(VoiceDraft::new(id));
-        if let Some(draft) = self.draft.as_ref() {
-            draft.interaction.mark("speech.listening_cue_queued");
-        }
-
-        match self.say(speak::SpeechOwner::Draft(id), "i'm listening") {
-            Some(utterance_id) => {
-                self.pending_listening_cue = Some(PendingListeningCue {
-                    draft_id: id,
-                    utterance_id,
-                });
-            }
-            None => {
-                // Queue failure is explicit and privacy-safe. There will be
-                // no later cue event, so capture may start without a cue.
-                speak::warning(
-                    "listening_cue_unavailable",
-                    "starting microphone capture without the listening cue",
-                );
-                return self.start_capture_after_cue(id).await;
-            }
-        }
-        true
+        // "Listening..." is terminal status only. The microphone opens right
+        // away; nothing is synthesized or played before capture.
+        speak::voice_log("listening — microphone opening");
+        self.start_capture(id).await
     }
 
-    /// Logs and queues an already-authorized spoken utterance. The controller
-    /// remains the only source of model answers; this helper is used only for
-    /// fixed interaction cues owned by this runtime.
-    fn say(&self, owner: speak::SpeechOwner, text: &'static str) -> Option<speak::UtteranceId> {
-        // Fixed voice cues are interface status, not assistant dialogue and
-        // never diagnostic content. Accepted model answers still use the
-        // distinct controller-authorized answer path.
-        speak::voice_cue(text);
-        let interaction = match owner {
-            speak::SpeechOwner::Draft(draft_id) => self
-                .draft
-                .as_ref()
-                .filter(|draft| draft.id == draft_id)
-                .map(|draft| draft.interaction.clone()),
-            speak::SpeechOwner::Turn(turn_id) => self.turns.active_interaction(turn_id),
-            speak::SpeechOwner::System => None,
-        };
-        self.speech
-            .handle()
-            .say_with_interaction(owner, text, interaction)
-    }
-
-    /// Handles a worker fact, rather than allowing the speech worker to
-    /// manipulate microphone state directly. Only the exact listening cue for
-    /// the currently-held draft may open capture.
+    /// Handles a worker fact. The speech worker never manipulates microphone
+    /// or draft state; it only reports how an accepted answer's audio ended.
     async fn handle_speech_event(&mut self, event: speak::SpeechEvent) -> bool {
         if let Some(interaction) = self.pending_answer_speech.remove(&event.utterance_id) {
             // The controller has already accepted and displayed the answer.
@@ -1748,52 +1600,15 @@ impl VoiceRuntime {
             return true;
         }
 
-        let Some(pending) = self.pending_listening_cue else {
-            return true;
-        };
-        if pending.utterance_id != event.utterance_id
-            || pending.draft_id
-                != match event.owner {
-                    speak::SpeechOwner::Draft(draft_id) => draft_id,
-                    speak::SpeechOwner::Turn(_) | speak::SpeechOwner::System => return true,
-                }
-        {
-            return true;
-        }
-
-        // Clear before any await. A release or Escape that races with this
-        // event therefore cannot leave a second path able to open capture.
-        self.pending_listening_cue = None;
-        match event.outcome {
-            speak::SpeechOutcome::Played => {
-                speak::process("listening_cue_completed", "opening microphone capture");
-                self.start_capture_after_cue(pending.draft_id).await
-            }
-            speak::SpeechOutcome::SynthesisFailed | speak::SpeechOutcome::PlaybackFailed => {
-                // Spoken output is optional: a missing Piper install or output
-                // device does not make the established voice input unusable.
-                speak::warning(
-                    "listening_cue_failed",
-                    "starting microphone capture without the listening cue",
-                );
-                self.start_capture_after_cue(pending.draft_id).await
-            }
-            speak::SpeechOutcome::Cancelled => {
-                // Cancellation is intentional (new press, release, Escape,
-                // or shutdown). It must never open the microphone later.
-                speak::process(
-                    "listening_cue_cancelled",
-                    "microphone capture was not started",
-                );
-                true
-            }
-        }
+        // Only accepted answers and fixed error notices are spoken now, so
+        // no other speech fact affects microphone or draft state.
+        true
     }
 
-    /// Starts the pre-existing DictationSession only after the cue boundary.
+    /// Starts the pre-existing DictationSession for the newly pressed draft.
     /// This explicitly reuses its recording-ID lifecycle instead of inventing
-    /// another microphone owner for speech output.
-    async fn start_capture_after_cue(&mut self, draft_id: u64) -> bool {
+    /// another microphone owner.
+    async fn start_capture(&mut self, draft_id: u64) -> bool {
         let current = self.draft.as_ref().is_some_and(|draft| {
             draft.id == draft_id
                 && draft.held
@@ -1806,7 +1621,6 @@ impl VoiceRuntime {
         }
 
         if let Some(draft) = self.draft.as_ref() {
-            draft.interaction.mark("speech.listening_cue_completed");
             self.dictation
                 .set_pending_interaction(draft.interaction.clone());
         }
@@ -1824,17 +1638,6 @@ impl VoiceRuntime {
     }
 
     fn release_draft(&mut self) {
-        if self.pending_listening_cue.take().is_some() {
-            // The person released during the cue. There is no recording to
-            // finish, and the late completion must not open a microphone.
-            self.cancel_draft();
-            self.speech
-                .handle()
-                .cancel_all("enter_released_during_listening_cue");
-            speak::voice_log("Enter released during listening cue; no microphone capture started");
-            return;
-        }
-
         let should_announce = if let Some(draft) = self.draft.as_mut() {
             if draft.held && !draft.released {
                 draft.held = false;
@@ -1871,9 +1674,9 @@ impl VoiceRuntime {
             let Some(draft) = self.draft.as_mut() else {
                 return;
             };
-            // `P` is meaningful only while actual capture is open. In
-            // particular, it cannot activate a camera while the listening cue
-            // is still playing before microphone capture begins.
+            // `P` is meaningful only while actual capture is open: a press in
+            // the brief moment before the microphone reports it is recording
+            // is ignored rather than attached to nothing.
             if !draft.held
                 || !draft.recording_started
                 || draft.released
@@ -1974,6 +1777,9 @@ impl VoiceRuntime {
     }
 
     fn request_partial_snapshot(&mut self) {
+        if !self.live_partial_transcription {
+            return;
+        }
         let recording_id = self.draft.as_mut().and_then(|draft| {
             if draft.held
                 && !draft.released
@@ -2135,8 +1941,11 @@ impl VoiceRuntime {
         if let Some(text) = partial {
             speak::user_transcript("partial", &text);
         }
-        if let Some(error) = failure {
-            speak::warning("partial_transcription_failed", error);
+        if failure.is_some() {
+            // Live partials are opportunistic display. A failure here (often
+            // just an early, quiet clip) says nothing about the final
+            // transcript, so it is never shown as a terminal warning.
+            speak::background_warning("partial_transcription_failed");
         }
 
         if let Some((pending_id, audio)) = self.pending_snapshot.take() {
@@ -2225,6 +2034,7 @@ impl VoiceRuntime {
             speak::voice_log(
                 "photo capture failed — no local model request was sent; hold ENTER and try again",
             );
+            self.announce_ready_if_idle();
             return true;
         }
 
@@ -2281,7 +2091,6 @@ impl VoiceRuntime {
 
     fn cancel_draft(&mut self) {
         self.cancel_live_transcription();
-        self.pending_listening_cue = None;
         self.active_photo_capture = None;
         if let Some(draft) = self.draft.take() {
             draft.cancellation.cancel();
@@ -2290,9 +2099,9 @@ impl VoiceRuntime {
                 self.cancelled_recordings
                     .insert(recording_id, draft.interaction);
             } else {
-                // A cue-only draft has no microphone/Whisper handle to wait
-                // for. Its local cleanup is complete once the generation was
-                // invalidated above.
+                // A draft whose recording was never requested (for example,
+                // the microphone could not be started) has no microphone or
+                // Whisper handle to wait for.
                 draft
                     .interaction
                     .mark("cancellation.local_cleanup_completed");
@@ -2305,7 +2114,7 @@ impl VoiceRuntime {
 
     fn complete_pending_recording(&mut self, recording_id: RecordingId, outcome: &'static str) {
         if let Some(interaction) = self.cancelled_recordings.remove(&recording_id) {
-            if outcome == "cancelled" {
+            if outcome == "cancelled" || outcome == "too_short" {
                 interaction.mark("cancellation.local_cleanup_completed");
             } else {
                 interaction.mark("dictation.cleanup_completed_after_failure");
@@ -2561,24 +2370,6 @@ pub enum AppError {
     #[error("security lifecycle rejected the requested operation: {0}")]
     Security(#[source] SecurityError),
 
-    #[error(
-        "Private Mode is not available because no authentication mechanism exists yet (security lifecycle: {state}); start without `--mode private` to use temporary Ephemeral Mode"
-    )]
-    PrivateModeUnavailable {
-        state: crate::security::SecurityState,
-    },
-
-    #[error("the physical input device closed while waiting for Ephemeral Mode entry")]
-    EphemeralEntryInputClosed,
-
-    #[error(
-        "the physical input device failed while waiting for Ephemeral Mode entry: {input_source}: {message}"
-    )]
-    EphemeralEntryInputFailed {
-        input_source: &'static str,
-        message: String,
-    },
-
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
 
@@ -2681,8 +2472,8 @@ mod tests {
     };
 
     use super::{
-        AppError, TurnRuntime, VoiceRuntime, enter_requested_ephemeral_mode,
-        finish_ephemeral_session, run_turn, run_voice_with_options, voice_diagnostic_speech,
+        AppError, TurnRuntime, VoiceRuntime, enter_ephemeral_mode, finish_ephemeral_session,
+        run_turn, run_voice_with_options, voice_diagnostic_speech,
     };
     use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
     use crate::security::{OperatingMode, SecurityManager, SecurityState};
@@ -2696,19 +2487,17 @@ mod tests {
     }
 
     #[test]
-    fn application_mode_boundary_enters_ephemeral_but_rejects_private_without_authentication() {
+    fn application_launch_enters_ephemeral_mode_once_without_any_gesture() {
         let mut security = SecurityManager::new();
-        let session = enter_requested_ephemeral_mode(&mut security, OperatingMode::Ephemeral)
-            .expect("default application launch enters the temporary mode");
+        let session = enter_ephemeral_mode(&mut security)
+            .expect("launching the application enters the temporary mode immediately");
         assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), Some(OperatingMode::Ephemeral));
+        assert!(
+            enter_ephemeral_mode(&mut security).is_err(),
+            "a second lease cannot be acquired while one is active"
+        );
         finish_ephemeral_session(&mut security, session).unwrap();
-        assert_eq!(security.active_mode(), None);
-
-        let error = enter_requested_ephemeral_mode(&mut security, OperatingMode::Private)
-            .expect_err("a CLI selection cannot manufacture authentication");
-        assert!(matches!(error, AppError::PrivateModeUnavailable { .. }));
-        assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), None);
     }
 
@@ -2937,19 +2726,6 @@ mod tests {
                     .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
                     .await
             );
-            let cue = self
-                .runtime
-                .pending_listening_cue
-                .expect("holding Enter should queue a listening cue");
-            assert!(
-                self.runtime
-                    .handle_speech_event(SpeechEvent {
-                        utterance_id: cue.utterance_id,
-                        owner: SpeechOwner::Draft(cue.draft_id),
-                        outcome: SpeechOutcome::Played,
-                    })
-                    .await
-            );
             let recording_id = match self.next_dictation_event().await {
                 DictationEvent::RecordingStarted { recording_id } => recording_id,
                 event => panic!("expected synthetic recording start, got {event:?}"),
@@ -3153,20 +2929,6 @@ mod tests {
             .await;
         let event = receiver.recv().await.expect("fake press event");
         assert!(harness.runtime.handle_control_event(event).await);
-        let cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("button press should queue the existing listening cue");
-        assert!(
-            harness
-                .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: cue.utterance_id,
-                    owner: SpeechOwner::Draft(cue.draft_id),
-                    outcome: SpeechOutcome::Played,
-                })
-                .await
-        );
         let started = harness.next_dictation_event().await;
         let recording_id = match started {
             DictationEvent::RecordingStarted { recording_id } => recording_id,
@@ -3216,20 +2978,6 @@ mod tests {
             harness
                 .runtime
                 .handle_control_event(receiver.recv().await.expect("button press event"))
-                .await
-        );
-        let cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("talk press should start the established listening cue");
-        assert!(
-            harness
-                .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: cue.utterance_id,
-                    owner: SpeechOwner::Draft(cue.draft_id),
-                    outcome: SpeechOutcome::Played,
-                })
                 .await
         );
         let recording_id = match harness.next_dictation_event().await {
@@ -3752,68 +3500,218 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn microphone_stays_closed_until_the_listening_cue_completes() {
+    async fn disabled_live_partials_never_copy_or_transcribe_while_held() {
         let server = MockServer::start().await;
-        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
-
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
-                .await
+        let mut harness = voice_harness(
+            &server,
+            ["only the final transcript".to_owned()],
+            unused_camera_service(),
         );
-        let cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("hold should queue a listening cue");
-        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
-        assert!(harness.dictation_events.try_recv().is_err());
+        harness.runtime.live_partial_transcription = false;
+        let recording_id = harness.start_hold().await;
 
+        for _ in 0..3 {
+            harness.runtime.request_partial_snapshot();
+        }
+        tokio::task::yield_now().await;
         assert!(
-            harness
-                .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: cue.utterance_id,
-                    owner: SpeechOwner::Draft(cue.draft_id),
-                    outcome: SpeechOutcome::Played,
-                })
-                .await
+            harness.dictation_events.try_recv().is_err(),
+            "no snapshot may be requested from the recorder"
         );
-        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 0);
+
+        let text = harness.release_hold(recording_id).await;
+        assert_eq!(text, "only the final transcript");
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 1);
+    }
+
+    async fn mock_answer(server: &MockServer, answer: &str) {
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": answer},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn photo_camera() -> CameraService {
+        let (camera, photo) = fake_camera();
+        CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: false,
+            captures: Arc::new(AtomicUsize::new(0)),
+        }))
     }
 
     #[tokio::test]
-    async fn release_or_escape_during_listening_cue_cannot_open_a_late_microphone() {
+    async fn terminal_shows_a_text_turn_once_and_in_order() {
         let server = MockServer::start().await;
-        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+        mock_answer(&server, "an answer").await;
+        let mut harness =
+            voice_harness(&server, ["a question".to_owned()], unused_camera_service());
+        crate::interface::test_terminal::start();
 
+        let _ = harness.submit_next_transcript().await;
+        harness.accept_next_answer().await;
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            [
+                "Listening...",
+                "Thinking...",
+                "You: a question",
+                "Independence: an answer",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_a_photo_turn_once_and_in_order() {
+        let server = MockServer::start().await;
+        mock_answer(&server, "a photo answer").await;
+        let mut harness = voice_harness(&server, ["what is this".to_owned()], photo_camera());
+        crate::interface::test_terminal::start();
+
+        let recording_id = harness.start_hold().await;
         assert!(
             harness
                 .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
                 .await
         );
-        let released_cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("hold should queue a listening cue");
+        let photo_finished = harness.next_aux_event().await;
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        let _ = harness.release_hold(recording_id).await;
+        harness.accept_next_answer().await;
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            [
+                "Listening...",
+                "Photo captured. 1 photo attached.",
+                "Thinking...",
+                "You: what is this",
+                "Independence: a photo answer",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_a_too_short_press_as_guidance_then_ready() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+        crate::interface::test_terminal::start();
+
+        let recording_id = harness.start_hold().await;
         assert!(
             harness
                 .runtime
                 .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
                 .await
         );
+        let _ = harness.next_dictation_event().await; // synthetic finished audio
         assert!(
             harness
                 .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: released_cue.utterance_id,
-                    owner: SpeechOwner::Draft(released_cue.draft_id),
-                    outcome: SpeechOutcome::Played,
-                })
+                .handle_dictation_event(DictationEvent::RecordingTooShort { recording_id })
                 .await
         );
-        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            [
+                "Listening...",
+                "Thinking...",
+                "Recording too short. Hold ENTER while you speak.",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_escape_once_then_ready() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+        crate::interface::test_terminal::start();
+
+        let _recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        let cancelled = harness.next_dictation_event().await;
+        assert!(harness.runtime.handle_dictation_event(cancelled).await);
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            ["Listening...", "Cancelled.", "Ready. Hold ENTER to speak."]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_a_failed_photo_once_and_ready_only_at_the_end() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: true,
+            captures: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut harness = voice_harness(&server, ["what is here".to_owned()], camera_service);
+        crate::interface::test_terminal::start();
+
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        let photo_finished = harness.next_aux_event().await;
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        let _ = harness.release_hold(recording_id).await;
+
+        let lines = crate::interface::test_terminal::lines();
+        assert_eq!(lines.first().map(String::as_str), Some("Listening..."));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Ready. Hold ENTER to speak.")
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "Thinking...")
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("Ready."))
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.starts_with("Independence:")));
+    }
+
+    #[tokio::test]
+    async fn press_opens_the_microphone_immediately_without_any_spoken_cue() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(
+            &server,
+            ["immediate question".to_owned()],
+            unused_camera_service(),
+        );
 
         assert!(
             harness
@@ -3821,32 +3719,31 @@ mod tests {
                 .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
                 .await
         );
-        let escaped_cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("second hold should queue a listening cue");
-        assert!(
-            harness
-                .runtime
-                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
-                .await
-        );
-        assert!(
-            harness
-                .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: escaped_cue.utterance_id,
-                    owner: SpeechOwner::Draft(escaped_cue.draft_id),
-                    outcome: SpeechOutcome::Played,
-                })
-                .await
-        );
-        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 0);
-        assert!(harness.runtime.draft.is_none());
+        // Capture is requested synchronously by the press itself; nothing
+        // waits for Piper or playback first.
+        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            harness.next_dictation_event().await,
+            DictationEvent::RecordingStarted { .. }
+        ));
+        assert_eq!(harness.runtime.speech.handle().utterances_requested(), 0);
     }
 
     #[tokio::test]
-    async fn a_failed_listening_cue_leaves_voice_input_usable_without_speaking() {
+    async fn status_changes_through_transcription_are_never_spoken() {
+        let server = MockServer::start().await;
+        let mut harness =
+            voice_harness(&server, ["a question".to_owned()], unused_camera_service());
+        let recording_id = harness.start_hold().await;
+        // Release → microphone released → transcribing → accepted transcript.
+        // None of these status changes may queue speech; only an accepted
+        // model answer may.
+        let _ = harness.release_hold(recording_id).await;
+        assert_eq!(harness.runtime.speech.handle().utterances_requested(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_before_the_microphone_reports_started_still_finishes_that_recording() {
         let server = MockServer::start().await;
         let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
 
@@ -3856,30 +3753,44 @@ mod tests {
                 .handle_dictation_event(DictationEvent::Input(DictationInput::HoldStart))
                 .await
         );
-        let cue = harness
-            .runtime
-            .pending_listening_cue
-            .expect("hold should queue a listening cue");
+        let started = harness.next_dictation_event().await;
+        // A very short press: the release arrives before the runtime has
+        // processed the microphone's started event.
         assert!(
             harness
                 .runtime
-                .handle_speech_event(SpeechEvent {
-                    utterance_id: cue.utterance_id,
-                    owner: SpeechOwner::Draft(cue.draft_id),
-                    outcome: SpeechOutcome::PlaybackFailed,
-                })
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
                 .await
         );
-
-        assert!(matches!(
-            harness.next_dictation_event().await,
-            DictationEvent::RecordingStarted { .. }
-        ));
-        assert_eq!(harness.recorder.starts.load(Ordering::SeqCst), 1);
+        assert!(harness.runtime.handle_dictation_event(started).await);
+        assert_eq!(harness.recorder.finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.recorder.cancels.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn p_during_the_listening_cue_does_not_activate_a_camera() {
+    async fn escape_right_after_press_cancels_the_new_recording() {
+        let server = MockServer::start().await;
+        let mut harness = voice_harness(&server, ["unused".to_owned()], unused_camera_service());
+        let recording_id = harness.start_hold().await;
+
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        let cancelled = harness.next_dictation_event().await;
+        assert!(matches!(
+            &cancelled,
+            DictationEvent::RecordingCancelled { recording_id: id } if *id == recording_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(cancelled).await);
+        assert!(harness.runtime.draft.is_none());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn p_before_the_microphone_reports_recording_does_not_activate_a_camera() {
         let server = MockServer::start().await;
         let (camera, photo) = fake_camera();
         let captures = Arc::new(AtomicUsize::new(0));
@@ -3997,6 +3908,212 @@ mod tests {
         );
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(captures.load(Ordering::SeqCst), 1);
+    }
+
+    /// A camera whose capture blocks until the test opens its gate, so a
+    /// release can deterministically happen while the photo is in progress.
+    struct GatedCameraBackend {
+        camera: CameraDescriptor,
+        photo: Photo,
+        fail: bool,
+        gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl CameraBackend for GatedCameraBackend {
+        fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+            Ok(vec![self.camera.clone()])
+        }
+
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
+            let _ = self
+                .gate
+                .lock()
+                .expect("synthetic camera gate lock")
+                .recv_timeout(Duration::from_secs(3));
+            if self.fail {
+                Err(CameraError::NoCameras)
+            } else {
+                Ok(self.photo.clone())
+            }
+        }
+    }
+
+    fn gated_camera(fail: bool) -> (CameraService, std::sync::mpsc::Sender<()>) {
+        let (camera, photo) = fake_camera();
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        (
+            CameraService::with_backend(Arc::new(GatedCameraBackend {
+                camera,
+                photo,
+                fail,
+                gate: Mutex::new(gate),
+            })),
+            open_gate,
+        )
+    }
+
+    #[tokio::test]
+    async fn release_during_photo_capture_waits_and_sends_transcript_with_the_photo() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "a photo answer"},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+        let (camera_service, open_gate) = gated_camera(false);
+        let mut harness = voice_harness(&server, ["what is this".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+
+        // Release immediately: the camera is still capturing. The recording
+        // finishes normally and the transcript is accepted, but nothing is
+        // sent until the photo is ready.
+        assert_eq!(harness.release_hold(recording_id).await, "what is this");
+        assert!(
+            harness.runtime.draft.is_some(),
+            "the draft waits for its photo"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        open_gate.send(()).unwrap();
+        let photo_finished = harness.next_aux_event().await;
+        assert!(matches!(
+            &photo_finished,
+            super::VoiceAuxEvent::PhotoCaptureFinished { result: Ok(_), .. }
+        ));
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        harness.accept_next_answer().await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request with transcript and photo"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let last = body["messages"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["content"], "what is this");
+        assert_eq!(last["images"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn release_during_a_photo_that_then_fails_sends_nothing() {
+        let server = MockServer::start().await;
+        let (camera_service, open_gate) = gated_camera(true);
+        let mut harness = voice_harness(&server, ["what is this".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        assert_eq!(harness.release_hold(recording_id).await, "what is this");
+
+        open_gate.send(()).unwrap();
+        let photo_finished = harness.next_aux_event().await;
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        assert!(harness.runtime.draft.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.main_events.recv())
+                .await
+                .is_err(),
+            "a failed photo must not become a text-only request"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn escape_while_waiting_for_a_photo_sends_nothing() {
+        let server = MockServer::start().await;
+        let (camera_service, open_gate) = gated_camera(false);
+        let mut harness = voice_harness(&server, ["what is this".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        assert_eq!(harness.release_hold(recording_id).await, "what is this");
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Escape))
+                .await
+        );
+        assert!(harness.runtime.draft.is_none());
+
+        // A late photo belongs to a cancelled draft. Whether or not its
+        // worker still reports, it must stay inert.
+        open_gate.send(()).unwrap();
+        if let Ok(Some(photo_finished)) =
+            tokio::time::timeout(Duration::from_millis(200), harness.aux_events.recv()).await
+        {
+            assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        }
+        assert!(harness.runtime.draft.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.main_events.recv())
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn too_short_recording_drops_the_draft_without_transcribing_or_asking() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: false,
+            captures: captures.clone(),
+        }));
+        let mut harness = voice_harness(&server, ["unused".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
+                .await
+        );
+        // The synthetic recorder always reports finished audio; real CPAL
+        // capture reports a too-short recording instead. Discard the former
+        // and deliver the latter.
+        assert!(matches!(
+            harness.next_dictation_event().await,
+            DictationEvent::RecordingFinished { .. }
+        ));
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::RecordingTooShort { recording_id })
+                .await
+        );
+        assert!(harness.runtime.draft.is_none());
+        assert!(harness.runtime.dictation.is_ready());
+        assert_eq!(harness.transcriber.calls.load(Ordering::SeqCst), 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        // The next press starts a fresh, normal recording.
+        let next = harness.start_hold().await;
+        assert_ne!(next, recording_id);
     }
 
     #[tokio::test]

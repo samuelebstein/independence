@@ -11,7 +11,6 @@ use thiserror::Error;
 
 use crate::{
     launch::{HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline},
-    security::OperatingMode,
     speak::tts::{DEFAULT_HAL_MODEL, DEFAULT_PIPER_COMMAND, PiperConfig},
     think::{OllamaConfig, ThinkError},
 };
@@ -85,7 +84,9 @@ pub(crate) struct ResolvedVoiceProfile {
     pub camera_backend: CameraBackendSelection,
     pub pipeline: VoicePipeline,
     pub backend: ModelBackend,
-    pub operating_mode: OperatingMode,
+    /// Whether Whisper re-transcribes the recording while Talk/ENTER is still
+    /// held, for live display. The final transcript is always produced.
+    pub live_partial_transcription: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -134,6 +135,7 @@ struct ProfileDefaults {
     model: &'static str,
     backend: ModelBackend,
     camera_backend: CameraBackendSelection,
+    live_partial_transcription: bool,
 }
 
 fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
@@ -143,18 +145,24 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
             model: PI_TEXT_MODEL,
             backend: ModelBackend::Ollama,
             camera_backend: CameraBackendSelection::RpiCamStill,
+            live_partial_transcription: true,
         },
         Some(HardwareProfile::RaspberryPiHailo) => ProfileDefaults {
             input: VoiceInputMode::Buttons,
             model: HAILO_VLM_MODEL,
             backend: ModelBackend::HailoVlm,
             camera_backend: CameraBackendSelection::RpiCamStill,
+            // Re-running Whisper on the growing recording while ENTER is held
+            // saturates the Pi's CPU alongside the camera, and was linked to
+            // lost recordings. Only the final transcript is produced here.
+            live_partial_transcription: false,
         },
         None => ProfileDefaults {
             input: VoiceInputMode::Terminal,
             model: LAPTOP_MODEL,
             backend: ModelBackend::Ollama,
             camera_backend: CameraBackendSelection::V4l,
+            live_partial_transcription: true,
         },
     }
 }
@@ -266,7 +274,7 @@ fn resolve_with_environment(
         camera_backend,
         pipeline,
         backend,
-        operating_mode: options.mode.unwrap_or(OperatingMode::Ephemeral),
+        live_partial_transcription: defaults.live_partial_transcription,
     })
 }
 
@@ -290,14 +298,12 @@ pub enum ProfileError {
 
 #[cfg(test)]
 mod tests {
-    use crate::launch::{
-        HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline,
-    };
-    use crate::security::OperatingMode;
-
     use super::{
         CameraBackendSelection, EnvironmentOverrides, ResolvedVoiceInput, defaults_for,
         resolve_with_environment,
+    };
+    use crate::launch::{
+        HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline,
     };
 
     #[test]
@@ -335,6 +341,20 @@ mod tests {
                     .unwrap()
             )
         );
+        assert!(
+            !resolved.live_partial_transcription,
+            "the Hailo Pi profile produces only the final transcript"
+        );
+    }
+
+    #[test]
+    fn laptop_voice_keeps_live_partial_transcription() {
+        let resolved = resolve_with_environment(
+            &VoiceLaunchOptions::default(),
+            EnvironmentOverrides::default(),
+        )
+        .unwrap();
+        assert!(resolved.live_partial_transcription);
     }
 
     #[test]
@@ -393,7 +413,6 @@ mod tests {
         assert_eq!(resolved.audio_output.as_deref(), Some("alsa:usb-speaker"));
         assert_eq!(resolved.microphone.as_deref(), Some("alsa:usb-microphone"));
         assert!(matches!(resolved.input, ResolvedVoiceInput::Buttons(_)));
-        assert_eq!(resolved.operating_mode, OperatingMode::Ephemeral);
     }
 
     #[test]

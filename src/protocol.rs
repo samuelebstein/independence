@@ -177,6 +177,11 @@ pub enum DictationEvent {
     RecordingCancelled {
         recording_id: RecordingId,
     },
+    /// The recording ended almost immediately (a tap, or a sticky button).
+    /// The microphone is already released; no audio is kept or transcribed.
+    RecordingTooShort {
+        recording_id: RecordingId,
+    },
     RecordingFailed {
         recording_id: RecordingId,
         message: String,
@@ -230,10 +235,14 @@ pub enum DictationEffect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DictationOutput {
     Ready,
-    Recording { elapsed: Duration },
+    Recording {
+        elapsed: Duration,
+    },
     Discarding,
     Transcribing,
     Transcript(String),
+    /// A press was too short to contain a question; ask for a longer hold.
+    TooShort,
     Diagnostic(String),
 }
 

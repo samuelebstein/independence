@@ -71,3 +71,29 @@ jq -c 'select(.record_type == "interaction_summary") |
 
 Telemetry and diagnostic files are development artifacts. They are not
 encrypted, rotated, or an archive of conversations.
+
+## Voice capture outcomes
+
+Each voice recording reports how it ended through the
+`microphone.capture.lifecycle` and `microphone.recording` telemetry events.
+The outcome is one of `completed`, `cancelled`, `too_short`, or `failed`. A
+failure always carries a stable `failure_class`, never audio or transcript
+text:
+
+| `failure_class` | Meaning |
+| --- | --- |
+| `device_unavailable` | The microphone could not be found, configured, opened, or started |
+| `stream_error` | The platform audio stream reported an error while recording |
+| `dropped_frames` | The capture thread fell more than two seconds behind the audio callback; `dropped_frames` gives the count |
+| `buffer_overflow` | The recording exceeded the bounded in-memory limit |
+| `invalid_audio` | The audio was empty, silent, or contained invalid samples |
+| `lock_poisoned` | A shared error slot was poisoned by a panicking thread |
+
+`too_short` (with `recorded_ms`) means the press held less than 300 ms of
+audio. It is guidance for the person, not a device failure, and Whisper is not
+run.
+
+"Listening..." and "Thinking..." are terminal status lines and are never
+spoken. A failed live partial transcription (laptop only) is recorded as the
+diagnostic event `partial_transcription_failed` and is not shown in the
+terminal, because it does not affect the final transcript.

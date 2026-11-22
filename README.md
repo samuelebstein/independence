@@ -31,10 +31,17 @@ discarded when the process ends.
 
 ## Teach Sam About the Latest Milestone
 
-The Hailo path now uses Qwen3-VL-2B-Instruct as a single-photo local backend.
-Independence replaces the previous accepted photo when a new one is captured,
-never sends a failed capture as a text-only vision request, and reports the
-bridge's bounded health and inference reason locally.
+Milestone 7 makes the Pi voice loop reliable and starts it immediately.
+Ephemeral Mode begins at launch (no five-second hold, no `--mode` option), and
+pressing ENTER opens the microphone at once: "Listening..." and "Thinking..."
+are screen status only, never spoken. The microphone callback now hands audio
+to the recording thread through a lock-free ring buffer, and the Hailo Pi
+profile no longer re-transcribes while you hold ENTER, so releasing during a
+photo capture no longer loses the recording; the turn waits for the photo and
+sends both. Presses under 300 ms say "Recording too short", and each status
+line appears once, in order, with "Ready" after the answer. See
+[the milestone](docs/milestones/MILESTONE_7_PI_VOICE_RELIABILITY.md) and
+[the learning notes](LEARNING.md#latest-milestone-pi-voice-reliability-and-immediate-start-milestone-7).
 
 ## Try it locally
 

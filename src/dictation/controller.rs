@@ -69,6 +69,9 @@ impl DictationController {
             DictationEvent::RecordingCancelled { recording_id } => {
                 self.recording_cancelled(recording_id)
             }
+            DictationEvent::RecordingTooShort { recording_id } => {
+                self.recording_too_short(recording_id)
+            }
             DictationEvent::RecordingFailed {
                 recording_id,
                 message,
@@ -269,6 +272,34 @@ impl DictationController {
         }
     }
 
+    fn recording_too_short(&mut self, recording_id: RecordingId) -> Vec<DictationEffect> {
+        match self.phase {
+            Phase::Starting {
+                recording_id: active,
+            }
+            | Phase::Recording {
+                recording_id: active,
+            }
+            | Phase::Finishing {
+                recording_id: active,
+            } if active == recording_id => {
+                self.phase = Phase::Ready;
+                let mut effects = vec![DictationEffect::Display(DictationOutput::TooShort)];
+                effects.extend(ready_effects());
+                effects
+            }
+            // Escape already asked to discard this recording; there is
+            // nothing more to tell the person.
+            Phase::CancellingCapture {
+                recording_id: active,
+            } if active == recording_id => {
+                self.phase = Phase::Ready;
+                ready_effects()
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn recording_failed(
         &mut self,
         recording_id: RecordingId,
@@ -421,6 +452,54 @@ mod tests {
 
     fn audio() -> CapturedAudio {
         CapturedAudio::new(vec![0.1; 160])
+    }
+
+    #[test]
+    fn too_short_recording_returns_to_ready_with_guidance_and_no_transcription() {
+        let mut controller = DictationController::new();
+        let id = start(&mut controller);
+        controller.handle(DictationEvent::RecordingStarted { recording_id: id });
+        controller.handle(DictationEvent::Input(DictationInput::Enter));
+
+        let effects = controller.handle(DictationEvent::RecordingTooShort { recording_id: id });
+        assert!(matches!(
+            effects.first(),
+            Some(DictationEffect::Display(DictationOutput::TooShort))
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, DictationEffect::StartTranscription { .. })),
+            "a tap is never transcribed"
+        );
+        assert!(matches!(controller.phase, Phase::Ready));
+
+        // A stale too-short report for an old recording changes nothing.
+        let next = start(&mut controller);
+        assert!(
+            controller
+                .handle(DictationEvent::RecordingTooShort { recording_id: id })
+                .is_empty()
+        );
+        assert!(
+            matches!(controller.phase, Phase::Starting { recording_id } if recording_id == next)
+        );
+    }
+
+    #[test]
+    fn too_short_after_escape_is_silent() {
+        let mut controller = DictationController::new();
+        let id = start(&mut controller);
+        controller.handle(DictationEvent::RecordingStarted { recording_id: id });
+        controller.handle(DictationEvent::Input(DictationInput::Escape));
+        let effects = controller.handle(DictationEvent::RecordingTooShort { recording_id: id });
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                DictationEffect::Display(DictationOutput::TooShort)
+            ))
+        );
+        assert!(matches!(controller.phase, Phase::Ready));
     }
 
     #[test]

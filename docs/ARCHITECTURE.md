@@ -12,21 +12,24 @@ the future encryption/authentication design in
 
 | Invocation | Entry function | Current purpose | Does not do |
 | --- | --- | --- | --- |
-| `cargo run` | `app::run_with_mode` | Typed **Ephemeral Mode** question, `/camera`, and temporary follow-ups | Open microphone or speaker; load local files with `/look`; access private storage |
+| `cargo run` | `app::run` | Typed **Ephemeral Mode** question, `/camera`, and temporary follow-ups | Open microphone or speaker; load local files with `/look`; access private storage |
 | `cargo run -- --dictate [--audio-input <exact device id>]` | `app::run_dictation` / `dictation::run` | One local ephemeral recording → Whisper transcript → terminal display | Call Ollama, run a spoken command, or open camera |
 | `cargo run -- --voice` | `app::run_voice_with_options` | Hold-to-talk → local Whisper → main controller → local Ollama; optional Piper/Rodio speech | Automatic listening, command parsing from speech, or echo cancellation |
 | `--voice --pipeline audio-to-audio` | `audio_to_audio::run` | Isolated recording-to-WAV plumbing experiment | Whisper, Piper, camera, text history, or a real audio model |
 | list/test commands | `app::list_*`, `app::run_speech_test` | Inspect devices or test local speech output | Start a normal interaction |
 
-The command parser accepts `--mode ephemeral|private`, `--profile
-raspberry-pi|raspberry-pi-hailo`, `--input terminal|buttons`, selected
+The command parser accepts `--profile raspberry-pi|raspberry-pi-hailo`, `--input terminal|buttons`, selected
 input/output device IDs, model/backend/pipeline choices, and an explicit
 button device. `src/profile.rs` resolves explicit command-line values over
 environment values and profile defaults. A Raspberry Pi profile is a
 configuration choice, not a separate application.
 
-`Ephemeral` is the default. `Private` is deliberately rejected before model or
-hardware setup because Milestone 6.1 has no authentication implementation.
+Ephemeral Mode is the only mode offered, and it begins as soon as the program
+starts, in every input mode: there is no `--mode` option and no physical entry
+gesture (Milestone 7). `--mode` is rejected with an explanation. Private Mode is
+not offered until Ephemeral Mode is mature and an authenticator exists; the
+`SecurityManager` lifecycle states for it remain in the code, unused by the
+command line.
 
 ## Core ownership model
 
@@ -87,9 +90,19 @@ cancel events. In button mode the selected evdev device is exclusively grabbed
 and terminal input is not started.
 
 `src/dictation/audio.rs` opens a CPAL stream only for an explicit recording.
-Its callback performs sample-format conversion, mono downmixing, and bounded
-in-memory buffering; it does not run recognition or controller logic. After
-capture, Rubato prepares Whisper's 16 kHz mono input. `src/dictation/transcribe.rs`
+Its real-time callback performs only sample-format conversion, mono
+downmixing, and a wait-free push into a lock-free single-producer/
+single-consumer ring buffer (`rtrb`, two seconds of audio). The capture thread
+drains that ring every 100 ms into the recording it alone owns, so copying the
+recording (for example, for a live partial) can never make the callback lose
+audio. If the capture thread ever falls more than two seconds behind, the lost
+frames are counted and the recording fails as `dropped_frames` rather than
+silently missing words. A recording shorter than 300 ms is reported as too
+short (a tap or sticky button): it is not transcribed, and the person is asked
+to hold ENTER while speaking. Capture failures carry a fixed failure class
+(`device_unavailable`, `stream_error`, `dropped_frames`, `buffer_overflow`,
+`invalid_audio`, `lock_poisoned`) in diagnostics. After capture, Rubato
+prepares Whisper's 16 kHz mono input. `src/dictation/transcribe.rs`
 uses `whisper-rs`/whisper.cpp with cooperative cancellation. The
 `DictationController` accepts a `TranscriptReady` event only for the current
 `RecordingId`.
@@ -97,9 +110,18 @@ uses `whisper-rs`/whisper.cpp with cooperative cancellation. The
 In `--dictate`, accepted text ends at terminal display. In `--voice`,
 `VoiceRuntime` receives the already accepted transcript and constructs literal
 question text for the main controller. A spoken string such as `/camera` or
-`/quit` is never given terminal-command authority. Voice mode has optional
-display-only partial recognition while a button is held; the final accepted
+`/quit` is never given terminal-command authority. On the laptop, voice mode
+runs display-only partial recognition while a button is held; the
+`raspberry-pi-hailo` profile turns this off so the Pi's CPU is not saturated
+while recording and the camera is running. In both, the final accepted
 transcript is the submitted text.
+
+Pressing Talk/ENTER opens the microphone immediately. "Listening..." and
+"Thinking..." are terminal status lines and diagnostic events only; nothing is
+synthesized or played for them. Releasing Talk/ENTER while a requested photo
+is still being captured finishes the recording normally; the turn waits for the
+photo and then sends the transcript and photo together. If that capture fails,
+no text-only request is sent.
 
 ## See: photo files and explicit camera capture
 
@@ -170,8 +192,9 @@ target and does not receive text, prompts, responses, transcripts, tool data,
 memory contents, or media. See [logging.md](logging.md).
 
 In voice mode, `src/speak/worker.rs` owns one bounded, ordered synthesis and
-playback queue. It tags work with a generation and `TurnId`/draft owner so stale
-audio cannot play after cancellation. `src/speak/tts.rs` invokes a configured
+playback queue. It speaks only accepted answers and fixed error notices, never
+status changes. It tags work with a generation and `TurnId` (or system) owner
+so stale audio cannot play after cancellation. `src/speak/tts.rs` invokes a configured
 local Piper CLI without a shell, passes text by stdin, and receives a WAV in
 memory. `src/speak/playback.rs` uses Rodio/CPAL to play that WAV through the
 explicitly selected or system-default output device. There is no echo
@@ -208,7 +231,8 @@ locked or encrypted. See [security/THREAT_MODEL.md](security/THREAT_MODEL.md).
 
 | Concern | Laptop/Linux default | Raspberry Pi profile | Raspberry Pi Hailo profile |
 | --- | --- | --- | --- |
-| Interaction input | Crossterm raw-key terminal controls | Explicit selected Linux evdev keyboard used as buttons; no stdin reader; five-second Talk hold gates Ephemeral Mode entry | Same physical-button adapter and entry gate |
+| Interaction input | Crossterm raw-key terminal controls | Explicit selected Linux evdev keyboard used as buttons; no stdin reader; Ephemeral Mode starts at launch | Same physical-button adapter |
+| Live partial transcription | On while Talk is held | On | Off; final transcript only |
 | Microphone/output | CPAL/Rodio selected device or system default | Same libraries and device selectors; usually explicit USB device IDs | Same libraries and selectors |
 | Camera | V4L2 one-shot still capture | `rpicam-still` one-shot JPEG adapter | Same `rpicam-still` adapter; bridge allows up to four current images in capture order |
 | Default model runtime | local Ollama at `11434` | `gemma3:1b` for text-only experiments | Hailo VLM bridge at `127.0.0.1:11435`, alias `qwen2-vl:2b` |

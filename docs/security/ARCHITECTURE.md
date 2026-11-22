@@ -249,13 +249,14 @@ PIN input, recovery input, or model/device authority.
 | Lifecycle states | `Uninitialized`, `SetupInProgress`, `Locked`, `Unlocked`, `RecoveryRequired`, with tested transition checks | Persisting state or obtaining state from an enrolled device |
 | Default launch | Starts a process-local `Uninitialized` manager, then obtains an opaque Ephemeral Mode lease | Any automatic setup or unlock |
 | Ephemeral Mode | Allowed from `Uninitialized`, `Locked`, and `RecoveryRequired`; does not change lifecycle state | A durable profile, preferences, or personal-memory load |
-| Private Mode | Named explicitly and denied unless lifecycle is `Unlocked` | Any production way to become `Unlocked` |
+| Private Mode | Not offered as a launch option (Milestone 7); the policy type still denies it unless lifecycle is `Unlocked` | Any production way to request or become `Unlocked` |
 | Storage authority | An opaque future `PrivateStorageAccess` type exists behind the manager | A storage adapter, DEK, envelope, or actual data access |
 | Cleanup | Runtime cancels/joins work, then clears controller-owned temporary history/photos on orderly exit | Secure erasure outside normal Rust/application ownership |
 
-The deliberate current rule is: a CLI flag cannot authenticate someone.
-`--mode private` fails before model, microphone, camera, terminal-input, or
-Piper startup. Test-only lifecycle transitions use private marker types that
+The deliberate current rule is: a CLI flag cannot authenticate someone. Since
+Milestone 7 there is no `--mode` option at all; `--mode` is rejected by the
+argument parser before model, microphone, camera, terminal-input, or Piper
+startup, with a message that Independence always runs in Ephemeral Mode. Test-only lifecycle transitions use private marker types that
 are not compiled into production authorization paths; they test policy, not a
 fake PIN.
 
@@ -283,12 +284,23 @@ of cryptographic or secure-memory clearing.
 
 #### Physical entry policy
 
-In Raspberry Pi `--voice --input buttons` mode, the selected exclusive evdev
-Talk/Enter button must be held for five seconds then released before the
-Ephemeral lease is obtained. The gate uses no microphone/camera/model/Piper
-work and consumes that first release; a fresh press begins normal recording.
-Terminal mode has no physical device to gate and enters default Ephemeral Mode
-directly. This is a usability/intent gesture, not authentication.
+Since Milestone 7 there is no physical entry gesture. Starting the program is
+the explicit action: the Ephemeral lease is obtained at launch in every input
+mode, and the first Talk/ENTER press starts a normal recording. The previous
+five-second hold (Milestone 6.1) was a usability/intent gesture, not
+authentication, and gated no private data, so removing it removes no
+protection. What remains unchanged: the microphone opens only while Talk/ENTER
+is held, and the camera only on `P` during a hold.
+
+Residual risks the owner accepted with this change:
+
+- A stray Talk/ENTER press records immediately instead of after an entry
+  ceremony. Recording still stops on release, and presses under 300 ms are
+  discarded without transcription.
+- Spoken "listening"/"thinking" cues were removed to start capture at once. On
+  a Pi without a screen, the held button is now the only indication that the
+  microphone is open. A hardware LED or a short tone could restore an indicator
+  without Piper in a later milestone.
 
 ### Proposed state machine
 

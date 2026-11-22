@@ -823,6 +823,22 @@ impl AudioToAudioRuntime {
                 }
                 self.start_capture_if_pending();
             }
+            DictationEvent::RecordingTooShort { recording_id } => {
+                self.retire_capture(recording_id).await;
+                if self.finish_cancelled_capture(recording_id, "too_short") {
+                    self.start_capture_if_pending();
+                    return true;
+                }
+                if self
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.recording_id == recording_id)
+                {
+                    self.draft.take();
+                    speak::voice_log(speak::TOO_SHORT_VOICE_LOG);
+                }
+                self.start_capture_if_pending();
+            }
             DictationEvent::RecordingFailed {
                 recording_id,
                 message,

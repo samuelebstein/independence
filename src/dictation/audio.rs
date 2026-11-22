@@ -1,8 +1,8 @@
 //! Microphone acquisition and audio preparation for local dictation.
 //!
 //! CPAL owns the platform input stream. The callback does only format
-//! conversion, mono downmixing, and bounded buffering; it never transcribes or
-//! touches application state. Once capture ends, the stream is dropped before
+//! conversion, mono downmixing, and a wait-free push into a lock-free ring
+//! buffer; it never blocks, transcribes, or touches application state. Once capture ends, the stream is dropped before
 //! a selected consumer converts the retained in-memory samples. Whisper asks
 //! for 16 kHz; a direct audio backend receives the actual capture rate.
 
@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     time::{Duration, Instant},
@@ -37,6 +37,13 @@ const MAX_WHISPER_SAMPLES: usize = WHISPER_SAMPLE_RATE as usize * 30;
 const STREAM_START_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MINIMUM_AUDIBLE_PEAK: f32 = 0.001;
+/// How far (in seconds of audio) the real-time callback may run ahead of the
+/// capture thread before frames are lost. The capture thread drains every
+/// `CONTROL_POLL_INTERVAL`, so this leaves a large margin for a busy CPU.
+const CAPTURE_RING_SECONDS: usize = 2;
+/// Recordings shorter than this are treated as a tap (or a sticky button), not
+/// a question: Whisper is not run and the person is asked to hold longer.
+pub(crate) const MIN_RECORDING_DURATION: Duration = Duration::from_millis(300);
 
 /// A non-sensitive description of the configured input before a stream opens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,21 +221,26 @@ impl CpalRecorder {
         let started = Instant::now();
         let outcome = self.capture(recording_id, &event_sender, &commands, interaction.as_ref());
         if let Some(interaction) = &interaction {
+            let mut fields = telemetry::fields([(
+                "capture_lifecycle_duration_ms",
+                serde_json::json!(duration_ms(started.elapsed())),
+            )]);
             let outcome_label = match &outcome {
                 Ok(CaptureOutcome::Audio(_)) => "completed",
                 Ok(CaptureOutcome::Cancelled) => "cancelled",
-                Err(_) => "device_failure",
+                Ok(CaptureOutcome::TooShort { recorded }) => {
+                    fields.insert(
+                        "recorded_ms".into(),
+                        serde_json::json!(duration_ms(*recorded)),
+                    );
+                    "too_short"
+                }
+                Err(failure) => {
+                    failure.add_fields(&mut fields);
+                    "failed"
+                }
             };
-            interaction.event(
-                "microphone.capture.lifecycle",
-                outcome_label,
-                telemetry::fields([(
-                    "capture_lifecycle_duration_ms",
-                    serde_json::json!(
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                    ),
-                )]),
-            );
+            interaction.event("microphone.capture.lifecycle", outcome_label, fields);
         }
         let event = match outcome {
             Ok(CaptureOutcome::Audio(audio)) => DictationEvent::RecordingFinished {
@@ -236,9 +248,12 @@ impl CpalRecorder {
                 audio,
             },
             Ok(CaptureOutcome::Cancelled) => DictationEvent::RecordingCancelled { recording_id },
-            Err(message) => DictationEvent::RecordingFailed {
+            Ok(CaptureOutcome::TooShort { .. }) => {
+                DictationEvent::RecordingTooShort { recording_id }
+            }
+            Err(failure) => DictationEvent::RecordingFailed {
                 recording_id,
-                message,
+                message: failure.message,
             },
         };
         let _ = event_sender.blocking_send(event);
@@ -250,23 +265,26 @@ impl CpalRecorder {
         event_sender: &EventSender<DictationEvent>,
         commands: &Receiver<CaptureCommand>,
         interaction: Option<&Interaction>,
-    ) -> Result<CaptureOutcome, String> {
+    ) -> Result<CaptureOutcome, CaptureFailure> {
         if command_requests_cancel(commands) {
             return Ok(CaptureOutcome::Cancelled);
         }
 
-        let device = self.select_device()?;
-        let supported_config = device
-            .default_input_config()
-            .map_err(|error| format!("could not query microphone format: {error}"))?;
+        let device = self.select_device().map_err(CaptureFailure::device)?;
+        let supported_config = device.default_input_config().map_err(|error| {
+            CaptureFailure::device(format!("could not query microphone format: {error}"))
+        })?;
         let channels = usize::from(supported_config.channels());
         let sample_rate = supported_config.sample_rate();
         if channels == 0 || sample_rate == 0 {
-            return Err("microphone reported an unusable zero-channel or zero-rate format".into());
+            return Err(CaptureFailure::device(
+                "microphone reported an unusable zero-channel or zero-rate format",
+            ));
         }
 
-        let sample_limit = bounded_raw_sample_limit(sample_rate)?;
-        let captured = Arc::new(CaptureBuffer::new(sample_limit)?);
+        let sample_limit = bounded_raw_sample_limit(sample_rate).map_err(CaptureFailure::device)?;
+        let (producer, mut recording) =
+            capture_channel(sample_rate, sample_limit).map_err(CaptureFailure::device)?;
         let stream_error = Arc::new(Mutex::new(None));
         let sample_format = supported_config.sample_format();
         let stream_config = supported_config.into();
@@ -280,18 +298,19 @@ impl CpalRecorder {
             &stream_config,
             sample_format,
             channels,
-            captured.clone(),
+            producer,
             stream_error.clone(),
-        )?;
+        )
+        .map_err(CaptureFailure::device)?;
 
         if command_requests_cancel(commands) {
             drop(stream);
             return Ok(CaptureOutcome::Cancelled);
         }
 
-        stream
-            .play()
-            .map_err(|error| format!("could not start microphone capture: {error}"))?;
+        stream.play().map_err(|error| {
+            CaptureFailure::device(format!("could not start microphone capture: {error}"))
+        })?;
         if let Some(interaction) = interaction {
             interaction.mark("microphone.recording_started");
             interaction.event(
@@ -321,8 +340,7 @@ impl CpalRecorder {
             event_sender,
             commands,
             &stream_error,
-            captured.as_ref(),
-            sample_rate,
+            &mut recording,
             started,
         );
 
@@ -333,30 +351,34 @@ impl CpalRecorder {
         let recording_duration = started.elapsed();
         if let Some(interaction) = interaction {
             interaction.mark("microphone.released");
+            let mut fields = telemetry::fields([(
+                "recording_duration_ms",
+                serde_json::json!(duration_ms(recording_duration)),
+            )]);
             let outcome = match &finish_reason {
                 Ok(FinishReason::Finished) => "completed",
                 Ok(FinishReason::Cancelled) => "cancelled",
-                Err(_) => "device_failure",
+                Err(failure) => {
+                    failure.add_fields(&mut fields);
+                    "failed"
+                }
             };
-            interaction.event(
-                "microphone.recording",
-                outcome,
-                telemetry::fields([(
-                    "recording_duration_ms",
-                    serde_json::json!(
-                        u64::try_from(recording_duration.as_millis()).unwrap_or(u64::MAX)
-                    ),
-                )]),
-            );
+            interaction.event("microphone.recording", outcome, fields);
         }
 
-        let finish_reason = finish_reason?;
-
-        if finish_reason == FinishReason::Cancelled {
+        if finish_reason? == FinishReason::Cancelled {
             return Ok(CaptureOutcome::Cancelled);
         }
 
-        let samples = captured.take()?;
+        // The callback has stopped; collect anything it wrote after the last
+        // poll before judging the recording.
+        let samples = match recording.finish() {
+            RecordingResult::Samples(samples) => samples,
+            RecordingResult::TooShort { recorded } => {
+                return Ok(CaptureOutcome::TooShort { recorded });
+            }
+            RecordingResult::Failed(failure) => return Err(failure),
+        };
         let input_samples = samples.len();
         let preparation = interaction.map(|interaction| {
             interaction.stage(
@@ -371,9 +393,18 @@ impl CpalRecorder {
             Ok(audio) => audio,
             Err(error) => {
                 if let Some(stage) = preparation {
-                    stage.finish("failed", telemetry::Fields::new());
+                    stage.finish(
+                        "failed",
+                        telemetry::fields([(
+                            "failure_class",
+                            serde_json::json!(CaptureFailureClass::InvalidAudio.label()),
+                        )]),
+                    );
                 }
-                return Err(error);
+                return Err(CaptureFailure::new(
+                    CaptureFailureClass::InvalidAudio,
+                    error,
+                ));
             }
         };
         if let Some(stage) = preparation {
@@ -461,6 +492,83 @@ enum FinishReason {
 enum CaptureOutcome {
     Audio(CapturedAudio),
     Cancelled,
+    /// The person released almost immediately (a tap, or a sticky button).
+    /// This is not a device or recognition failure, and Whisper is not run.
+    TooShort {
+        recorded: Duration,
+    },
+}
+
+/// Why a microphone capture failed, as a small fixed vocabulary for
+/// diagnostics. It never carries audio, text, or device serial numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureFailureClass {
+    /// The device could not be found, configured, opened, or started.
+    DeviceUnavailable,
+    /// The platform audio stream reported an error while recording.
+    StreamError,
+    /// The capture thread fell more than the ring-buffer length behind the
+    /// real-time callback, so some audio was lost.
+    DroppedFrames,
+    /// The recording exceeded the bounded in-memory limit.
+    BufferOverflow,
+    /// The audio was silent, empty, or contained invalid samples.
+    InvalidAudio,
+    /// A shared error slot was poisoned by a panicking thread.
+    LockPoisoned,
+}
+
+impl CaptureFailureClass {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DeviceUnavailable => "device_unavailable",
+            Self::StreamError => "stream_error",
+            Self::DroppedFrames => "dropped_frames",
+            Self::BufferOverflow => "buffer_overflow",
+            Self::InvalidAudio => "invalid_audio",
+            Self::LockPoisoned => "lock_poisoned",
+        }
+    }
+}
+
+/// A classified capture failure. `message` is the existing bounded
+/// explanation; only `class` and `dropped_frames` reach telemetry.
+#[derive(Debug)]
+struct CaptureFailure {
+    class: CaptureFailureClass,
+    message: String,
+    dropped_frames: usize,
+}
+
+impl CaptureFailure {
+    fn new(class: CaptureFailureClass, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+            dropped_frames: 0,
+        }
+    }
+
+    fn device(message: impl Into<String>) -> Self {
+        Self::new(CaptureFailureClass::DeviceUnavailable, message)
+    }
+
+    fn add_fields(&self, fields: &mut telemetry::Fields) {
+        fields.insert(
+            "failure_class".into(),
+            serde_json::json!(self.class.label()),
+        );
+        if self.dropped_frames != 0 {
+            fields.insert(
+                "dropped_frames".into(),
+                serde_json::json!(self.dropped_frames),
+            );
+        }
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn wait_for_finish(
@@ -468,18 +576,29 @@ fn wait_for_finish(
     event_sender: &EventSender<DictationEvent>,
     commands: &Receiver<CaptureCommand>,
     stream_error: &Mutex<Option<String>>,
-    captured: &CaptureBuffer,
-    sample_rate: u32,
+    recording: &mut CaptureRecording,
     started: Instant,
-) -> Result<FinishReason, String> {
+) -> Result<FinishReason, CaptureFailure> {
     let mut last_reported_second = 0;
     loop {
+        // Move whatever the real-time callback produced into the recording
+        // owned by this thread. This never blocks the callback.
+        recording.drain();
+
         if let Some(error) = stream_error
             .lock()
-            .map_err(|_| "microphone error state lock was poisoned".to_owned())?
+            .map_err(|_| {
+                CaptureFailure::new(
+                    CaptureFailureClass::LockPoisoned,
+                    "microphone error state lock was poisoned",
+                )
+            })?
             .take()
         {
-            return Err(format!("microphone stream failed: {error}"));
+            return Err(CaptureFailure::new(
+                CaptureFailureClass::StreamError,
+                format!("microphone stream failed: {error}"),
+            ));
         }
 
         let elapsed = started.elapsed();
@@ -504,7 +623,10 @@ fn wait_for_finish(
                 // capture validation authoritative and keep recording. Send
                 // an acknowledgement either way so voice mode can retry once
                 // speech begins instead of treating this request as pending.
-                let event = match captured
+                // This thread copies its own buffer, so a snapshot can never
+                // make the real-time callback lose audio.
+                let sample_rate = recording.sample_rate;
+                let event = match recording
                     .snapshot()
                     .and_then(|samples| prepare_for_whisper(samples, sample_rate))
                 {
@@ -539,80 +661,165 @@ fn command_requests_cancel(commands: &Receiver<CaptureCommand>) -> bool {
     }
 }
 
-struct CaptureBuffer {
-    samples: Mutex<Vec<f32>>,
+/// Creates the two halves of one recording's audio path.
+///
+/// The CPAL callback receives the `CaptureProducer` and only ever pushes mono
+/// samples into a lock-free single-producer/single-consumer ring buffer
+/// (`rtrb`). The capture thread keeps the `CaptureRecording`, regularly drains
+/// the ring into the recording it alone owns, and is the only code that copies
+/// or inspects that recording. No lock is shared with the real-time callback,
+/// so reading the recording can never make the callback drop audio.
+fn capture_channel(
+    sample_rate: u32,
     sample_limit: usize,
-    overflowed: AtomicBool,
-    dropped_frames: AtomicUsize,
+) -> Result<(CaptureProducer, CaptureRecording), String> {
+    let ring_capacity = usize::try_from(sample_rate)
+        .map_err(|_| "microphone sample rate does not fit this platform".to_owned())?
+        .checked_mul(CAPTURE_RING_SECONDS)
+        .ok_or_else(|| "microphone sample rate overflows the capture ring".to_owned())?
+        .max(1);
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(sample_limit)
+        .map_err(|error| format!("could not reserve bounded microphone buffer: {error}"))?;
+    let (producer, consumer) = rtrb::RingBuffer::new(ring_capacity);
+    let dropped_frames = Arc::new(AtomicUsize::new(0));
+    Ok((
+        CaptureProducer {
+            producer,
+            dropped_frames: dropped_frames.clone(),
+        },
+        CaptureRecording {
+            consumer,
+            samples,
+            sample_limit,
+            sample_rate,
+            overflowed: false,
+            dropped_frames,
+        },
+    ))
 }
 
-impl CaptureBuffer {
-    fn new(sample_limit: usize) -> Result<Self, String> {
-        let mut samples = Vec::new();
-        samples
-            .try_reserve_exact(sample_limit)
-            .map_err(|error| format!("could not reserve bounded microphone buffer: {error}"))?;
-        Ok(Self {
-            samples: Mutex::new(samples),
-            sample_limit,
-            overflowed: AtomicBool::new(false),
-            dropped_frames: AtomicUsize::new(0),
-        })
-    }
+/// The real-time half. Its only work is format conversion, mono downmixing,
+/// and a wait-free push. If the ring is full, the missing frames are counted
+/// (an atomic add) rather than blocking the audio thread.
+struct CaptureProducer {
+    producer: rtrb::Producer<f32>,
+    dropped_frames: Arc<AtomicUsize>,
+}
 
-    fn append<T>(&self, data: &[T], channels: usize)
+impl CaptureProducer {
+    fn push_frames<T>(&mut self, data: &[T], channels: usize)
     where
         T: Sample,
         f32: FromSample<T>,
     {
         let frames = data.len() / channels;
-        let Ok(mut samples) = self.samples.try_lock() else {
-            // Blocking the high-priority audio callback would be worse than
-            // rejecting one unreliable recording after it has stopped.
-            self.dropped_frames.fetch_add(frames, Ordering::Relaxed);
+        let writable = self.producer.slots().min(frames);
+        if writable > 0
+            && let Ok(chunk) = self.producer.write_chunk_uninit(writable)
+        {
+            chunk.fill_from_iter(data.chunks_exact(channels).take(writable).map(|frame| {
+                frame
+                    .iter()
+                    .map(|sample| f32::from_sample(*sample))
+                    .sum::<f32>()
+                    / channels as f32
+            }));
+        }
+        if writable < frames {
+            self.dropped_frames
+                .fetch_add(frames - writable, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The capture-thread half: the only owner of the growing recording.
+struct CaptureRecording {
+    consumer: rtrb::Consumer<f32>,
+    samples: Vec<f32>,
+    sample_limit: usize,
+    sample_rate: u32,
+    overflowed: bool,
+    dropped_frames: Arc<AtomicUsize>,
+}
+
+/// The authoritative end-of-recording judgement.
+enum RecordingResult {
+    Samples(Vec<f32>),
+    TooShort { recorded: Duration },
+    Failed(CaptureFailure),
+}
+
+impl CaptureRecording {
+    /// Moves every sample currently in the ring into the owned recording.
+    fn drain(&mut self) {
+        let available = self.consumer.slots();
+        if available == 0 {
+            return;
+        }
+        let Ok(chunk) = self.consumer.read_chunk(available) else {
             return;
         };
-
-        for frame in data.chunks_exact(channels) {
-            if samples.len() == self.sample_limit {
-                self.overflowed.store(true, Ordering::Relaxed);
+        let (first, second) = chunk.as_slices();
+        for sample in first.iter().chain(second) {
+            if self.samples.len() == self.sample_limit {
+                self.overflowed = true;
                 break;
             }
-            let mono = frame
-                .iter()
-                .map(|sample| f32::from_sample(*sample))
-                .sum::<f32>()
-                / channels as f32;
-            samples.push(mono);
+            self.samples.push(*sample);
         }
+        chunk.commit_all();
     }
 
-    fn take(&self) -> Result<Vec<f32>, String> {
-        if self.overflowed.load(Ordering::Relaxed) {
-            return Err("recording exceeded the bounded in-memory audio limit".into());
+    fn integrity_failure(&self) -> Option<CaptureFailure> {
+        if self.overflowed {
+            return Some(CaptureFailure::new(
+                CaptureFailureClass::BufferOverflow,
+                "recording exceeded the bounded in-memory audio limit",
+            ));
         }
-        if self.dropped_frames.load(Ordering::Relaxed) != 0 {
-            return Err("recording lost audio frames while buffering; try again".into());
+        let dropped_frames = self.dropped_frames.load(Ordering::Relaxed);
+        if dropped_frames != 0 {
+            let mut failure = CaptureFailure::new(
+                CaptureFailureClass::DroppedFrames,
+                "recording lost audio frames while buffering; try again",
+            );
+            failure.dropped_frames = dropped_frames;
+            return Some(failure);
         }
-        let mut samples = self
-            .samples
-            .lock()
-            .map_err(|_| "microphone sample buffer lock was poisoned".to_owned())?;
-        Ok(std::mem::take(&mut *samples))
+        None
     }
 
-    fn snapshot(&self) -> Result<Vec<f32>, String> {
-        if self.overflowed.load(Ordering::Relaxed) {
-            return Err("recording exceeded the bounded in-memory audio limit".into());
+    fn snapshot(&mut self) -> Result<Vec<f32>, String> {
+        self.drain();
+        if let Some(failure) = self.integrity_failure() {
+            return Err(failure.message);
         }
-        if self.dropped_frames.load(Ordering::Relaxed) != 0 {
-            return Err("recording lost audio frames while buffering; try again".into());
-        }
-        self.samples
-            .lock()
-            .map_err(|_| "microphone sample buffer lock was poisoned".to_owned())
-            .map(|samples| samples.clone())
+        Ok(self.samples.clone())
     }
+
+    /// Call only after the stream has been dropped, so no further samples can
+    /// arrive. A too-short recording is reported before integrity problems:
+    /// a tap is never worth a failure message.
+    fn finish(mut self) -> RecordingResult {
+        self.drain();
+        let recorded = recorded_duration(self.samples.len(), self.sample_rate);
+        if recorded < MIN_RECORDING_DURATION {
+            return RecordingResult::TooShort { recorded };
+        }
+        if let Some(failure) = self.integrity_failure() {
+            return RecordingResult::Failed(failure);
+        }
+        RecordingResult::Samples(std::mem::take(&mut self.samples))
+    }
+}
+
+fn recorded_duration(samples: usize, sample_rate: u32) -> Duration {
+    if sample_rate == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(samples as f64 / f64::from(sample_rate))
 }
 
 fn build_input_stream(
@@ -620,12 +827,12 @@ fn build_input_stream(
     config: &cpal::StreamConfig,
     sample_format: SampleFormat,
     channels: usize,
-    captured: Arc<CaptureBuffer>,
+    producer: CaptureProducer,
     stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String> {
     macro_rules! build {
         ($sample:ty) => {
-            build_stream_for_format::<$sample>(device, config, channels, captured, stream_error)
+            build_stream_for_format::<$sample>(device, config, channels, producer, stream_error)
         };
     }
 
@@ -654,19 +861,18 @@ fn build_stream_for_format<T>(
     device: &Device,
     config: &cpal::StreamConfig,
     channels: usize,
-    captured: Arc<CaptureBuffer>,
+    mut producer: CaptureProducer,
     stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String>
 where
     T: Sample + SizedSample,
     f32: FromSample<T>,
 {
-    let input = captured.clone();
     let error_slot = stream_error.clone();
     device
         .build_input_stream(
             *config,
-            move |data: &[T], _| input.append(data, channels),
+            move |data: &[T], _| producer.push_frames(data, channels),
             move |error| {
                 if let Ok(mut slot) = error_slot.lock() {
                     if slot.is_none() {
@@ -779,9 +985,161 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        WHISPER_SAMPLE_RATE, bounded_raw_sample_limit, downmix_interleaved, prepare_for_whisper,
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::Duration,
     };
+
+    use super::{
+        CaptureFailureClass, MIN_RECORDING_DURATION, RecordingResult, WHISPER_SAMPLE_RATE,
+        bounded_raw_sample_limit, capture_channel, downmix_interleaved, prepare_for_whisper,
+        recorded_duration,
+    };
+
+    const RATE: u32 = 16_000;
+
+    fn expect_samples(result: RecordingResult) -> Vec<f32> {
+        match result {
+            RecordingResult::Samples(samples) => samples,
+            RecordingResult::TooShort { recorded } => {
+                panic!("unexpectedly too short: {recorded:?}")
+            }
+            RecordingResult::Failed(failure) => panic!("unexpected failure: {:?}", failure.class),
+        }
+    }
+
+    #[test]
+    fn concurrent_snapshots_never_make_the_callback_drop_audio() {
+        // Reproduces the Pi failure shape: the "callback" keeps pushing while
+        // the capture thread repeatedly copies the recording for live
+        // transcription. With the old shared lock, contention dropped frames
+        // and failed the whole recording.
+        let (mut producer, mut recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+        let total_frames = RATE as usize * 3;
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_done = done.clone();
+        let callback = thread::spawn(move || {
+            let block: Vec<i16> = (0..160).map(|index| (index * 100) as i16).collect();
+            for _ in 0..(total_frames / block.len()) {
+                producer.push_frames(&block, 1);
+                thread::sleep(Duration::from_micros(200));
+            }
+            callback_done.store(true, Ordering::Release);
+        });
+        let mut snapshots = 0;
+        while !done.load(Ordering::Acquire) {
+            let snapshot = recording.snapshot().expect("snapshot must not fail");
+            assert!(snapshot.len() <= total_frames);
+            snapshots += 1;
+        }
+        callback.join().unwrap();
+        assert!(snapshots > 1);
+        let samples = expect_samples(recording.finish());
+        assert_eq!(samples.len(), total_frames, "every pushed frame is kept");
+    }
+
+    #[test]
+    fn stereo_frames_are_downmixed_before_entering_the_ring() {
+        let (mut producer, recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+        let frames = RATE as usize; // one second, well above the minimum
+        let stereo: Vec<f32> = (0..frames).flat_map(|_| [0.5_f32, -0.5]).collect();
+        producer.push_frames(&stereo, 2);
+        let samples = expect_samples(recording.finish());
+        assert_eq!(samples.len(), frames);
+        assert!(samples.iter().all(|sample| sample.abs() < 1e-6));
+    }
+
+    #[test]
+    fn a_full_ring_counts_dropped_frames_instead_of_blocking() {
+        let (mut producer, recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+        // The ring holds two seconds. Never draining it while three seconds
+        // arrive simulates a capture thread that stalled completely.
+        let block = vec![0.25_f32; RATE as usize];
+        for _ in 0..3 {
+            producer.push_frames(&block, 1);
+        }
+        match recording.finish() {
+            RecordingResult::Failed(failure) => {
+                assert_eq!(failure.class, CaptureFailureClass::DroppedFrames);
+                assert_eq!(failure.dropped_frames, RATE as usize);
+            }
+            _ => panic!("a stalled capture thread must be reported, not hidden"),
+        }
+    }
+
+    #[test]
+    fn exceeding_the_recording_limit_is_a_buffer_overflow() {
+        let limit = RATE as usize; // one second
+        let (mut producer, recording) = capture_channel(RATE, limit).unwrap();
+        producer.push_frames(&vec![0.25_f32; limit + 10], 1);
+        match recording.finish() {
+            RecordingResult::Failed(failure) => {
+                assert_eq!(failure.class, CaptureFailureClass::BufferOverflow);
+            }
+            _ => panic!("overflow must be reported"),
+        }
+    }
+
+    #[test]
+    fn recordings_under_the_minimum_are_too_short_not_failures() {
+        for millis in [0_u64, 30, 100, 299] {
+            let (mut producer, recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+            let frames = (RATE as u64 * millis / 1_000) as usize;
+            producer.push_frames(&vec![0.25_f32; frames], 1);
+            assert!(
+                matches!(recording.finish(), RecordingResult::TooShort { .. }),
+                "{millis} ms should be too short"
+            );
+        }
+
+        let (mut producer, recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+        let frames = (RATE as u128 * MIN_RECORDING_DURATION.as_millis() / 1_000) as usize;
+        producer.push_frames(&vec![0.25_f32; frames], 1);
+        assert_eq!(expect_samples(recording.finish()).len(), frames);
+    }
+
+    #[test]
+    fn a_tap_is_reported_as_too_short_even_if_frames_were_dropped() {
+        let (mut producer, recording) = capture_channel(RATE, RATE as usize * 30).unwrap();
+        producer.dropped_frames.store(5, Ordering::Relaxed);
+        producer.push_frames(&vec![0.25_f32; 100], 1);
+        assert!(matches!(
+            recording.finish(),
+            RecordingResult::TooShort { .. }
+        ));
+    }
+
+    #[test]
+    fn recorded_duration_uses_the_capture_rate() {
+        assert_eq!(recorded_duration(48_000, 48_000), Duration::from_secs(1));
+        assert_eq!(recorded_duration(4_800, 48_000), Duration::from_millis(100));
+        assert_eq!(recorded_duration(10, 0), Duration::ZERO);
+    }
+
+    #[test]
+    fn failure_classes_are_a_fixed_content_free_vocabulary() {
+        let labels = [
+            CaptureFailureClass::DeviceUnavailable,
+            CaptureFailureClass::StreamError,
+            CaptureFailureClass::DroppedFrames,
+            CaptureFailureClass::BufferOverflow,
+            CaptureFailureClass::InvalidAudio,
+            CaptureFailureClass::LockPoisoned,
+        ]
+        .map(CaptureFailureClass::label);
+        assert_eq!(
+            labels,
+            [
+                "device_unavailable",
+                "stream_error",
+                "dropped_frames",
+                "buffer_overflow",
+                "invalid_audio",
+                "lock_poisoned"
+            ]
+        );
+    }
 
     #[test]
     fn integer_stereo_samples_are_converted_and_downmixed() {

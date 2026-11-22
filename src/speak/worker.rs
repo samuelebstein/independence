@@ -5,7 +5,6 @@
 //! small text requests; it never contains audio bytes or blocks the event loop.
 
 use std::{
-    collections::HashMap,
     io,
     sync::{
         Arc,
@@ -32,15 +31,13 @@ use super::{
 };
 
 const PLAYBACK_QUEUE_CAPACITY: usize = 8;
-const LISTENING_CUE: &str = "i'm listening";
-const THINKING_CUE: &str = "i'm thinking";
 
 /// The application state that authorized an utterance. A model answer carries
-/// its existing `TurnId`; a listening cue carries the voice draft it belongs
-/// to. Either becomes obsolete when the speech generation changes.
+/// its existing `TurnId`; a fixed error notice is owned by the system. Either
+/// becomes obsolete when the speech generation changes. Status changes such as
+/// listening or thinking are never spoken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpeechOwner {
-    Draft(u64),
     Turn(TurnId),
     System,
 }
@@ -108,6 +105,13 @@ pub struct SpeechHandle {
 }
 
 impl SpeechHandle {
+    /// How many utterances have ever been requested through this handle.
+    /// Tests use it to prove that status changes never reach Piper.
+    #[cfg(test)]
+    pub(crate) fn utterances_requested(&self) -> u64 {
+        self.next_utterance_id.load(Ordering::Relaxed) - 1
+    }
+
     /// Queues exactly one authorized utterance. The bounded queue protects the
     /// controller when Piper or an audio device is slow.
     pub fn say(&self, owner: SpeechOwner, text: impl Into<String>) -> Option<UtteranceId> {
@@ -440,8 +444,6 @@ fn worker_loop_with_metrics<S, P>(
     S: Synthesizer,
     P: Playback,
 {
-    let mut fixed_phrase_cache = HashMap::<&'static str, Vec<u8>>::new();
-
     while let Ok(command) = receiver.recv() {
         match command {
             SpeechCommand::Shutdown => break,
@@ -451,7 +453,6 @@ fn worker_loop_with_metrics<S, P>(
                 &mut synthesizer,
                 &mut playback,
                 &generation,
-                &mut fixed_phrase_cache,
                 &queue_metrics,
             ),
         }
@@ -466,7 +467,6 @@ fn process_request<S, P>(
     synthesizer: &mut S,
     playback: &mut P,
     generation: &AtomicU64,
-    fixed_phrase_cache: &mut HashMap<&'static str, Vec<u8>>,
     queue_metrics: &WorkerQueueMetrics,
 ) where
     S: Synthesizer,
@@ -493,57 +493,34 @@ fn process_request<S, P>(
         return;
     }
 
-    let cache_key = fixed_phrase(&request.text);
-    let synthesis = request.interaction.as_ref().map(|interaction| {
-        interaction.stage(
-            "piper.synthesis",
-            telemetry::fields([("cache_candidate", serde_json::json!(cache_key.is_some()))]),
-        )
-    });
-    let audio = if let Some(key) = cache_key
-        && let Some(audio) = fixed_phrase_cache.get(key)
-    {
-        info!(
-            target: "speech",
-            event = "synthesis_cache_hit",
-            utterance_id = request.utterance_id.value(),
-            owner = ?request.owner,
-            "speech"
-        );
-        Ok(SynthesisResult::Audio(audio.clone()))
-    } else {
-        info!(
-            target: "speech",
-            event = "synthesis_started",
-            utterance_id = request.utterance_id.value(),
-            owner = ?request.owner,
-            "speech"
-        );
-        let result = synthesizer.synthesize(
-            &SynthesisRequest {
-                utterance_id: request.utterance_id.value(),
-                generation: request.generation,
-                text: request.text.clone(),
-            },
-            generation,
-        );
-        if let Ok(SynthesisResult::Audio(audio)) = &result
-            && let Some(key) = cache_key
-        {
-            fixed_phrase_cache.insert(key, audio.clone());
-        }
-        result
-    };
+    let synthesis = request
+        .interaction
+        .as_ref()
+        .map(|interaction| interaction.stage("piper.synthesis", telemetry::Fields::new()));
+    info!(
+        target: "speech",
+        event = "synthesis_started",
+        utterance_id = request.utterance_id.value(),
+        owner = ?request.owner,
+        "speech"
+    );
+    // Every utterance is synthesized by Piper. There are no fixed status cues
+    // any more, so there is nothing worth caching and no outcome is ever
+    // reported as a cache hit.
+    let audio = synthesizer.synthesize(
+        &SynthesisRequest {
+            utterance_id: request.utterance_id.value(),
+            generation: request.generation,
+            text: request.text.clone(),
+        },
+        generation,
+    );
 
     let audio = match audio {
         Ok(SynthesisResult::Audio(audio)) => {
             if let Some(stage) = synthesis {
                 stage.finish(
-                    if cache_key.is_some() {
-                        "cache_hit"
-                    } else {
-                        "completed"
-                    },
+                    "completed",
                     telemetry::fields([
                         ("generated_audio_bytes", serde_json::json!(audio.len())),
                         (
@@ -722,14 +699,6 @@ fn request_is_stale(request: &SpeechRequest, generation: &AtomicU64) -> bool {
     generation.load(Ordering::Acquire) != request.generation
 }
 
-fn fixed_phrase(text: &str) -> Option<&'static str> {
-    match text {
-        LISTENING_CUE => Some(LISTENING_CUE),
-        THINKING_CUE => Some(THINKING_CUE),
-        _ => None,
-    }
-}
-
 fn finish(
     event_sender: &tokio_mpsc::Sender<SpeechEvent>,
     request: SpeechRequest,
@@ -771,7 +740,6 @@ fn finish(
 
 fn speech_owner_label(owner: SpeechOwner) -> &'static str {
     match owner {
-        SpeechOwner::Draft(_) => "draft",
         SpeechOwner::Turn(_) => "turn",
         SpeechOwner::System => "system",
     }
@@ -802,8 +770,7 @@ mod tests {
     use tokio::sync::mpsc as tokio_mpsc;
 
     use super::{
-        SpeechCommand, SpeechEvent, SpeechOutcome, SpeechOwner, SpeechRequest, fixed_phrase,
-        worker_loop,
+        SpeechCommand, SpeechEvent, SpeechOutcome, SpeechOwner, SpeechRequest, worker_loop,
     };
     use crate::speak::{
         playback::{Playback, PlaybackError, PlaybackRequest, PlaybackResult},
@@ -879,7 +846,7 @@ mod tests {
     fn request(id: u64, generation: u64, text: &str) -> SpeechRequest {
         SpeechRequest {
             utterance_id: super::UtteranceId(id),
-            owner: SpeechOwner::Draft(id),
+            owner: SpeechOwner::Turn(super::TurnId::new(id)),
             generation,
             text: text.into(),
             interaction: None,
@@ -969,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_cue_is_cached_but_is_still_played_each_time() {
+    async fn repeated_text_is_synthesized_every_time_without_a_cache() {
         let (sender, receiver) = mpsc::sync_channel(4);
         let (event_sender, mut event_receiver) = tokio_mpsc::channel(4);
         let generation = Arc::new(AtomicU64::new(1));
@@ -1003,7 +970,7 @@ mod tests {
         let _ = event_receiver.recv().await.unwrap();
         worker.join().unwrap();
 
-        assert_eq!(synth_calls.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(synth_calls.lock().unwrap().as_slice(), &[1, 2]);
         assert_eq!(played.lock().unwrap().as_slice(), &[1, 2]);
     }
 
@@ -1074,13 +1041,6 @@ mod tests {
         worker.join().unwrap();
 
         assert_eq!(event.outcome, SpeechOutcome::Cancelled);
-    }
-
-    #[test]
-    fn only_exact_fixed_phrases_are_cacheable() {
-        assert_eq!(fixed_phrase("i'm listening"), Some("i'm listening"));
-        assert_eq!(fixed_phrase("I'm listening"), None);
-        assert_eq!(fixed_phrase("i'm thinking now"), None);
     }
 
     #[test]

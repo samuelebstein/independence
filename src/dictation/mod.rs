@@ -494,6 +494,7 @@ impl DictationRuntime {
                 self.retire_recording(*recording_id).await;
             }
             DictationEvent::RecordingCancelled { recording_id }
+            | DictationEvent::RecordingTooShort { recording_id }
             | DictationEvent::RecordingFailed { recording_id, .. } => {
                 self.retire_recording(*recording_id).await;
                 self.recording_interactions.remove(recording_id);

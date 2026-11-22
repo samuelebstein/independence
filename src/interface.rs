@@ -28,7 +28,27 @@ until Independence exits or you use /reset. Terminal scrollback may retain
 what is displayed here.
 "#;
 
+/// Shown when a press is too short to contain a question (a tap, or a sticky
+/// button). This is guidance, not a failure.
+pub const TOO_SHORT_MESSAGE: &str = "Recording too short. Hold ENTER while you speak.";
+
 static LAST_STATUS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Runs `update` with the most recently displayed status line. Tests use a
+/// per-thread copy so parallel tests cannot deduplicate each other's lines.
+fn with_last_status<R>(update: impl FnOnce(&mut Option<String>) -> R) -> R {
+    #[cfg(test)]
+    {
+        let _ = &LAST_STATUS;
+        test_terminal::LAST_STATUS.with(|last| update(&mut last.borrow_mut()))
+    }
+    #[cfg(not(test))]
+    {
+        let lock = LAST_STATUS.get_or_init(|| Mutex::new(None));
+        let mut last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut last)
+    }
+}
 
 /// Displays an authorized assistant response. It is intentionally not a log
 /// event: answers are private conversation data, not diagnostics.
@@ -39,20 +59,22 @@ pub fn answer(text: &str) {
 
 /// Displays one accepted final microphone transcript. Partial transcripts are
 /// deliberately not rendered or retained by this interface.
+///
+/// The current status is intentionally kept: in voice mode "Thinking..." is
+/// shown on release, before the transcript, and must not be repeated after it.
 pub fn final_transcript(text: &str) {
     write_terminal(|writer| write_prefixed_text(writer, "You: ", text));
-    clear_status();
 }
 
 /// Displays a short, deduplicated status message.
 pub fn status(message: &str) {
-    let lock = LAST_STATUS.get_or_init(|| Mutex::new(None));
-    let mut last = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if last.as_deref() == Some(message) {
-        return;
-    }
-    write_terminal(|writer| write_text(writer, message));
-    *last = Some(message.to_owned());
+    with_last_status(|last| {
+        if last.as_deref() == Some(message) {
+            return;
+        }
+        write_terminal(|writer| write_text(writer, message));
+        *last = Some(message.to_owned());
+    });
 }
 
 /// Displays an informational user-facing message that should not be deduped.
@@ -88,12 +110,14 @@ fn operational_warning_message(event: &str) -> &'static str {
         }
         "input_device_unavailable"
         | "input_device_inaccessible"
-        | "ephemeral_entry_input_lost"
         | "voice_input_source_failed"
         | "voice_input_source_lost"
         | "audio_to_audio_input_failed"
         | "audio_to_audio_input_lost" => {
             "The selected button input is unavailable. Check its connection and permissions, then try again."
+        }
+        "hailo_bridge_unavailable" => {
+            "The Hailo bridge is not reachable or not ready, so no questions can be answered. Start it (scripts/run-raspberry-pi-hailo.sh does this for you), then restart Independence."
         }
         "ollama_model_capabilities_unknown" => {
             "The model's capabilities could not be checked. Text chat is available, but camera and direct voice features are unavailable."
@@ -110,9 +134,6 @@ fn operational_warning_message(event: &str) -> &'static str {
         }
         "audio_to_audio_recording_limit" => {
             "The recording reached the 30-second limit and is being finished."
-        }
-        "listening_cue_unavailable" | "listening_cue_failed" => {
-            "The listening sound could not play. Recording will still start."
         }
         _ => "Independence could not complete that step. Please try again.",
     }
@@ -201,6 +222,7 @@ pub fn emit_dictation(output: DictationOutput) {
         DictationOutput::Discarding => status("Cancelling recording..."),
         DictationOutput::Transcribing => status("Transcribing..."),
         DictationOutput::Transcript(text) => final_transcript(&text),
+        DictationOutput::TooShort => notice(TOO_SHORT_MESSAGE),
         DictationOutput::Diagnostic(_) => operational_warning("dictation"),
     }
 }
@@ -214,9 +236,7 @@ pub fn process_status(event: &str, detail: &str) {
         "ephemeral_session_cleared" => Some("Temporary conversation cleared."),
         "voice_prompt" => Some("Hold ENTER to speak."),
         "dictation_ready" => Some("Ready. Press ENTER to start recording."),
-        "recording" | "microphone_capture_started" | "listening_cue_completed" => {
-            Some("Listening...")
-        }
+        "recording" | "microphone_capture_started" => Some("Listening..."),
         "transcribing" => Some("Transcribing..."),
         "mode" => match detail {
             value if value.starts_with("dictation") => Some("Dictation mode is ready."),
@@ -225,15 +245,7 @@ pub fn process_status(event: &str, detail: &str) {
         },
         "controls" => Some(detail),
         "privacy" => Some("Your transcript is displayed here and is not sent to Ollama."),
-        "ephemeral_entry_waiting" => Some(
-            "Hold the Talk/ENTER button for five seconds, then release it to enter Ephemeral Mode.",
-        ),
-        "ephemeral_entry_not_confirmed" => {
-            Some("Hold the Talk/ENTER button for five full seconds to enter Ephemeral Mode.")
-        }
-        "ephemeral_entry_cancelled" => Some("Ephemeral Mode entry was cancelled."),
-        "ephemeral_entry_confirmed" => Some("Ephemeral Mode is active. Hold ENTER to speak."),
-        "ephemeral_entry_input_recovered" | "voice_input_source_recovered" => {
+        "voice_input_source_recovered" => {
             Some("The button input is available again. Hold ENTER to speak.")
         }
         "speech_test_completed" => Some("Speech test completed."),
@@ -276,18 +288,17 @@ pub fn voice_status(message: &str) {
         "ready — hold enter to start recording/transcription" => {
             status("Ready. Hold ENTER to speak.")
         }
-        "microphone released; finishing local transcription" => status("Thinking..."),
-        "recording released; waiting for microphone cleanup" => status("Finishing recording..."),
+        "transcribing — whisper is running on the recording" => status("Transcribing..."),
+        "model request started" => status("Asking the local model..."),
         "recording released; waiting for direct audio backend" => status("Thinking..."),
         "discarding recording and releasing microphone" => status("Cancelling recording..."),
         "draft cancelled"
         | "direct-audio draft cancelled"
         | "direct-audio recording cancelled; microphone released" => notice("Cancelled."),
-        "released before the microphone became available; no recording started" => {
-            notice("Recording was not started.")
-        }
-        "Enter released during listening cue; no microphone capture started" => {
-            notice("Recording was not started.")
+        "listening — microphone opening" => status("Listening..."),
+        crate::speak::TOO_SHORT_VOICE_LOG
+        | "released before the microphone became available; no recording started" => {
+            notice(TOO_SHORT_MESSAGE)
         }
         value if value.starts_with("audio-to-audio ready") => {
             status("Direct voice mode is ready. Hold ENTER to speak.")
@@ -295,15 +306,6 @@ pub fn voice_status(message: &str) {
         // Callers can add a new internal state without accidentally exposing
         // it as terminal implementation detail. Add a deliberate mapping
         // above when the state needs a person-facing explanation.
-        _ => status("Working..."),
-    }
-}
-
-/// Announces a fixed spoken cue without echoing it as an assistant answer.
-pub fn voice_cue(text: &str) {
-    match text {
-        "i'm listening" => status("Listening..."),
-        "i'm thinking" => status("Thinking..."),
         _ => status("Working..."),
     }
 }
@@ -344,16 +346,69 @@ pub fn input_devices(lines: &[String]) {
 }
 
 fn clear_status() {
-    let lock = LAST_STATUS.get_or_init(|| Mutex::new(None));
-    *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    with_last_status(|last| *last = None);
 }
 
 fn write_terminal(render: impl FnOnce(&mut dyn Write) -> io::Result<()>) {
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
-    // The terminal may be in Crossterm raw mode. Write CRLF ourselves and
-    // flush every message so status text remains readable in that mode.
-    let _ = render(&mut writer).and_then(|()| writer.flush());
+    #[cfg(test)]
+    test_terminal::record(render);
+    #[cfg(not(test))]
+    {
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        // The terminal may be in Crossterm raw mode. Write CRLF ourselves and
+        // flush every message so status text remains readable in that mode.
+        let _ = render(&mut writer).and_then(|()| writer.flush());
+    }
+}
+
+/// A per-thread record of what the interface would have written, so tests can
+/// assert that each status line appears once and in order.
+#[cfg(test)]
+pub(crate) mod test_terminal {
+    use std::cell::RefCell;
+    use std::io::{self, Write};
+
+    thread_local! {
+        pub(super) static LAST_STATUS: RefCell<Option<String>> = const { RefCell::new(None) };
+        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    /// Starts recording terminal output on this thread, discarding earlier
+    /// lines and status state.
+    pub(crate) fn start() {
+        LAST_STATUS.with(|last| *last.borrow_mut() = None);
+        LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Returns the recorded lines since `start`.
+    pub(crate) fn lines() -> Vec<String> {
+        LINES.with(|lines| lines.borrow().clone().unwrap_or_default())
+    }
+
+    /// Writes into the recording if one is active; otherwise writes to
+    /// standard output like production does.
+    pub(super) fn record(render: impl FnOnce(&mut dyn Write) -> io::Result<()>) {
+        let mut buffer = Vec::new();
+        let _ = render(&mut buffer);
+        let text = String::from_utf8_lossy(&buffer).into_owned();
+        let recorded = LINES.with(|lines| match lines.borrow_mut().as_mut() {
+            Some(lines) => {
+                lines.extend(
+                    text.split("\r\n")
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+                true
+            }
+            None => false,
+        });
+        if !recorded {
+            let stdout = io::stdout();
+            let mut writer = stdout.lock();
+            let _ = writer.write_all(&buffer).and_then(|()| writer.flush());
+        }
+    }
 }
 
 fn write_text(writer: &mut dyn Write, text: &str) -> io::Result<()> {

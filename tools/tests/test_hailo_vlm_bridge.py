@@ -28,6 +28,8 @@ from tools.hailo_vlm_bridge import (  # noqa: E402
     MAX_IMAGES,
     SafeTelemetry,
     _loopback_host,
+    _stop_on_terminate,
+    install_termination_handler,
 )
 
 
@@ -41,6 +43,20 @@ class FakeBackend:
 
     def close(self) -> None:
         return
+
+
+class TerminationHandlerTests(unittest.TestCase):
+    def test_sigterm_uses_the_same_orderly_shutdown_as_ctrl_c(self) -> None:
+        import signal
+
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            install_termination_handler()
+            self.assertIs(signal.getsignal(signal.SIGTERM), _stop_on_terminate)
+            with self.assertRaises(KeyboardInterrupt):
+                _stop_on_terminate(signal.SIGTERM, None)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 class HailoVlmBridgeTests(unittest.TestCase):

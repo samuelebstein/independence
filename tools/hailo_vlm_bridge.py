@@ -20,6 +20,7 @@ import binascii
 import ipaddress
 import json
 import os
+import signal
 import socket
 import sys
 import threading
@@ -796,6 +797,21 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
     )
 
 
+def _stop_on_terminate(_signum: int, _frame: object) -> None:
+    """Turn SIGTERM into the same orderly shutdown as Ctrl+C.
+
+    A launcher that starts the bridge in the background cannot use Ctrl+C:
+    background processes started by a script ignore SIGINT. It sends SIGTERM
+    instead, and this makes the `finally` block below release the Hailo
+    device rather than leaving that to process teardown.
+    """
+    raise KeyboardInterrupt
+
+
+def install_termination_handler() -> None:
+    signal.signal(signal.SIGTERM, _stop_on_terminate)
+
+
 def main(argv: list[str] | None = None) -> int:
     config = parse_arguments(argv)
     try:
@@ -839,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Health: {config.endpoint}/healthz | status: ready | model: {config.model} | capabilities: vision"
     )
+    install_termination_handler()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

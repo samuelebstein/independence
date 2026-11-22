@@ -6,11 +6,7 @@
 //! ephemeral session, but it has no mechanism to create an authenticated
 //! private session.
 
-use std::{
-    fmt,
-    marker::PhantomData,
-    time::{Duration, Instant},
-};
+use std::{fmt, marker::PhantomData};
 
 use thiserror::Error;
 
@@ -64,16 +60,6 @@ impl OperatingMode {
             Self::Private => "private",
         }
     }
-
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "ephemeral" => Ok(Self::Ephemeral),
-            "private" => Ok(Self::Private),
-            _ => Err(format!(
-                "unknown operating mode `{value}`; use `ephemeral` or `private`"
-            )),
-        }
-    }
 }
 
 impl Default for OperatingMode {
@@ -85,78 +71,6 @@ impl Default for OperatingMode {
 impl fmt::Display for OperatingMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.label())
-    }
-}
-
-/// Five seconds makes accidental entry from an ordinary Talk press unlikely.
-/// The gate consumes that initial press; a fresh press is required to record.
-pub(crate) const EPHEMERAL_ENTRY_HOLD: Duration = Duration::from_secs(5);
-
-/// Hardware-independent facts that a physical entry adapter can report.
-///
-/// `app` maps existing terminal/evdev control events onto these facts.  This
-/// type deliberately knows nothing about microphones, terminal input, or GPIO.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EphemeralEntryControl {
-    TalkPressed,
-    TalkReleased,
-    Cancelled,
-    Other,
-}
-
-/// Result of advancing the physical Ephemeral Mode entry gesture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EphemeralEntryOutcome {
-    Waiting,
-    TooShort,
-    Cancelled,
-    Entered,
-}
-
-/// A deliberately small hold-gesture recognizer.
-///
-/// It uses timestamps supplied by its caller, which makes its timing behavior
-/// deterministic in tests and keeps it separate from the real input adapter.
-#[derive(Debug)]
-pub(crate) struct EphemeralEntryGesture {
-    pressed_at: Option<Instant>,
-}
-
-impl EphemeralEntryGesture {
-    pub(crate) fn new() -> Self {
-        Self { pressed_at: None }
-    }
-
-    pub(crate) fn handle(
-        &mut self,
-        control: EphemeralEntryControl,
-        now: Instant,
-    ) -> EphemeralEntryOutcome {
-        match control {
-            EphemeralEntryControl::TalkPressed => {
-                self.pressed_at.get_or_insert(now);
-                EphemeralEntryOutcome::Waiting
-            }
-            EphemeralEntryControl::TalkReleased => {
-                let Some(pressed_at) = self.pressed_at.take() else {
-                    return EphemeralEntryOutcome::Waiting;
-                };
-                if now.saturating_duration_since(pressed_at) >= EPHEMERAL_ENTRY_HOLD {
-                    EphemeralEntryOutcome::Entered
-                } else {
-                    EphemeralEntryOutcome::TooShort
-                }
-            }
-            EphemeralEntryControl::Cancelled => {
-                self.pressed_at = None;
-                EphemeralEntryOutcome::Cancelled
-            }
-            EphemeralEntryControl::Other => EphemeralEntryOutcome::Waiting,
-        }
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.pressed_at = None;
     }
 }
 
@@ -464,10 +378,7 @@ pub enum SecurityError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::{
-        EPHEMERAL_ENTRY_HOLD, EphemeralEntryControl, EphemeralEntryGesture, EphemeralEntryOutcome,
         LockOutcome, OperatingMode, PrivateSession, SecurityError, SecurityManager, SecurityState,
         VerifiedSetup,
     };
@@ -576,55 +487,5 @@ mod tests {
             })
         ));
         assert_eq!(manager.lock().unwrap(), LockOutcome::AlreadyLocked);
-    }
-
-    #[test]
-    fn physical_ephemeral_entry_requires_one_deliberate_hold_and_release() {
-        let started = Instant::now();
-        let mut gesture = EphemeralEntryGesture::new();
-        assert_eq!(
-            gesture.handle(EphemeralEntryControl::TalkPressed, started),
-            EphemeralEntryOutcome::Waiting
-        );
-        assert_eq!(
-            gesture.handle(
-                EphemeralEntryControl::TalkReleased,
-                started + EPHEMERAL_ENTRY_HOLD - std::time::Duration::from_millis(1),
-            ),
-            EphemeralEntryOutcome::TooShort
-        );
-        assert_eq!(
-            gesture.handle(EphemeralEntryControl::TalkPressed, started),
-            EphemeralEntryOutcome::Waiting
-        );
-        assert_eq!(
-            gesture.handle(
-                EphemeralEntryControl::TalkReleased,
-                started + EPHEMERAL_ENTRY_HOLD,
-            ),
-            EphemeralEntryOutcome::Entered
-        );
-    }
-
-    #[test]
-    fn cancelling_or_other_buttons_cannot_enter_ephemeral_mode() {
-        let now = Instant::now();
-        let mut gesture = EphemeralEntryGesture::new();
-        assert_eq!(
-            gesture.handle(EphemeralEntryControl::Other, now),
-            EphemeralEntryOutcome::Waiting
-        );
-        gesture.handle(EphemeralEntryControl::TalkPressed, now);
-        assert_eq!(
-            gesture.handle(EphemeralEntryControl::Cancelled, now),
-            EphemeralEntryOutcome::Cancelled
-        );
-        assert_eq!(
-            gesture.handle(
-                EphemeralEntryControl::TalkReleased,
-                now + EPHEMERAL_ENTRY_HOLD,
-            ),
-            EphemeralEntryOutcome::Waiting
-        );
     }
 }

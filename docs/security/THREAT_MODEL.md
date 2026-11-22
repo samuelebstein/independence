@@ -25,8 +25,9 @@ The current code has useful privacy boundaries, but no cryptographic private
 storage boundary:
 
 - `SecurityManager` (`src/security.rs`) owns a process-local lifecycle policy
-  and an opaque Ephemeral Mode lease. Production startup is `Uninitialized`;
-  there is no production route to `Unlocked` or Private Mode yet.
+  and an opaque Ephemeral Mode lease, obtained immediately at launch (no entry
+  gesture since Milestone 7). Production startup is `Uninitialized`; there is
+  no launch option for Private Mode and no production route to `Unlocked`.
 - The default Ephemeral `Controller` keeps accepted conversation turns and
   freshly captured `Photo` bytes in process memory only (`src/controller.rs`).
   It starts empty; `/reset` and orderly runtime shutdown clear application-owned
@@ -186,7 +187,7 @@ it is not implemented by this document.
 | Malicious local program | Spy on terminal, filesystem, process, environment, audio device, or replace executable | Any data while unlocked; phrases/PIN at entry | Shell avoidance and bounded worker APIs help only narrowly | Least privilege, hardened release process, reduce plaintext logs, process isolation where feasible | No app-level defense is sufficient against a hostile OS/user session |
 | Compromised OS/kernel/firmware | Read memory and intercept I/O | DEK, PIN, phrase, live media | None | Document as out of app scope; optional verified boot/TPM/layered OS hardening per device | Still cannot trust an unlocked compromised system |
 | Dependency/model supply chain | Backdoored crate, package, model, Piper/Ollama binary, build artifact | All assets and correctness | Cargo.lock pins resolution; no reproducible-build policy yet | Dependency review, advisory scanning, provenance/SBOM plan, pinned hashes/releases, reproducible-build path | Review cannot prove absence of compromise |
-| Physical observation/listening | See words on screen/paper; hear recovery words or speaker echo; plug input device | Recovery phrase, PIN, transcript, photo context | Explicit capture and current no persistent audio | Private ceremony UX, mute output, no general ASR, no phrase display logging, safe physical controls | Shoulder surfing, hidden cameras, acoustic leakage remain |
+| Physical observation/listening | See words on screen/paper; hear recovery words or speaker echo; plug input device | Recovery phrase, PIN, transcript, photo context | Explicit push-to-talk capture and current no persistent audio; no audible microphone indicator on a screenless Pi since spoken cues were removed (the held button is the only indication) | Private ceremony UX, mute output, no general ASR, no phrase display logging, safe physical controls | Shoulder surfing, hidden cameras, acoustic leakage remain |
 | Logs/debug/telemetry/model exposure | Read scrollback, redirected stdout, stderr diagnostics, JSONL, OTLP, crash report, model request | Transcript, answer, media metadata, PIN/recovery phrase | Terminal interface plaintext; diagnostics/telemetry redact conversation content | Secret-safe types, no debug/display, logging policy, encrypted or opt-in logs, no secrets in model path | Terminal interface scrollback still exposes dialogue; third-party process logs remain |
 | Unauthorized backup access | Copy/cloud-sync/export backup | Ciphertext, recovery envelope, metadata | No backup feature yet | AEAD backup format, no plaintext DEK/phrase, versioned manifest, restore authentication | Phrase theft plus backup decrypts by design; metadata leakage must be minimized |
 | Tamper/rollback/corruption | Modify/delete old ciphertext/envelopes/backup | Integrity and availability | Model/camera validation only | AEAD, authenticated metadata, atomic writes, backup version/rollback policy | Availability cannot be guaranteed; rollback detection needs a trusted monotonic anchor or user-visible policy |

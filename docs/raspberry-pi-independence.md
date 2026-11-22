@@ -140,9 +140,9 @@ use Whisper, Piper, a camera, or a model.
   --backend fixture
 ```
 
-Use the physically attached keyboard, not SSH keys: hold **Enter** for five
-seconds and release to enter Ephemeral Mode; then hold **Enter** again, make a
-short sound, and release. A test tone should play. Physical **Escape** cancels
+Use the physically attached keyboard, not SSH keys. Ephemeral Mode starts
+immediately; hold **Enter**, make a sound for at least half a second, and
+release (presses under 300 ms are ignored as too short). A test tone should play. Physical **Escape** cancels
 unfinished work, and **Ctrl+C** exits the terminal process.
 
 ### Camera Module 3 Wide

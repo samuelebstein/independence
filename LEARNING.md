@@ -70,13 +70,15 @@ the default/legacy selection behavior.
 
 ```text
 hold-to-talk Enter press
-  -> VoiceRuntime queues the fixed "i'm listening" cue to SpeechService
-  -> after that exact cue plays (or audio fails visibly), VoiceRuntime asks
-     DictationController to allocate a RecordingId and request capture
+  -> terminal shows "Listening..." (status only; nothing is spoken)
+  -> VoiceRuntime immediately asks DictationController to allocate a
+     RecordingId and request capture
   -> CPAL opens the selected microphone only for that recording
-  -> callback downmixes to bounded mono f32 samples
-  -> periodic bounded snapshots run display-only local recognition
+  -> callback downmixes to mono f32 and pushes into a lock-free ring buffer
+  -> the capture thread drains the ring into the recording it alone owns
+  -> laptop only: periodic snapshots run display-only local recognition
   -> real Enter release (or 30 seconds) drops the stream and releases the microphone
+  -> under 300 ms of audio: "Recording too short", nothing is transcribed
   -> Rubato resamples the retained clip to 16 kHz
   -> whisper-rs runs whisper.cpp on a blocking worker
   -> worker sends TranscriptReady { recording_id, text }
@@ -113,11 +115,30 @@ while native recognition might still return text. Once a cancel changes the
 active phase, a completion with that ID is either used only for cleanup or
 ignored; it cannot display or submit a stale transcript. In voice mode, a new
 Enter press at READY first stops any active model turn and speech playback,
-then queues a new listening cue. Capture begins only when that particular cue
-has completed. Releasing Enter or pressing Esc while it is still playing clears
-the draft first, so its late completion cannot open the microphone. Esc also
-cancels the microphone, partial/final transcription, photo work, synthesis,
-playback, and inference without clearing accepted history.
+then starts capture immediately. A release that arrives before CPAL reports the
+microphone open is remembered, and the recording is finished as soon as it
+opens. Esc cancels the microphone, partial/final transcription, photo work,
+synthesis, playback, and inference without clearing accepted history.
+
+### Why the microphone callback never shares a lock
+
+CPAL runs the microphone callback on a real-time audio thread. If it has to
+wait, the audio device keeps producing samples and some are lost. Before
+Milestone 7 the callback appended into a `Mutex<Vec<f32>>` with `try_lock`: if
+any other thread held the lock, the callback counted the samples as dropped,
+and one dropped sample failed the whole recording. On the Pi, live partial
+transcription copied the entire recording under that lock every 750 ms while
+Whisper, the camera, and Piper competed for the CPU. Releasing ENTER during a
+photo capture lost the recording every time it was tried.
+
+Now the callback owns the *producer* end of an `rtrb` ring buffer (a
+maintained single-producer/single-consumer queue designed for real-time
+audio) and only pushes into it. The capture thread owns the *consumer* end and
+the growing `Vec`; nobody else touches that `Vec`. A snapshot copies it on the
+capture thread itself, so it cannot make the callback lose audio. `rtrb` owns
+the lock-free memory ordering; Independence owns the ring size (two seconds),
+the drain cadence (100 ms), and the rule that any genuinely lost frame still
+fails the recording as `dropped_frames` instead of silently missing words.
 
 ## Local speech output is a separate worker
 
@@ -142,19 +163,21 @@ cancel the unfinished interaction; the worker then kills an in-progress Piper
 child or stops the current Rodio player at its next check, and stale generated
 audio is never started later.
 
-There are two fixed cues: `i'm listening` before capture begins and `i'm
-thinking` only after CPAL has released the microphone. The worker caches their
-generated WAV bytes after the first successful synthesis, so repeating a
-normal control does not repeatedly invoke Piper for those short phrases. Piper
-itself is used through its documented CLI rather than reimplemented in Rust;
-Rodio provides output-device access and WAV decoding/playback. Our code owns
-queue ordering, cancellation identity, privacy limits, and the rule that the
-microphone must wait for the listening cue.
+Status changes are never spoken. Until Milestone 7 the worker spoke fixed
+`i'm listening` / `i'm thinking` cues through Piper, and the microphone waited
+for the listening cue to finish: on the Pi that cost 0.7–2.5 seconds per press
+and cut off the start of what people said. Now "Listening..." and
+"Transcribing..." / "Asking the local model..." are terminal status lines and
+diagnostic events, and Piper speaks
+only accepted answers and fixed error notices. Piper itself is used through
+its documented CLI rather than reimplemented in Rust; Rodio provides
+output-device access and WAV decoding/playback. Our code owns queue ordering,
+cancellation identity, and privacy limits.
 
 This is **not echo cancellation**. Speaker audio can reach a nearby
 microphone; use a selectable headset when that matters. If Piper or an output
-device is unavailable, the text log remains authoritative and recording starts
-with a visible warning instead of pretending audio played.
+device is unavailable, the text on screen remains authoritative and a visible
+warning says the audio could not play.
 
 ## Observability follows ownership, not dialogue
 
@@ -193,8 +216,8 @@ queue” explanation.
 The named milestones calculate only intervals with both endpoints. In voice
 mode those include Enter→actual microphone recording, release→Ollama dispatch,
 release→accepted text, release→final-answer software playback start, and
-cancellation request→local resource cleanup. The thinking cue is its own
-speech request and cannot satisfy the final-answer playback milestone.
+cancellation request→local resource cleanup. Only an accepted answer's speech
+request can satisfy the final-answer playback milestone.
 
 The controller still accepts text before speech delivery completes. For
 observability, `VoiceRuntime` keeps that accepted interaction indexed by the
@@ -424,15 +447,16 @@ sentence through the system-default device. It is the real speaker check and
 does not open a microphone, contact Ollama, or capture a photo. If the device
 list names a different desired output, rerun it with `--audio-output 'Exact id'`.
 
-For `--voice`, hold Enter and wait for **Listening...** before asking “What is
-the primary gas in Earth's atmosphere?”; then release Enter. The microphone is
-not open during that cue. The final transcript appears once, followed by
-**Thinking...** and the text answer. Repeat while pressing `P`
-twice after capture begins and before release to attach two stills in press
-order. While an answer is pending, hold Enter again: its old model result and
-old speech must become ineligible. Press Esc during the listening cue, a held
-draft, final recognition, synthesis/playback, or inference to discard that
-work. `cargo run -- --dictate` remains the separate transcript-only check; it
+For `--voice`, hold Enter and start asking “What is the primary gas in Earth's
+atmosphere?” right away; then release Enter. **Listening...** appears on press,
+**Transcribing...** while Whisper works, then the transcript once, **Asking the
+local model...** while the model answers, the answer, and finally
+**Ready. Hold ENTER to speak.** Repeat while pressing `P` once after capture
+begins; release immediately afterwards and the turn should wait for the photo
+and send both. Tap Enter briefly: you should see “Recording too short.” While an
+answer is pending, hold Enter again: its old model result and old speech must
+become ineligible. Press Esc during a held draft, final recognition,
+synthesis/playback, or inference to discard that work. `cargo run -- --dictate` remains the separate transcript-only check; it
 should display speech but never contact Ollama or speakers.
 
 ## What tests establish—and what they cannot
@@ -463,11 +487,14 @@ manual checks above; no model weight, microphone, Ollama server, or camera is
 required for the ordinary suite.
 
 Speech-worker tests use fake synthesizers and fake players. They verify queue
-order, fixed-cue caching, synthesis/playback failure reporting, and generation
-cancellation without Piper, a model file, or a real speaker. Voice-runtime
-tests separately verify that recording does not open before the listening cue,
-that a late cue after release/Escape cannot reopen it, and that `P` during the
-cue cannot activate a camera. They do not prove that a physical speaker works;
+order, that repeated text is synthesized every time (no cue cache),
+synthesis/playback failure reporting, and generation cancellation without
+Piper, a model file, or a real speaker. Voice-runtime tests separately verify
+that a press opens the microphone with no speech request, that status changes
+are never spoken, that releasing during a photo waits for it, that a too-short
+press is never transcribed, and that terminal lines appear once and in order.
+Capture tests push audio from one thread while another repeatedly snapshots,
+and check that no frame is lost. They do not prove that a physical speaker works;
 only `cargo run -- --speak-test` can do that on the selected machine.
 
 ## Previous milestone: Raspberry Pi hardware adapters and keyboard-as-buttons
@@ -586,7 +613,7 @@ attached Pi keyboard, USB microphone/speaker, ARM64 Whisper/Piper installation,
 or Camera Module 3 Wide. Those remain separate, documented hardware checks in
 [`docs/raspberry-pi.md`](docs/raspberry-pi.md#8-optional-hardware-adapters-attached-keyboard-as-buttons).
 
-## Latest milestone: local Hailo VLM bridge
+## Previous milestone: local Hailo VLM bridge
 
 The Hailo integration adds a **transport adapter**, not another chat
 application. Hailo Apps owns the accelerator, VDevice, model loading, image
@@ -713,7 +740,7 @@ preservation, malformed-audio rejection, and stale-result cancellation. See
 configuration precedence, and why a backend must verify both a model's
 capabilities and the request/response format before direct audio can run.
 
-## Latest milestone: security foundation and Ephemeral Mode
+## Previous milestone: security foundation and Ephemeral Mode
 
 Milestone 6.1 turns one security design idea into a small, testable code
 boundary without pretending encryption exists. The new
@@ -766,11 +793,9 @@ remains in memory only. Terminal transcript/answer output remains visible to
 the person using the terminal; diagnostics and JSONL telemetry keep their
 separate content-redaction boundaries.
 
-On the Raspberry Pi button profile, the existing Talk/Enter evdev input is a
-physical entry gesture: hold for five seconds and release before the normal
-voice runtime starts. The gate opens no microphone/camera/model/Piper resource
-and consumes that release, so a fresh press is required to record. This is
-intentional entry, not authentication.
+Milestone 6.1 added a five-second Talk/Enter hold before the Pi entered
+Ephemeral Mode. Milestone 7 removed it: it was an intent gesture, not
+authentication, and starting the program is already an explicit action.
 
 Try this from the repository root:
 
@@ -786,7 +811,58 @@ knows the prior question. The application sends no prior context. Then run:
 cargo run -- --mode private
 ```
 
-It should refuse before starting model/device work. That refusal is safer and
+Since Milestone 7 the argument parser refuses `--mode` entirely and explains
+that Independence always runs in Ephemeral Mode. That refusal is safer and
 more honest than a placeholder PIN. The next milestone remains **6.2 only
 after owner approval** of the key/recovery-format choices in the security
 documents.
+
+## Latest milestone: Pi voice reliability and immediate start (Milestone 7)
+
+Two Pi sessions lost five of eleven turns. The logs showed one clear pattern:
+releasing ENTER while the camera was still capturing failed every time. The
+fix was not a new feature but removing contention and waiting:
+
+- **No live partials on the Hailo Pi profile.** Whisper no longer re-runs on
+  the growing recording while ENTER is held there; only the final transcript is
+  produced. The laptop keeps live partials.
+- **A lock-free capture path** (see "Why the microphone callback never shares
+  a lock" above), so reading the recording can never cost audio.
+- **Named failure reasons.** A capture failure is now `stream_error`,
+  `dropped_frames`, `buffer_overflow`, `device_unavailable`, `invalid_audio`,
+  or `lock_poisoned` in diagnostics, instead of one `device_failure` label.
+- **Short presses are guidance, not failures.** Under 300 ms of audio, Whisper
+  is not run and the terminal says "Recording too short. Hold ENTER while you
+  speak."
+- **Immediate start.** Ephemeral Mode begins at launch (no five-second hold),
+  `--mode` is gone, and pressing ENTER opens the microphone at once because
+  there are no spoken cues to wait for.
+- **One line per event, in order.** `Listening...` → (`Photo captured...`) →
+  `Transcribing...` → `You: ...` → `Asking the local model...` →
+  `Independence: ...` → `Ready. Hold ENTER to speak.` The two processing
+  stages are named separately so you can see which one you are waiting on
+  (on the Pi, Whisper takes about 2 s and the model 15–25 s). If you release
+  during a photo and Whisper finishes first, "Transcribing..." is skipped
+  rather than shown late. "Ready" waits for the answer or failure.
+
+- **One command on the Pi.** `scripts/run-raspberry-pi-hailo.sh` checks
+  every file and device first, starts the bridge in the background, waits for
+  `/healthz`, runs Independence, and stops the bridge on any exit. A
+  background process started by a script ignores Ctrl+C, so the script stops
+  the bridge with SIGTERM, which the bridge now handles like Ctrl+C.
+- **The camera is required on the Hailo Pi.** Both the script and
+  Independence exit with a clear message when `rpicam-still --list-cameras`
+  finds nothing, instead of failing later when you press `P`.
+
+Answers are deliberately *not* post-processed: a looping or cut-off answer is
+shown exactly as the model produced it, so the problem stays visible and gets
+fixed at its source (prompt, token cap, temperature).
+
+Releasing during a photo already waited for the photo in code
+(`VoiceRuntime::try_submit`); the recording was simply failing first. Tests now
+pin that behavior down with a camera that blocks until the test releases it.
+
+Experiment: on the Pi, press `P` and release ENTER immediately five times in a
+row. Each turn should answer with the photo. Then run with
+`INDEPENDENCE_LOG=debug` and search the log for `failure_class` — there should
+be none.

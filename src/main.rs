@@ -9,9 +9,7 @@ async fn main() {
 
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     let result = match independence::launch::parse_arguments(&arguments) {
-        Ok(independence::launch::LaunchCommand::Interactive { mode }) => {
-            independence::app::run_with_mode(mode).await
-        }
+        Ok(independence::launch::LaunchCommand::Interactive) => independence::app::run().await,
         Ok(independence::launch::LaunchCommand::Dictate { audio_input }) => {
             independence::app::run_dictation(audio_input).await
         }
@@ -48,7 +46,7 @@ async fn main() {
 
 fn usage_and_exit(detail: &str) -> ! {
     let usage = format!(
-        "{detail}. usage: cargo run -- [[--mode ephemeral|private]|--dictate [--audio-input <exact device id>]|--voice [--mode ephemeral|private] [--profile raspberry-pi|raspberry-pi-hailo] [--input terminal|buttons] [--input-device <stable /dev/input path>] [--audio-input <exact device id>] [--audio-output <exact device id>] [--model <model>] [--backend ollama|hailo-vlm|fixture] [--pipeline transcribe-and-speak|audio-to-audio]|--audio-devices|--audio-input-devices|--input-devices|--speak-test [--audio-output <exact device id>]"
+        "{detail}. usage: cargo run -- [--dictate [--audio-input <exact device id>]|--voice [--profile raspberry-pi|raspberry-pi-hailo] [--input terminal|buttons] [--input-device <stable /dev/input path>] [--audio-input <exact device id>] [--audio-output <exact device id>] [--model <model>] [--backend ollama|hailo-vlm|fixture] [--pipeline transcribe-and-speak|audio-to-audio]|--audio-devices|--audio-input-devices|--input-devices|--speak-test [--audio-output <exact device id>]"
     );
     independence::speak::usage(&usage);
     std::process::exit(2);

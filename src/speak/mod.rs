@@ -139,10 +139,12 @@ pub fn user_transcript(stage: &'static str, text: &str) {
     }
 }
 
-/// Announces that an accepted voice request is being processed. Its text and
-/// photo details remain outside diagnostics.
-pub fn voice_submission(_text: &str, _photos: usize) {
-    interface::status("Thinking...");
+/// Records that an accepted voice request is being sent to the model. The
+/// terminal already shows "Thinking..." from the moment Talk/ENTER was
+/// released, so nothing is printed again here. Text and photo details remain
+/// outside diagnostics.
+pub fn voice_submission(_text: &str, photos: usize) {
+    info!(target: "process", event = "voice_request_submitted", photos, "voice request submitted");
 }
 
 /// Emits a safe operational event and, when appropriate, a human-facing
@@ -159,6 +161,13 @@ pub fn process(event: &'static str, detail: impl std::fmt::Display) {
 pub fn warning(event: &'static str, _detail: impl std::fmt::Display) {
     interface::operational_warning(event);
     warn!(target: "process", event, "recoverable operational condition");
+}
+
+/// Records a recoverable condition in diagnostics only. Use this for
+/// best-effort background work (such as live partial transcription) whose
+/// failure does not affect what the person asked and needs no action.
+pub fn background_warning(event: &'static str) {
+    warn!(target: "process", event, "recoverable background condition");
 }
 
 /// Lists audio output devices without opening a stream or producing sound.
@@ -227,17 +236,14 @@ pub fn emit_raw(output: Output) {
     emit(output);
 }
 
+/// The fixed lifecycle message for a press too short to hold a question.
+pub const TOO_SHORT_VOICE_LOG: &str = "recording too short — hold enter while you speak";
+
 /// User-facing lifecycle text for button-controlled voice mode. The text is
 /// never copied into diagnostic output.
 pub fn voice_log(message: &str) {
     interface::voice_status(message);
     info!(target: "process", event = "voice_status_changed", "voice status changed");
-}
-
-/// Displays a fixed voice cue as status rather than as a logged answer.
-pub fn voice_cue(text: &str) {
-    interface::voice_cue(text);
-    info!(target: "speech", event = "voice_cue_displayed", "voice cue displayed");
 }
 
 /// Displays non-sensitive setup information before standalone dictation
@@ -269,10 +275,6 @@ pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, mode
 
 /// Displays setup information for button-controlled voice questions.
 pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
-    process(
-        "voice_prompt",
-        "hold down Enter to start recording/transcription",
-    );
     process("mode", "voice — local transcription and local Ollama");
     match microphone {
         Ok(microphone) => process("microphone", microphone),
@@ -295,6 +297,11 @@ pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_av
         "safety",
         "Spoken command-like text is treated as a question, not a terminal command.",
     );
+    // The prompt comes last so it is the line the person acts on.
+    process(
+        "voice_prompt",
+        "hold down Enter to start recording/transcription",
+    );
 }
 
 /// Renders standalone dictation lifecycle output without logging a transcript.
@@ -305,6 +312,7 @@ pub fn emit_dictation(output: DictationOutput) {
         DictationOutput::Discarding => "discarding",
         DictationOutput::Transcribing => "transcribing",
         DictationOutput::Transcript(_) => "transcript",
+        DictationOutput::TooShort => "too_short",
         DictationOutput::Diagnostic(_) => "notice",
     };
     interface::emit_dictation(output);

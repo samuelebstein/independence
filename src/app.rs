@@ -799,9 +799,8 @@ struct TurnRuntime {
     active: Option<RunningTurn>,
     pending_interaction: Option<Interaction>,
     /// Whether starting a model request prints "Thinking...". Typed mode
-    /// needs it; voice mode already printed it when Talk/ENTER was released,
-    /// and printing it again would repeat it after the transcript (for
-    /// example when a late photo status line came in between).
+    /// needs it; voice mode prints its own "Asking the local model..." when
+    /// it sends the request.
     announce_thinking: bool,
     /// Cancellation returns control immediately, but an already-running
     /// bounded V4L2 closure can still own the camera gate. These background
@@ -1140,6 +1139,8 @@ struct VoiceDraft {
     held: bool,
     released: bool,
     snapshot_requested: bool,
+    /// Whisper has started on the final recording (no transcript yet).
+    transcribing: bool,
     cancellation: CancellationToken,
     photos: BTreeMap<u64, DraftPhoto>,
     next_photo_request: u64,
@@ -1162,6 +1163,7 @@ impl VoiceDraft {
             held: true,
             released: false,
             snapshot_requested: false,
+            transcribing: false,
             cancellation: CancellationToken::new(),
             photos: BTreeMap::new(),
             next_photo_request: 1,
@@ -1241,7 +1243,8 @@ impl VoiceRuntime {
         speech: speak::SpeechService,
     ) -> Self {
         let mut turns = turns;
-        // Voice mode owns its own "Thinking..." line, shown on release.
+        // Voice mode shows "Transcribing..." and "Asking the local
+        // model..." itself, at the right moments.
         turns.announce_thinking = false;
         Self {
             controller,
@@ -1533,7 +1536,9 @@ impl VoiceRuntime {
                     return true;
                 }
 
-                speak::user_transcript("final", &text);
+                // "You: ..." is printed when the request is actually sent
+                // (see `try_submit`), so it always follows "Photo captured"
+                // even if the photo finishes after Whisper.
                 if let Some(draft) = self.draft.as_mut() {
                     draft.interaction.mark("whisper.final_transcript_accepted");
                     draft.final_transcript = Some(text);
@@ -1568,14 +1573,16 @@ impl VoiceRuntime {
             }
             DictationOutput::Transcribing => {
                 // Dictation emits this only after the CPAL recording owner has
-                // produced `RecordingFinished`. "Thinking..." is terminal
-                // status and a diagnostic marker only; it is never spoken.
-                speak::voice_log("microphone released; finishing local transcription");
-                if let Some(draft) = self.draft.as_ref() {
+                // produced `RecordingFinished`, so a too-short or failed
+                // recording never shows "Transcribing...". Status only; never
+                // spoken.
+                if let Some(draft) = self.draft.as_mut() {
+                    draft.transcribing = true;
                     draft
                         .interaction
                         .mark("whisper.final_transcription_started");
                 }
+                self.announce_transcribing_if_ready();
             }
             // `AcceptedTranscript` below provides the exact, one-time final
             // transcript log. Avoid printing it once here and once there.
@@ -1704,9 +1711,25 @@ impl VoiceRuntime {
                 draft.interaction.mark("voice.enter_released");
             }
             self.cancel_live_transcription();
-            // The thinking cue is deliberately delayed until DictationOutput::
-            // Transcribing, after the microphone has actually been released.
-            speak::voice_log("recording released; waiting for microphone cleanup");
+            info!(target: "process", event = "voice_recording_released", "recording released; waiting for microphone cleanup");
+        }
+    }
+
+    /// Shows "Transcribing..." while Whisper works on the released
+    /// recording, but only after any requested photo has finished, so the
+    /// terminal reads in order: listening, photo, transcribing, question,
+    /// model. If Whisper already finished while the photo was still being
+    /// captured, the line is skipped rather than shown late.
+    fn announce_transcribing_if_ready(&self) {
+        let ready = self.draft.as_ref().is_some_and(|draft| {
+            draft.released
+                && draft.transcribing
+                && draft.final_transcript.is_none()
+                && !draft.has_pending_photos()
+                && !draft.cancellation.is_cancelled()
+        });
+        if ready {
+            speak::voice_log("transcribing — whisper is running on the recording");
         }
     }
 
@@ -1944,6 +1967,7 @@ impl VoiceRuntime {
             } => {
                 self.handle_photo_capture_finished(draft_id, request_id, result);
                 self.start_next_photo_capture();
+                self.announce_transcribing_if_ready();
                 self.try_submit().await
             }
         }
@@ -2109,6 +2133,10 @@ impl VoiceRuntime {
             return true;
         };
 
+        speak::user_transcript("final", &transcript);
+        // The request is about to go to the local model; this is where the
+        // long wait is, so say so separately from transcription.
+        speak::voice_log("model request started");
         speak::voice_submission(&transcript, photos.len());
         let input = if photos.is_empty() {
             Input::Ask(transcript)
@@ -3663,8 +3691,9 @@ mod tests {
             crate::interface::test_terminal::lines(),
             [
                 "Listening...",
-                "Thinking...",
+                "Transcribing...",
                 "You: a question",
+                "Asking the local model...",
                 "Independence: an answer",
                 "Ready. Hold ENTER to speak.",
             ]
@@ -3695,8 +3724,9 @@ mod tests {
             [
                 "Listening...",
                 "Photo captured. 1 photo attached.",
-                "Thinking...",
+                "Transcribing...",
                 "You: what is this",
+                "Asking the local model...",
                 "Independence: a photo answer",
                 "Ready. Hold ENTER to speak.",
             ]
@@ -3704,9 +3734,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_shows_thinking_once_when_release_comes_before_the_photo() {
-        // Reproduces the Pi run: release during capture printed "Thinking...",
-        // then "Photo captured", then the transcript, then "Thinking..." again.
+    async fn terminal_keeps_photo_first_when_release_comes_before_the_photo() {
+        // Reproduces the Pi runs: releasing during capture printed the
+        // processing status before "Photo captured" (and once, twice). The
+        // photo line must come first and nothing may repeat.
         let server = MockServer::start().await;
         mock_answer(&server, "a fridge answer").await;
         let (camera_service, open_gate) = gated_camera(false);
@@ -3730,22 +3761,16 @@ mod tests {
         assert!(harness.runtime.handle_aux_event(photo_finished).await);
         harness.accept_next_answer().await;
 
+        // Whisper finished while the camera was still busy, so
+        // "Transcribing..." is skipped rather than shown after the fact.
         let lines = crate::interface::test_terminal::lines();
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line.as_str() == "Thinking...")
-                .count(),
-            1,
-            "{lines:?}"
-        );
         assert_eq!(
             lines,
             [
                 "Listening...",
-                "Thinking...",
-                "You: what is on the fridge",
                 "Photo captured. 1 photo attached.",
+                "You: what is on the fridge",
+                "Asking the local model...",
                 "Independence: a fridge answer",
                 "Ready. Hold ENTER to speak.",
             ]
@@ -3777,7 +3802,6 @@ mod tests {
             crate::interface::test_terminal::lines(),
             [
                 "Listening...",
-                "Thinking...",
                 "Recording too short. Hold ENTER while you speak.",
                 "Ready. Hold ENTER to speak.",
             ]
@@ -3839,9 +3863,13 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|line| line.as_str() == "Thinking...")
+                .filter(|line| line.as_str() == "Transcribing...")
                 .count(),
             1
+        );
+        assert!(
+            !lines.iter().any(|line| line == "Asking the local model..."),
+            "a failed photo never reaches the model: {lines:?}"
         );
         assert_eq!(
             lines

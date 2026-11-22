@@ -101,7 +101,8 @@ text:
 audio. It is guidance for the person, not a device failure, and Whisper is not
 run.
 
-"Listening..." and "Thinking..." are terminal status lines and are never
+"Listening...", "Transcribing...", and "Asking the local model..." are
+terminal status lines and are never
 spoken. A failed live partial transcription (laptop only) is recorded as the
 diagnostic event `partial_transcription_failed` and is not shown in the
 terminal, because it does not affect the final transcript.

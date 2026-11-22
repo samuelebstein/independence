@@ -288,10 +288,8 @@ pub fn voice_status(message: &str) {
         "ready — hold enter to start recording/transcription" => {
             status("Ready. Hold ENTER to speak.")
         }
-        "microphone released; finishing local transcription" => status("Thinking..."),
-        // Release is the moment the person stops talking; "Thinking..." is
-        // shown once here and not repeated by later processing steps.
-        "recording released; waiting for microphone cleanup" => status("Thinking..."),
+        "transcribing — whisper is running on the recording" => status("Transcribing..."),
+        "model request started" => status("Asking the local model..."),
         "recording released; waiting for direct audio backend" => status("Thinking..."),
         "discarding recording and releasing microphone" => status("Cancelling recording..."),
         "draft cancelled"

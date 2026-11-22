@@ -33,8 +33,9 @@ discarded when the process ends.
 
 Milestone 7 makes the Pi voice loop reliable and starts it immediately.
 Ephemeral Mode begins at launch (no five-second hold, no `--mode` option), and
-pressing ENTER opens the microphone at once: "Listening..." and "Thinking..."
-are screen status only, never spoken. The microphone callback now hands audio
+pressing ENTER opens the microphone at once: status lines such as
+"Listening...", "Transcribing...", and "Asking the local model..." are shown
+on screen only, never spoken. The microphone callback now hands audio
 to the recording thread through a lock-free ring buffer, and the Hailo Pi
 profile no longer re-transcribes while you hold ENTER, so releasing during a
 photo capture no longer loses the recording; the turn waits for the photo and

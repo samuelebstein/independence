@@ -117,7 +117,8 @@ while recording and the camera is running. In both, the final accepted
 transcript is the submitted text.
 
 Pressing Talk/ENTER opens the microphone immediately. "Listening..." and
-"Thinking..." are terminal status lines and diagnostic events only; nothing is
+"Transcribing..." / "Asking the local model..." are terminal status lines and
+diagnostic events only; nothing is
 synthesized or played for them. Releasing Talk/ENTER while a requested photo
 is still being captured finishes the recording normally; the turn waits for the
 photo and then sends the transcript and photo together. If that capture fails,

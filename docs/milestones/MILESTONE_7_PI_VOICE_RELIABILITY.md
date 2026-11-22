@@ -345,8 +345,18 @@ in §11.
 - R6 follow-up from the first Pi run (2026-11-22): releasing during a photo
   printed "Thinking..." a second time after the transcript, because the model
   dispatch printed it again once "Photo captured" had become the last status.
-  Voice mode now prints "Thinking..." only on release; covered by
-  `terminal_shows_thinking_once_when_release_comes_before_the_photo`.
+  Voice mode prints "Thinking..." only once.
+- R6 follow-up from the second Pi run: releasing during a photo still printed
+  "Thinking..." before "Photo captured". Now "Thinking..." waits until no
+  requested photo is pending, and "You: ..." is printed when the request is
+  actually sent. Owner then asked to split the processing status: voice mode
+  now shows "Transcribing..." while Whisper runs and "Asking the local
+  model..." when the request goes to the model (typed mode keeps
+  "Thinking..."). Order: Listening → Photo captured → Transcribing → You →
+  Asking the local model → Independence → Ready. "Transcribing..." is
+  skipped if Whisper already finished while a photo was pending, and never
+  shown for a too-short recording. Covered by the `terminal_*` tests,
+  including `terminal_keeps_photo_first_when_release_comes_before_the_photo`.
 - R9: `scripts/run-raspberry-pi-hailo.sh` with env-overridable defaults,
   pre-flight checks (binary, model, Hailo Apps, bridge Python, Piper/voice,
   button device, curl, camera), refusal when the bridge port is already in

@@ -470,8 +470,9 @@ and asks you to try the photo again; it will not present a text-only answer as
 visual analysis.
 
 A capture takes about 1.5 seconds on the Pi. You can release ENTER right after
-pressing `P`: the recording finishes normally, "Thinking..." appears, and the
-request waits for the photo before it is sent with your question. Each new
+pressing `P`: the recording finishes normally and the request waits for the
+photo before it is sent with your question. "Photo captured" always appears
+before "Transcribing..." and "Asking the local model...". Each new
 question can have its own photo; there is no one-photo-per-session limit.
 
 The Hailo Apps test remains a deliberately temporary upstream edit, not the

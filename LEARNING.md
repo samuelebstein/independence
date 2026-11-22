@@ -167,7 +167,8 @@ Status changes are never spoken. Until Milestone 7 the worker spoke fixed
 `i'm listening` / `i'm thinking` cues through Piper, and the microphone waited
 for the listening cue to finish: on the Pi that cost 0.7–2.5 seconds per press
 and cut off the start of what people said. Now "Listening..." and
-"Thinking..." are terminal status lines and diagnostic events, and Piper speaks
+"Transcribing..." / "Asking the local model..." are terminal status lines and
+diagnostic events, and Piper speaks
 only accepted answers and fixed error notices. Piper itself is used through
 its documented CLI rather than reimplemented in Rust; Rodio provides
 output-device access and WAV decoding/playback. Our code owns queue ordering,
@@ -448,7 +449,8 @@ list names a different desired output, rerun it with `--audio-output 'Exact id'`
 
 For `--voice`, hold Enter and start asking “What is the primary gas in Earth's
 atmosphere?” right away; then release Enter. **Listening...** appears on press,
-**Thinking...** on release, then the transcript once, the answer, and finally
+**Transcribing...** while Whisper works, then the transcript once, **Asking the
+local model...** while the model answers, the answer, and finally
 **Ready. Hold ENTER to speak.** Repeat while pressing `P` once after capture
 begins; release immediately afterwards and the turn should wait for the photo
 and send both. Tap Enter briefly: you should see “Recording too short.” While an
@@ -836,8 +838,12 @@ fix was not a new feature but removing contention and waiting:
   `--mode` is gone, and pressing ENTER opens the microphone at once because
   there are no spoken cues to wait for.
 - **One line per event, in order.** `Listening...` → (`Photo captured...`) →
-  `Thinking...` → `You: ...` → `Independence: ...` → `Ready. Hold ENTER to
-  speak.` "Ready" now waits for the answer or failure.
+  `Transcribing...` → `You: ...` → `Asking the local model...` →
+  `Independence: ...` → `Ready. Hold ENTER to speak.` The two processing
+  stages are named separately so you can see which one you are waiting on
+  (on the Pi, Whisper takes about 2 s and the model 15–25 s). If you release
+  during a photo and Whisper finishes first, "Transcribing..." is skipped
+  rather than shown late. "Ready" waits for the answer or failure.
 
 - **One command on the Pi.** `scripts/run-raspberry-pi-hailo.sh` checks
   every file and device first, starts the bridge in the background, waits for

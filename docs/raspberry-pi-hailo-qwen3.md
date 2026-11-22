@@ -3,8 +3,8 @@
 Use this on a fresh Raspberry Pi OS card after [first boot](raspberry-pi.md).
 It installs one consistent HailoRT 5.3 stack, proves the Hailo-10H is visible,
 downloads the Qwen3-VL-2B-Instruct HEF, and proves one local image request.
-It does **not** claim that the current Independence Qwen2 bridge can serve
-Qwen3.
+It now includes the migrated Independence Qwen3 bridge path after the
+standalone acceptance test.
 
 ## Overview
 
@@ -348,31 +348,83 @@ Qwen2 size or send multiple photos.
 Hailo-Ollama is intentionally not part of this path: Hailo documents its
 Ollama-compatible REST API as LLM-only, not usable for vision-language models.
 
-## 5. What to do after the standalone test
+## 5. Use the migrated Qwen3 bridge
 
 After Gates 1–3, the Pi has a matching host stack, the model file, and proof
-that Qwen3 generated a response from one image. Do **not** point the existing
-commands below at the new HEF:
+that Qwen3 generated a response from one image. The Independence bridge now
+uses the same Qwen3 implementation: direct BGR-to-RGB conversion, resize to
+512 × 288, the Hailo Apps prompt structure, and `generate_all` with the smoke
+test's generation parameters.
 
 ```bash
 scripts/run_pi_hailo_vlm_bridge.sh
 tools/hailo_vlm_bridge.py
 ```
 
-They are current Qwen2-only code: they preprocess square 336 × 336 images and
-accept up to four images. Overriding `HAILO_VLM_HEF` there would be a misleading
-test, not a Qwen3 deployment.
+Start the bridge with the explicit Qwen3 HEF:
 
-The next work is a small, explicit Qwen3 adapter milestone: load this exact
-HEF through the Hailo Python API, resize one photo to 512 × 288 RGB, use the
-model's prompt contract, prove one bundled non-personal image, and then expose
-its actual capabilities to Independence (`vision`, `max_images=1`, and
-`video=false`). That work needs an owner-approved implementation plan and a
-real-device test before it replaces the working Qwen2 path.
+```bash
+HAILO_VLM_HEF="$QWEN3_VL_HEF" \
+  HAILO_APPS_DIR="$HOME/code/hailo-apps-26.03.1" \
+  HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
+  scripts/run_pi_hailo_vlm_bridge.sh
+```
 
-The Hailo Apps test is a deliberately temporary upstream edit, not the
-Independence implementation. The backup/restore step keeps its working tree
-clean; do not make the changed file a permanent local fork.
+It serves `qwen3-vl:2b-instruct` on loopback port `11435`, advertises vision,
+and rejects requests containing more than one image. The existing Rust camera
+permission and JPEG transport remain in use. `HAILO_VLM_PYTHON` points at the
+same dedicated environment that passed the standalone Qwen3 smoke test; this
+avoids requiring Hailo Apps' separate optional `venv_hailo_apps` environment.
+
+The smoke-test generation settings are startup-configurable. Defaults remain
+`temperature=0.1`, `seed=42`, and `max-generated-tokens=200`:
+
+```bash
+HAILO_VLM_HEF="$QWEN3_VL_HEF" \
+  HAILO_APPS_DIR="$HOME/code/hailo-apps-26.03.1" \
+  HAILO_VLM_PYTHON="$HOME/.venvs/hailo-qwen3-smoke/bin/python" \
+  scripts/run_pi_hailo_vlm_bridge.sh \
+  --temperature 0.2 --seed 42 --max-generated-tokens 128
+```
+
+Temperature must be greater than `0` and at most `2`; token count must be positive. These values
+affect generation only and are reported nowhere with prompt or image content.
+
+### Health, errors, and one-photo behavior
+
+The bridge is ready only after the HEF and Hailo device initialize. In the
+bridge terminal, `Health: ... status: ready` confirms startup. Check it from a
+second terminal without sending a photograph:
+
+```bash
+curl --silent --show-error --include http://127.0.0.1:11435/healthz
+```
+
+The response is HTTP 200 with `"status":"ready"` when healthy. This is a
+last-known runtime health state: a device that fails while idle is detected on
+the next generation request. A failed Hailo generation
+changes the response to HTTP 503 with `"status":"degraded"`; the bridge
+terminal prints the bounded failure reason. The next successful generation
+prints a recovery message and returns health to `ready`. The Rust application
+also displays the HTTP status, failure code, health state, and bounded local
+reason; in voice mode Piper speaks a fixed “check the Hailo bridge” notice, not
+the raw backend diagnostic.
+
+`BrokenPipeError` is not a Hailo inference failure. It means Independence (or a
+manual client) cancelled or timed out after generation began and closed the
+loopback connection before the response was written. The bridge now reports
+this as a client disconnect and does not mark the model unhealthy.
+
+Qwen3 accepts one photograph per request. Pressing `P` after a photo has already
+been captured is rejected, and a photo captured in a new request replaces the
+previous accepted photo instead of being appended to it. If an explicitly
+requested photo cannot be captured, Independence sends **no** text-only request
+and asks you to try the photo again; it will not present a text-only answer as
+visual analysis.
+
+The Hailo Apps test remains a deliberately temporary upstream edit, not the
+Independence implementation. Restore that source file after the smoke test;
+the migrated bridge contains the Qwen3-specific implementation locally.
 
 ## Sources
 

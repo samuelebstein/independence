@@ -1,9 +1,8 @@
-# Raspberry Pi AI HAT+ 2: Qwen2-VL bridge (current working path)
+# Raspberry Pi AI HAT+ 2: Qwen3-VL bridge
 
-This is the implemented Independence Hailo path: Hailo-10H, Hailo Apps,
-Qwen2-VL, and one loopback Python bridge. It deliberately uses the Raspberry
-Pi repository's 5.1 Hailo stack and does **not** use Hailo-Ollama to serve
-vision.
+This document describes the original Qwen2/5.1 procedure and is retained only
+as historical reference. Use the [Qwen3 guide](raspberry-pi-hailo-qwen3.md)
+for the supported Hailo-10H path; do not run the Qwen2 commands below.
 
 For a fresh-card HailoRT 5.3/Qwen3 setup, use
 [the separate Qwen3 guide](raspberry-pi-hailo-qwen3.md). Do not combine the

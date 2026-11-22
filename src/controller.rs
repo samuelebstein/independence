@@ -65,14 +65,14 @@ struct TextTurn {
 
 /// The only ways a successful answer may affect accepted image context.
 ///
-/// A worker cannot mutate session state. For an appended voice batch, the
-/// photos are already validated before the turn starts, so the controller can
-/// retain the exact proposed vector here until it accepts the answer.
+/// A worker cannot mutate session state. A newly captured voice photo replaces
+/// the prior visual scene. Qwen3-VL accepts one photograph per request, so the
+/// controller never builds a multi-image context.
 #[derive(Debug)]
 enum SceneCommit {
     Unchanged,
     ReplaceWithWorkerPhoto,
-    AppendKnown(Vec<Photo>),
+    ReplaceKnown(Vec<Photo>),
 }
 
 #[derive(Debug)]
@@ -151,7 +151,7 @@ impl Controller {
         self.session.photos.last()
     }
 
-    /// All accepted photos in the order follow-up model requests use them.
+    /// The one accepted photo used by follow-up model requests, when present.
     pub fn accepted_photos(&self) -> &[Photo] {
         &self.session.photos
     }
@@ -180,12 +180,16 @@ impl Controller {
                     );
                 }
 
-                let mut accepted_and_new = self.session.photos.clone();
-                accepted_and_new.extend(photos);
+                if photos.len() > 1 {
+                    return vec![Effect::Display(Output::Diagnostic(
+                        "Qwen3 accepts one photo per request; no multi-photo request was sent. Start a new request with one photo.".into(),
+                    ))];
+                }
+
                 self.start_turn(
                     question,
-                    VisualRequest::UseAccepted(accepted_and_new.clone()),
-                    SceneCommit::AppendKnown(accepted_and_new),
+                    VisualRequest::UseAccepted(photos.clone()),
+                    SceneCommit::ReplaceKnown(photos),
                 )
             }
             Input::AskAudio {
@@ -242,8 +246,10 @@ impl Controller {
         // preflight stale before it can supersede anything.
         self.pending_camera = None;
 
-        if !matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto)
-            && self.session.history.len() >= MAX_HISTORY_TURNS
+        if !matches!(
+            scene_commit,
+            SceneCommit::ReplaceWithWorkerPhoto | SceneCommit::ReplaceKnown(_)
+        ) && self.session.history.len() >= MAX_HISTORY_TURNS
         {
             let restart = match self.mode {
                 OperatingMode::Ephemeral => "/reset to start a new temporary session",
@@ -263,7 +269,10 @@ impl Controller {
 
         // A new photograph begins a prospective new scene, so it must not
         // inherit conversations that describe the old scene.
-        let history = if matches!(scene_commit, SceneCommit::ReplaceWithWorkerPhoto) {
+        let history = if matches!(
+            scene_commit,
+            SceneCommit::ReplaceWithWorkerPhoto | SceneCommit::ReplaceKnown(_)
+        ) {
             Vec::new()
         } else {
             self.session.history.clone()
@@ -468,12 +477,13 @@ impl Controller {
                 self.session.photos = vec![scene];
                 self.session.history.clear();
             }
-            (SceneCommit::AppendKnown(photos), None) => {
+            (SceneCommit::ReplaceKnown(photos), None) => {
                 self.session.photos = photos;
+                self.session.history.clear();
             }
             (SceneCommit::Unchanged, None) => {}
             (SceneCommit::ReplaceWithWorkerPhoto, None)
-            | (SceneCommit::AppendKnown(_), Some(_))
+            | (SceneCommit::ReplaceKnown(_), Some(_))
             | (SceneCommit::Unchanged, Some(_)) => {
                 return vec![Effect::Display(Output::Diagnostic(
                     "worker returned an inconsistent scene result; no answer was accepted".into(),
@@ -789,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_photos_append_in_order_only_after_the_answer_is_accepted() {
+    fn voice_photo_replaces_the_previous_scene_and_never_builds_multi_image_context() {
         let mut controller = Controller::new_private_for_test();
         let existing = Photo::test_photo("existing.png");
         let first = start_look(&mut controller, "existing.png", "what is this?");
@@ -800,12 +810,11 @@ mod tests {
             Some(existing),
         );
 
-        let attached_first = Photo::test_photo("attached-first.png");
-        let attached_second = Photo::test_photo("attached-second.png");
+        let attached = Photo::test_photo("attached.png");
         let request = controller
             .handle(Event::Input(Input::AskWithPhotos {
-                question: "compare these".into(),
-                photos: vec![attached_first, attached_second],
+                question: "what is this now?".into(),
+                photos: vec![attached],
             }))
             .into_iter()
             .find_map(|effect| match effect {
@@ -814,7 +823,7 @@ mod tests {
             })
             .expect("voice photos should start one turn");
 
-        assert_eq!(request.history.len(), 1);
+        assert!(request.history.is_empty());
         assert!(matches!(
             request.visual,
             VisualRequest::UseAccepted(ref photos)
@@ -822,27 +831,41 @@ mod tests {
                     .iter()
                     .map(|photo| photo.path().map(|path| path.to_path_buf()))
                     .collect::<Vec<_>>() == vec![
-                    Some(PathBuf::from("existing.png")),
-                    Some(PathBuf::from("attached-first.png")),
-                    Some(PathBuf::from("attached-second.png")),
+                    Some(PathBuf::from("attached.png")),
                 ]
         ));
         assert_eq!(controller.accepted_photos().len(), 1);
 
-        successful_answer(&mut controller, request.id, "a comparison", None);
-        assert_eq!(controller.accepted_history().len(), 2);
+        successful_answer(&mut controller, request.id, "a new scene", None);
+        assert_eq!(controller.accepted_history().len(), 1);
         assert_eq!(
             controller
                 .accepted_photos()
                 .iter()
                 .map(|photo| photo.path().map(|path| path.to_path_buf()))
                 .collect::<Vec<_>>(),
-            vec![
-                Some(PathBuf::from("existing.png")),
-                Some(PathBuf::from("attached-first.png")),
-                Some(PathBuf::from("attached-second.png")),
-            ]
+            vec![Some(PathBuf::from("attached.png"))]
         );
+    }
+
+    #[test]
+    fn controller_rejects_multi_photo_voice_requests_before_starting_inference() {
+        let mut controller = Controller::new_ephemeral();
+        let effects = controller.handle(Event::Input(Input::AskWithPhotos {
+            question: "compare these".into(),
+            photos: vec![
+                Photo::test_photo("first.png"),
+                Photo::test_photo("second.png"),
+            ],
+        }));
+
+        assert_eq!(
+            effects,
+            vec![Effect::Display(Output::Diagnostic(
+                "Qwen3 accepts one photo per request; no multi-photo request was sent. Start a new request with one photo.".into(),
+            ))]
+        );
+        assert!(!controller.has_active_turn());
     }
 
     #[test]

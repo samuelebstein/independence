@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -19,6 +21,9 @@ from tools.hailo_vlm_bridge import (  # noqa: E402
     BridgeApplication,
     BridgeConfig,
     BridgeHttpServer,
+    BridgeRequestHandler,
+    BridgeResponse,
+    BackendInferenceError,
     HailoVlmBackend,
     MAX_IMAGES,
     SafeTelemetry,
@@ -44,7 +49,7 @@ class HailoVlmBridgeTests(unittest.TestCase):
         self.config = BridgeConfig(
             host="127.0.0.1",
             port=11435,
-            model="qwen2-vl:2b",
+            model="qwen3-vl:2b-instruct",
             hef_path=Path("/not-used-by-fake.hef"),
             max_generated_tokens=200,
         )
@@ -61,15 +66,90 @@ class HailoVlmBridgeTests(unittest.TestCase):
         show = application.handle(
             "POST",
             "/api/show",
-            json.dumps({"model": "qwen2-vl:2b"}).encode(),
+            json.dumps({"model": "qwen3-vl:2b-instruct"}).encode(),
         )
         health = application.handle("GET", "/healthz")
 
         self.assertEqual(show.status, 200)
         self.assertEqual(show.body["capabilities"], ["vision"])
         self.assertEqual(health.status, 200)
+        self.assertEqual(health.body["status"], "ready")
         self.assertEqual(health.body["endpoint"], "http://127.0.0.1:11435")
-        self.assertEqual(health.body["model"], "qwen2-vl:2b")
+        self.assertEqual(health.body["model"], "qwen3-vl:2b-instruct")
+
+    def test_backend_failure_marks_health_degraded_and_exposes_bounded_reason(self) -> None:
+        class FailingBackend(FakeBackend):
+            def generate(self, prompt: list[dict[str, object]], images: list[bytes]) -> str:
+                raise BackendInferenceError(
+                    "Hailo VLM inference failed",
+                    "hailo_inference_failed",
+                    "RuntimeError: device queue stopped",
+                )
+
+        application = BridgeApplication(
+            self.config,
+            FailingBackend(),
+            SafeTelemetry(None),
+        )
+        request = {
+            "model": "qwen3-vl:2b-instruct",
+            "stream": False,
+            "messages": [{"role": "user", "content": "look", "images": []}],
+        }
+
+        response = application.handle("POST", "/api/chat", json.dumps(request).encode())
+        health = application.handle("GET", "/healthz")
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(response.body["code"], "hailo_inference_failed")
+        self.assertEqual(response.body["health"], "degraded")
+        self.assertIn("device queue stopped", response.body["error"])
+        self.assertEqual(health.status, 503)
+        self.assertEqual(health.body["status"], "degraded")
+        self.assertEqual(health.body["error_code"], "hailo_inference_failed")
+
+        show = application.handle(
+            "POST",
+            "/api/show",
+            json.dumps({"model": "qwen3-vl:2b-instruct"}).encode(),
+        )
+        self.assertEqual(show.status, 503)
+        self.assertEqual(show.body["health"], "degraded")
+
+    def test_successful_generation_recovers_degraded_health(self) -> None:
+        application = self.app()
+        application._health.mark_failure(  # type: ignore[attr-defined]
+            BackendInferenceError("Hailo VLM inference failed", "hailo_inference_failed", "device stopped")
+        )
+        request = {
+            "model": "qwen3-vl:2b-instruct",
+            "stream": False,
+            "messages": [{"role": "user", "content": "look", "images": []}],
+        }
+
+        response = application.handle("POST", "/api/chat", json.dumps(request).encode())
+        health = application.handle("GET", "/healthz")
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(health.status, 200)
+        self.assertEqual(health.body["status"], "ready")
+
+    def test_client_disconnect_during_response_is_logged_without_traceback(self) -> None:
+        class DisconnectedWriter:
+            def write(self, _body: bytes) -> int:
+                raise BrokenPipeError("client closed the loopback socket")
+
+        handler = object.__new__(BridgeRequestHandler)
+        handler.wfile = DisconnectedWriter()  # type: ignore[assignment]
+        handler.send_response = lambda _status: None  # type: ignore[method-assign]
+        handler.send_header = lambda _name, _value: None  # type: ignore[method-assign]
+        handler.end_headers = lambda: None  # type: ignore[method-assign]
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            handler._respond(BridgeResponse(200, {"status": "ready"}))
+
+        self.assertIn("client disconnected before the response was sent", stderr.getvalue())
 
     def test_server_host_matches_independence_loopback_policy(self) -> None:
         self.assertEqual(_loopback_host("127.0.0.1"), "127.0.0.1")
@@ -84,7 +164,7 @@ class HailoVlmBridgeTests(unittest.TestCase):
         config = BridgeConfig(
             host="127.0.0.1",
             port=0,
-            model="qwen2-vl:2b",
+            model="qwen3-vl:2b-instruct",
             hef_path=Path("/not-used-by-fake.hef"),
             max_generated_tokens=200,
         )
@@ -97,7 +177,7 @@ class HailoVlmBridgeTests(unittest.TestCase):
         try:
             request = Request(
                 f"http://127.0.0.1:{server.server_port}/api/show",
-                data=json.dumps({"model": "qwen2-vl:2b"}).encode(),
+                data=json.dumps({"model": "qwen3-vl:2b-instruct"}).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -111,18 +191,18 @@ class HailoVlmBridgeTests(unittest.TestCase):
 
         self.assertEqual(payload["capabilities"], ["vision"])
 
-    def test_chat_preserves_multiple_image_order_in_the_hailo_prompt(self) -> None:
+    def test_chat_preserves_one_image_in_the_qwen3_prompt(self) -> None:
         application = self.app()
         images = [f"in-memory image {index}".encode("ascii") for index in range(MAX_IMAGES)]
         request = {
-            "model": "qwen2-vl:2b",
+            "model": "qwen3-vl:2b-instruct",
             "stream": False,
             "messages": [
                 {"role": "system", "content": "local system instruction"},
                 {"role": "assistant", "content": "prior answer"},
                 {
                     "role": "user",
-                    "content": "compare these pictures",
+                    "content": "describe this picture",
                     "images": [base64.b64encode(image).decode("ascii") for image in images],
                 },
             ],
@@ -136,19 +216,13 @@ class HailoVlmBridgeTests(unittest.TestCase):
         self.assertEqual(len(self.backend.calls), 1)
         prompt, supplied_images = self.backend.calls[0]
         self.assertEqual(supplied_images, images)
-        self.assertEqual(
-            prompt[-1]["content"][:MAX_IMAGES],
-            [{"type": "image"}] * MAX_IMAGES,
-        )
-        self.assertEqual(
-            prompt[-1]["content"][MAX_IMAGES],
-            {"type": "text", "text": "compare these pictures"},
-        )
+        self.assertEqual(prompt[-1]["content"][0], {"type": "image"})
+        self.assertEqual(prompt[-1]["content"][1], {"type": "text", "text": "describe this picture"})
 
     def test_more_than_the_bounded_image_limit_is_rejected_without_inference(self) -> None:
         application = self.app()
         request = {
-            "model": "qwen2-vl:2b",
+            "model": "qwen3-vl:2b-instruct",
             "stream": False,
             "messages": [
                 {
@@ -181,9 +255,9 @@ class HailoVlmBridgeTests(unittest.TestCase):
                 self.frames: list[object] | None = None
                 self.cleared = False
 
-            def generate(self, **kwargs: object) -> FakeGeneration:
+            def generate_all(self, **kwargs: object) -> str:
                 self.frames = kwargs["frames"]  # type: ignore[assignment]
-                return FakeGeneration()
+                return "ordered frames<|im_end|>"
 
             def clear_context(self) -> None:
                 self.cleared = True
@@ -193,12 +267,14 @@ class HailoVlmBridgeTests(unittest.TestCase):
         backend._generation_lock = threading.Lock()
         backend._vlm = fake_vlm
         backend._max_generated_tokens = 200
+        backend._temperature = 0.1
+        backend._seed = 42
         backend._prepare_image = lambda image: f"frame:{image.decode('ascii')}"
 
-        answer = backend.generate([], [b"first", b"second"])
+        answer = backend.generate([], [b"first"])
 
         self.assertEqual(answer, "ordered frames")
-        self.assertEqual(fake_vlm.frames, ["frame:first", "frame:second"])
+        self.assertEqual(fake_vlm.frames, ["frame:first"])
         self.assertTrue(fake_vlm.cleared)
 
     def test_optional_telemetry_omits_prompt_image_and_answer_contents(self) -> None:
@@ -206,10 +282,10 @@ class HailoVlmBridgeTests(unittest.TestCase):
             telemetry_path = Path(temporary_directory) / "hailo-vlm.jsonl"
             application = self.app(telemetry_path)
             secret_question = "private spoken question should never be logged"
-            images = [b"private first image bytes", b"private second image bytes"]
+            images = [b"private first image bytes"]
             encoded_images = [base64.b64encode(image).decode("ascii") for image in images]
             request = {
-                "model": "qwen2-vl:2b",
+                "model": "qwen3-vl:2b-instruct",
                 "stream": False,
                 "messages": [
                     {"role": "user", "content": secret_question, "images": encoded_images}
@@ -226,7 +302,7 @@ class HailoVlmBridgeTests(unittest.TestCase):
             self.assertNotIn(encoded_image, logged)
         self.assertNotIn("a local answer", logged)
         self.assertEqual(event["event"], "hailo_vlm.api_call")
-        self.assertEqual(event["image_count"], 2)
+        self.assertEqual(event["image_count"], 1)
         self.assertEqual(event["image_bytes"], sum(len(image) for image in images))
         self.assertEqual(event["message_count"], 1)
 

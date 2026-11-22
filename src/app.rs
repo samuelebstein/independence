@@ -54,7 +54,7 @@ use crate::{
 const EVENT_CHANNEL_CAPACITY: usize = 32;
 const VOICE_AUX_CHANNEL_CAPACITY: usize = 64;
 const PARTIAL_TRANSCRIPTION_INTERVAL: Duration = Duration::from_millis(750);
-const MAX_QUEUED_PHOTO_CAPTURES: usize = 32;
+const MAX_QUEUED_PHOTO_CAPTURES: usize = 1;
 const MAX_DRAFT_PHOTO_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -104,11 +104,36 @@ impl OutputMode<'_> {
                     }
                 }
                 output => {
+                    let spoken_diagnostic = match &output {
+                        crate::protocol::Output::Diagnostic(message) => {
+                            voice_diagnostic_speech(message)
+                        }
+                        _ => None,
+                    };
                     speak::emit(output);
+                    if let Some(message) = spoken_diagnostic {
+                        // Keep Piper on a fixed, non-sensitive status phrase.
+                        // The detailed local diagnostic remains terminal-only.
+                        let _ = speech.say(speak::SpeechOwner::System, message);
+                    }
                     AnswerSpeechEmission::None
                 }
             },
         }
+    }
+}
+
+fn voice_diagnostic_speech(message: &str) -> Option<&'static str> {
+    if message.starts_with("local inference failed: ") {
+        if message.contains("Hailo VLM") || message.contains("health=degraded") {
+            Some("The local model could not complete that request. Check the Hailo bridge.")
+        } else {
+            Some("The local model could not complete that request. Check the local model service.")
+        }
+    } else if message.starts_with("could not capture camera: ") {
+        Some("The camera could not capture a photo. Check the camera and try again.")
+    } else {
+        None
     }
 }
 
@@ -1250,6 +1275,12 @@ impl VoiceDraft {
             .any(|photo| matches!(photo, DraftPhoto::Queued | DraftPhoto::Capturing))
     }
 
+    fn has_captured_photo(&self) -> bool {
+        self.photos
+            .values()
+            .any(|photo| matches!(photo, DraftPhoto::Captured(_)))
+    }
+
     fn captured_photos(&self) -> Vec<Photo> {
         self.photos
             .values()
@@ -1850,10 +1881,16 @@ impl VoiceRuntime {
             {
                 return;
             }
+            if draft.has_captured_photo() {
+                speak::voice_log(
+                    "photo capture request rejected — Qwen3 accepts one photo per request; release ENTER and start a new request for another photo",
+                );
+                return;
+            }
             if draft.pending_photo_count() >= MAX_QUEUED_PHOTO_CAPTURES {
-                speak::voice_log(&format!(
-                    "photo capture request rejected — {MAX_QUEUED_PHOTO_CAPTURES} captures are already waiting for the camera"
-                ));
+                speak::voice_log(
+                    "photo capture request rejected — one photo capture is already waiting for the camera",
+                );
                 return;
             }
 
@@ -2168,6 +2205,29 @@ impl VoiceRuntime {
     }
 
     async fn try_submit(&mut self) -> bool {
+        let failed_without_photo = self.draft.as_ref().is_some_and(|draft| {
+            draft.released
+                && draft.final_transcript.is_some()
+                && !draft.has_pending_photos()
+                && !draft.has_captured_photo()
+                && draft
+                    .photos
+                    .values()
+                    .any(|photo| matches!(photo, DraftPhoto::Failed))
+        });
+        if failed_without_photo {
+            if let Some(draft) = self.draft.take() {
+                draft.cancellation.cancel();
+                draft
+                    .interaction
+                    .complete("photo_capture_failed_no_request", telemetry::Fields::new());
+            }
+            speak::voice_log(
+                "photo capture failed — no local model request was sent; hold ENTER and try again",
+            );
+            return true;
+        }
+
         let submission = self.draft.as_mut().and_then(|draft| {
             if !draft.released
                 || draft.final_transcript.is_none()
@@ -2622,7 +2682,7 @@ mod tests {
 
     use super::{
         AppError, TurnRuntime, VoiceRuntime, enter_requested_ephemeral_mode,
-        finish_ephemeral_session, run_turn, run_voice_with_options,
+        finish_ephemeral_session, run_turn, run_voice_with_options, voice_diagnostic_speech,
     };
     use crate::launch::{ModelBackend, VoiceLaunchOptions, VoicePipeline};
     use crate::security::{OperatingMode, SecurityManager, SecurityState};
@@ -2650,6 +2710,21 @@ mod tests {
         assert!(matches!(error, AppError::PrivateModeUnavailable { .. }));
         assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), None);
+    }
+
+    #[test]
+    fn voice_model_failures_use_a_fixed_non_sensitive_spoken_notice() {
+        assert_eq!(
+            voice_diagnostic_speech(
+                "local inference failed: Hailo VLM inference failed [health=degraded]"
+            ),
+            Some("The local model could not complete that request. Check the Hailo bridge.")
+        );
+        assert_eq!(
+            voice_diagnostic_speech("local inference failed: HTTP 503"),
+            Some("The local model could not complete that request. Check the local model service.")
+        );
+        assert_eq!(voice_diagnostic_speech("camera capture failed"), None);
     }
 
     async fn within_test_timeout<T>(future: impl Future<Output = T>) -> T {
@@ -2976,15 +3051,6 @@ mod tests {
         let image = DynamicImage::new_rgb8(1, 1);
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, ImageFormat::Jpeg).unwrap();
-        bytes.into_inner()
-    }
-
-    fn tiny_colored_jpeg(red: u8, green: u8, blue: u8) -> Vec<u8> {
-        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([red, green, blue]));
-        let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgb8(image)
-            .write_to(&mut bytes, ImageFormat::Jpeg)
-            .unwrap();
         bytes.into_inner()
     }
 
@@ -3843,95 +3909,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_p_presses_submit_four_photos_in_press_order_with_one_request() {
+    async fn repeated_p_presses_keep_qwen3_voice_requests_to_one_photo() {
         let server = MockServer::start().await;
-        let camera = CameraDescriptor::new(CameraId::new(11), "Sequenced Camera");
-        let image_bytes = [
-            tiny_colored_jpeg(255, 0, 0),
-            tiny_colored_jpeg(0, 255, 0),
-            tiny_colored_jpeg(0, 0, 255),
-            tiny_colored_jpeg(255, 255, 0),
-        ];
-        let expected_images = image_bytes
-            .iter()
-            .map(|bytes| STANDARD.encode(bytes))
-            .collect::<Vec<_>>();
-        let photos = image_bytes
-            .iter()
-            .map(|bytes| {
-                Photo::from_camera_jpeg(
-                    CameraPhotoSource::new(camera.clone(), 1, 1, "MJPEG"),
-                    (*bytes).clone(),
-                )
-                .unwrap()
-            })
-            .collect::<VecDeque<_>>();
-        let captures = Arc::new(AtomicUsize::new(0));
-        let camera_service = CameraService::with_backend(Arc::new(SequencedCameraBackend {
-            camera,
-            photos: Mutex::new(photos),
-            captures: captures.clone(),
-        }));
-
         Mock::given(method("POST"))
             .and(path("/api/chat"))
-            .and(body_json(json!({
-                "model": "test-model",
-                "stream": false,
-                "messages": [
-                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
-                    {"role": "user", "content": "compare the four views", "images": expected_images.clone()}
-                ]
-            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "four-view answer"},
+                "message": {"role": "assistant", "content": "one-photo answer"},
                 "done": true,
                 "done_reason": "stop"
             })))
             .mount(&server)
             .await;
 
-        let mut harness = voice_harness(
-            &server,
-            ["compare the four views".to_owned()],
-            camera_service,
-        );
-        let recording_id = harness.start_hold().await;
-        for _ in 0..4 {
-            assert!(
-                harness
-                    .runtime
-                    .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
-                    .await
-            );
-        }
-        for _ in 0..4 {
-            let completion = harness.next_aux_event().await;
-            assert!(matches!(
-                &completion,
-                super::VoiceAuxEvent::PhotoCaptureFinished { result: Ok(_), .. }
-            ));
-            assert!(harness.runtime.handle_aux_event(completion).await);
-        }
-        assert_eq!(captures.load(Ordering::SeqCst), 4);
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(SequencedCameraBackend {
+            camera,
+            photos: Mutex::new(VecDeque::from([photo])),
+            captures: captures.clone(),
+        }));
 
-        assert_eq!(
-            harness.release_hold(recording_id).await,
-            "compare the four views"
-        );
-        harness.accept_next_answer().await;
-        assert_eq!(harness.runtime.controller.accepted_photos().len(), 4);
-        assert_eq!(
+        let mut harness = voice_harness(&server, ["describe this".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
             harness
                 .runtime
-                .controller
-                .accepted_photos()
-                .iter()
-                .map(|photo| STANDARD.encode(photo.bytes()))
-                .collect::<Vec<_>>(),
-            expected_images
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
         );
+        let completion = harness.next_aux_event().await;
+        assert!(matches!(
+            &completion,
+            super::VoiceAuxEvent::PhotoCaptureFinished { result: Ok(_), .. }
+        ));
+        assert!(harness.runtime.handle_aux_event(completion).await);
+
+        // A second P press is rejected after the first image is captured; it
+        // cannot become a second image in the eventual request.
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(harness.release_hold(recording_id).await, "describe this");
+        harness.accept_next_answer().await;
+        assert_eq!(harness.runtime.controller.accepted_photos().len(), 1);
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["messages"][1]["images"].as_array().unwrap().len(), 1);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_voice_photo_does_not_fall_back_to_a_text_only_request() {
+        let server = MockServer::start().await;
+        let (camera, photo) = fake_camera();
+        let captures = Arc::new(AtomicUsize::new(0));
+        let camera_service = CameraService::with_backend(Arc::new(FakeCameraBackend {
+            camera,
+            photo,
+            fail: true,
+            captures: captures.clone(),
+        }));
+        let mut harness = voice_harness(&server, ["what is here".to_owned()], camera_service);
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        let completion = harness.next_aux_event().await;
+        assert!(matches!(
+            &completion,
+            super::VoiceAuxEvent::PhotoCaptureFinished { result: Err(_), .. }
+        ));
+        assert!(harness.runtime.handle_aux_event(completion).await);
+
+        assert_eq!(harness.release_hold(recording_id).await, "what is here");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), harness.main_events.recv())
+                .await
+                .is_err(),
+            "a failed explicit photo must not submit a text-only model request"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

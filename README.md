@@ -1,5 +1,7 @@
 # Independence
 
+a computer that does not need 1) electricity from anything but its exterior solar shell or 2) the internet.
+
 Independence is a voice-first operating system for exploring the physical
 world. Read the [original vision](VISION.md) for the longer explanation of
 why it exists.

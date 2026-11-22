@@ -390,6 +390,53 @@ HAILO_VLM_HEF="$QWEN3_VL_HEF" \
 Temperature must be greater than `0` and at most `2`; token count must be positive. These values
 affect generation only and are reported nowhere with prompt or image content.
 
+### Start everything with one command
+
+After the setup above, start Independence on the Pi with:
+
+```bash
+cd "$HOME/code/independence"
+cargo build --release
+scripts/run-raspberry-pi-hailo.sh
+```
+
+The script checks the model file, Hailo Apps, bridge Python, Piper and the HAL
+voice, the button device, the release binary, and the camera
+(`rpicam-still --list-cameras`). Any missing piece stops it with one message
+naming the fix; a missing camera is fatal because this profile requires it.
+It refuses to start if something already listens on the bridge port (for
+example, a bridge left running in another terminal). It then starts the
+bridge in the background, waits for `/healthz` to report `ready`, and runs
+Independence in the foreground. Ctrl+C (or any exit) stops the bridge too.
+
+Logs go to `local-data/logs/hailo-bridge-<time>.log` and
+`local-data/logs/raspberry-pi-hailo-<time>.log` (diagnostics at
+`INDEPENDENCE_LOG=debug` by default; they contain timings and outcomes, not
+transcripts or answers, but review them before sharing).
+
+Every default can be overridden with an environment variable:
+
+| Variable | Default |
+| --- | --- |
+| `PI_BUTTON_DEVICE` | `/dev/input/event2` |
+| `PI_AUDIO_INPUT` / `PI_AUDIO_OUTPUT` | `alsa:plughw:CARD=Device,DEV=0` |
+| `BRIDGE_MAX_GENERATED_TOKENS` | `100` |
+| `BRIDGE_TEMPERATURE` | empty (bridge default `0.1`) |
+| `BRIDGE_READY_TIMEOUT_SECONDS` | `180` |
+| `HAILO_VLM_HEF` | `$HOME/models/hailo10h/Qwen3-VL-2B-Instruct.hef` |
+| `HAILO_APPS_DIR` | `$HOME/code/hailo-apps-26.03.1` |
+| `HAILO_VLM_PYTHON` | `$HOME/.venvs/hailo-qwen3-smoke/bin/python` |
+| `INDEPENDENCE_PIPER_COMMAND` | `$HOME/.local/share/independence/piper-venv/bin/piper` |
+| `INDEPENDENCE_TTS_MODEL` / `INDEPENDENCE_TTS_CONFIG` | `local-data/piper/hal/hal.onnx(.json)` |
+| `INDEPENDENCE_LOG` | `debug` |
+
+For example: `BRIDGE_TEMPERATURE=0.4 PI_BUTTON_DEVICE=/dev/input/event3 scripts/run-raspberry-pi-hailo.sh`.
+
+The bridge now treats SIGTERM like Ctrl+C, so it releases the Hailo device in
+an orderly way when the script stops it. Independence itself also requires a
+camera under this profile: run directly without one, it exits with the same
+fix-it message before opening the microphone.
+
 ### Health, errors, and one-photo behavior
 
 The bridge is ready only after the HEF and Hailo device initialize. In the

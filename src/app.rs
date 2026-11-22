@@ -162,7 +162,7 @@ pub async fn run() -> Result<(), AppError> {
 
     let result = async {
         let client = OllamaClient::from_environment()?;
-        discover_model_capabilities(&client).await;
+        discover_model_capabilities(&client, ModelBackend::Ollama).await;
         let (event_sender, mut event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         listen::spawn_stdin_reader(event_sender.clone()).map_err(AppError::InputAdapter)?;
 
@@ -237,7 +237,7 @@ fn finish_ephemeral_session(
 /// Obtains one cached `/api/show` record for the selected local model. A
 /// failed probe does not stop text-only startup, but leaves camera and any
 /// future direct-audio capability gated as explicitly unknown.
-async fn discover_model_capabilities(client: &OllamaClient) {
+async fn discover_model_capabilities(client: &OllamaClient, backend: ModelBackend) {
     match client.discover_capabilities().await {
         Ok(ModelCapabilities {
             image_input,
@@ -252,6 +252,15 @@ async fn discover_model_capabilities(client: &OllamaClient) {
                 image_input.label(),
                 audio_input.label(),
                 audio_output.label()
+            ),
+        ),
+        // Every Hailo request, text included, goes through the bridge, so an
+        // unreachable bridge must not be described as "text still works".
+        Err(error) if backend == ModelBackend::HailoVlm => speak::warning(
+            "hailo_bridge_unavailable",
+            format!(
+                "could not reach the Hailo bridge for `{}`: {error}",
+                client.model()
             ),
         ),
         Err(error) => speak::warning(
@@ -457,8 +466,15 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
         match (resolved.pipeline, resolved.backend) {
             (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama | ModelBackend::HailoVlm) => {
                 let client = configured_ollama_client(&resolved)?;
-                discover_model_capabilities(&client).await;
-                run_transcribe_and_speak(resolved, client).await
+                discover_model_capabilities(&client, resolved.backend).await;
+                let camera = camera_service_for(resolved.camera_backend);
+                if resolved.require_camera {
+                    // Checked before the microphone, speaker, or Whisper are
+                    // opened: on the Hailo Pi, a missing camera is a setup
+                    // fault to fix now, not something to discover on `P`.
+                    require_working_camera(&camera).await?;
+                }
+                run_transcribe_and_speak(resolved, client, camera).await
             }
             (VoicePipeline::TranscribeAndSpeak, backend) => Err(AppError::UnsupportedPipeline {
                 backend: backend.label(),
@@ -472,7 +488,7 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
                 let client = match backend {
                     ModelBackend::Ollama => {
                         let client = configured_ollama_client(&resolved)?;
-                        discover_model_capabilities(&client).await;
+                        discover_model_capabilities(&client, resolved.backend).await;
                         Some(client)
                     }
                     // The Hailo bridge is intentionally visual/text only in
@@ -501,6 +517,33 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     result
 }
 
+fn camera_service_for(selection: CameraBackendSelection) -> CameraService {
+    match selection {
+        CameraBackendSelection::V4l => CameraService::v4l(),
+        CameraBackendSelection::RpiCamStill => CameraService::rpicam(),
+    }
+}
+
+/// Lists cameras once and fails unless at least one is usable. Listing opens
+/// no stream and captures nothing (`rpicam-still --list-cameras` on the Pi).
+async fn require_working_camera(camera: &CameraService) -> Result<(), AppError> {
+    match camera.list().await {
+        Ok(cameras) if !cameras.is_empty() => {
+            speak::process(
+                "camera_ready",
+                format!("{} camera(s) detected", cameras.len()),
+            );
+            Ok(())
+        }
+        Ok(_) => Err(AppError::CameraRequired {
+            detail: "no camera was listed".into(),
+        }),
+        Err(error) => Err(AppError::CameraRequired {
+            detail: error.to_string(),
+        }),
+    }
+}
+
 /// Creates the strict local Ollama-compatible client only after runtime
 /// pipeline selection chose a compatible adapter. Profile resolution
 /// intentionally does not decide whether a model can perform the selected
@@ -519,6 +562,7 @@ fn configured_ollama_client(resolved: &ResolvedVoiceProfile) -> Result<OllamaCli
 async fn run_transcribe_and_speak(
     resolved: ResolvedVoiceProfile,
     client: OllamaClient,
+    camera: CameraService,
 ) -> Result<(), AppError> {
     let (main_event_sender, mut main_event_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (dictation_event_sender, mut dictation_event_receiver) =
@@ -586,14 +630,7 @@ async fn run_transcribe_and_speak(
     );
     let mut runtime = VoiceRuntime::new(
         Controller::new_ephemeral(),
-        TurnRuntime::new(
-            client,
-            match resolved.camera_backend {
-                CameraBackendSelection::V4l => CameraService::v4l(),
-                CameraBackendSelection::RpiCamStill => CameraService::rpicam(),
-            },
-            main_event_sender,
-        ),
+        TurnRuntime::new(client, camera, main_event_sender),
         dictation,
         voice_aux_sender,
         speech,
@@ -761,6 +798,11 @@ struct TurnRuntime {
     event_sender: mpsc::Sender<Event>,
     active: Option<RunningTurn>,
     pending_interaction: Option<Interaction>,
+    /// Whether starting a model request prints "Thinking...". Typed mode
+    /// needs it; voice mode already printed it when Talk/ENTER was released,
+    /// and printing it again would repeat it after the transcript (for
+    /// example when a late photo status line came in between).
+    announce_thinking: bool,
     /// Cancellation returns control immediately, but an already-running
     /// bounded V4L2 closure can still own the camera gate. These background
     /// monitors finish telemetry only after that app-owned resource is idle;
@@ -797,6 +839,7 @@ impl TurnRuntime {
             event_sender,
             active: None,
             pending_interaction: None,
+            announce_thinking: true,
             cleanup_tasks: Vec::new(),
         }
     }
@@ -906,7 +949,9 @@ impl TurnRuntime {
         }
         // A model request has been authorized and is about to begin. This is
         // deliberately user-interface state, not a tracing message.
-        interface::status("Thinking...");
+        if self.announce_thinking {
+            interface::status("Thinking...");
+        }
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
         let client = self.client.clone();
@@ -1195,6 +1240,9 @@ impl VoiceRuntime {
         aux_sender: mpsc::Sender<VoiceAuxEvent>,
         speech: speak::SpeechService,
     ) -> Self {
+        let mut turns = turns;
+        // Voice mode owns its own "Thinking..." line, shown on release.
+        turns.announce_thinking = false;
         Self {
             controller,
             turns,
@@ -2370,6 +2418,11 @@ pub enum AppError {
     #[error("security lifecycle rejected the requested operation: {0}")]
     Security(#[source] SecurityError),
 
+    #[error(
+        "no working camera was found ({detail}). The raspberry-pi-hailo profile requires one: power off, reseat both ends of the camera ribbon, power on, and confirm with `rpicam-still --list-cameras`"
+    )]
+    CameraRequired { detail: String },
+
     #[error("could not start terminal input: {0}")]
     InputAdapter(#[source] io::Error),
 
@@ -2911,6 +2964,54 @@ mod tests {
         )
         .unwrap();
         (camera, photo)
+    }
+
+    struct EmptyCameraBackend;
+
+    impl CameraBackend for EmptyCameraBackend {
+        fn list(&self) -> Result<Vec<CameraDescriptor>, CameraError> {
+            Ok(Vec::new())
+        }
+
+        fn capture(
+            &self,
+            _camera: &CameraDescriptor,
+            _cancellation: &CancellationToken,
+        ) -> Result<Photo, CameraError> {
+            Err(CameraError::NoCameras)
+        }
+    }
+
+    #[tokio::test]
+    async fn required_camera_check_passes_only_when_a_camera_is_listed() {
+        assert!(
+            super::require_working_camera(&photo_camera()).await.is_ok(),
+            "a listed camera satisfies the requirement"
+        );
+
+        let empty = CameraService::with_backend(Arc::new(EmptyCameraBackend));
+        let error = super::require_working_camera(&empty)
+            .await
+            .expect_err("an empty camera list is fatal");
+        assert!(matches!(error, AppError::CameraRequired { .. }));
+        assert!(error.to_string().contains("rpicam-still --list-cameras"));
+
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let capture_calls = Arc::new(AtomicUsize::new(0));
+        let failing = CameraService::with_backend(Arc::new(UnexpectedCameraBackend {
+            list_calls: list_calls.clone(),
+            capture_calls: capture_calls.clone(),
+        }));
+        assert!(matches!(
+            super::require_working_camera(&failing).await,
+            Err(AppError::CameraRequired { .. })
+        ));
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            capture_calls.load(Ordering::SeqCst),
+            0,
+            "the startup check never captures a photo"
+        );
     }
 
     #[tokio::test]
@@ -3597,6 +3698,55 @@ mod tests {
                 "Thinking...",
                 "You: what is this",
                 "Independence: a photo answer",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_thinking_once_when_release_comes_before_the_photo() {
+        // Reproduces the Pi run: release during capture printed "Thinking...",
+        // then "Photo captured", then the transcript, then "Thinking..." again.
+        let server = MockServer::start().await;
+        mock_answer(&server, "a fridge answer").await;
+        let (camera_service, open_gate) = gated_camera(false);
+        let mut harness = voice_harness(
+            &server,
+            ["what is on the fridge".to_owned()],
+            camera_service,
+        );
+        crate::interface::test_terminal::start();
+
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        let _ = harness.release_hold(recording_id).await;
+        open_gate.send(()).unwrap();
+        let photo_finished = harness.next_aux_event().await;
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        harness.accept_next_answer().await;
+
+        let lines = crate::interface::test_terminal::lines();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.as_str() == "Thinking...")
+                .count(),
+            1,
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines,
+            [
+                "Listening...",
+                "Thinking...",
+                "You: what is on the fridge",
+                "Photo captured. 1 photo attached.",
+                "Independence: a fridge answer",
                 "Ready. Hold ENTER to speak.",
             ]
         );

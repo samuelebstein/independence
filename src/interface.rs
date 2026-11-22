@@ -116,6 +116,9 @@ fn operational_warning_message(event: &str) -> &'static str {
         | "audio_to_audio_input_lost" => {
             "The selected button input is unavailable. Check its connection and permissions, then try again."
         }
+        "hailo_bridge_unavailable" => {
+            "The Hailo bridge is not reachable or not ready, so no questions can be answered. Start it (scripts/run-raspberry-pi-hailo.sh does this for you), then restart Independence."
+        }
         "ollama_model_capabilities_unknown" => {
             "The model's capabilities could not be checked. Text chat is available, but camera and direct voice features are unavailable."
         }

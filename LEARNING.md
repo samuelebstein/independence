@@ -839,6 +839,19 @@ fix was not a new feature but removing contention and waiting:
   `Thinking...` → `You: ...` → `Independence: ...` → `Ready. Hold ENTER to
   speak.` "Ready" now waits for the answer or failure.
 
+- **One command on the Pi.** `scripts/run-raspberry-pi-hailo.sh` checks
+  every file and device first, starts the bridge in the background, waits for
+  `/healthz`, runs Independence, and stops the bridge on any exit. A
+  background process started by a script ignores Ctrl+C, so the script stops
+  the bridge with SIGTERM, which the bridge now handles like Ctrl+C.
+- **The camera is required on the Hailo Pi.** Both the script and
+  Independence exit with a clear message when `rpicam-still --list-cameras`
+  finds nothing, instead of failing later when you press `P`.
+
+Answers are deliberately *not* post-processed: a looping or cut-off answer is
+shown exactly as the model produced it, so the problem stays visible and gets
+fixed at its source (prompt, token cap, temperature).
+
 Releasing during a photo already waited for the photo in code
 (`VoiceRuntime::try_submit`); the recording was simply failing first. Tests now
 pin that behavior down with a camera that blocks until the test releases it.

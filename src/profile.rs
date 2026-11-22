@@ -87,6 +87,9 @@ pub(crate) struct ResolvedVoiceProfile {
     /// Whether Whisper re-transcribes the recording while Talk/ENTER is still
     /// held, for live display. The final transcript is always produced.
     pub live_partial_transcription: bool,
+    /// Whether voice startup fails when no camera can be listed. The Hailo Pi
+    /// is a camera device; the laptop and text-only Pi profile are not.
+    pub require_camera: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -136,6 +139,7 @@ struct ProfileDefaults {
     backend: ModelBackend,
     camera_backend: CameraBackendSelection,
     live_partial_transcription: bool,
+    require_camera: bool,
 }
 
 fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
@@ -146,6 +150,7 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
             backend: ModelBackend::Ollama,
             camera_backend: CameraBackendSelection::RpiCamStill,
             live_partial_transcription: true,
+            require_camera: false,
         },
         Some(HardwareProfile::RaspberryPiHailo) => ProfileDefaults {
             input: VoiceInputMode::Buttons,
@@ -156,6 +161,7 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
             // saturates the Pi's CPU alongside the camera, and was linked to
             // lost recordings. Only the final transcript is produced here.
             live_partial_transcription: false,
+            require_camera: true,
         },
         None => ProfileDefaults {
             input: VoiceInputMode::Terminal,
@@ -163,6 +169,7 @@ fn defaults_for(profile: Option<HardwareProfile>) -> ProfileDefaults {
             backend: ModelBackend::Ollama,
             camera_backend: CameraBackendSelection::V4l,
             live_partial_transcription: true,
+            require_camera: false,
         },
     }
 }
@@ -275,6 +282,7 @@ fn resolve_with_environment(
         pipeline,
         backend,
         live_partial_transcription: defaults.live_partial_transcription,
+        require_camera: defaults.require_camera,
     })
 }
 
@@ -345,6 +353,10 @@ mod tests {
             !resolved.live_partial_transcription,
             "the Hailo Pi profile produces only the final transcript"
         );
+        assert!(
+            resolved.require_camera,
+            "the Hailo Pi profile needs its camera"
+        );
     }
 
     #[test]
@@ -355,6 +367,15 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.live_partial_transcription);
+        assert!(
+            !resolved.require_camera,
+            "a laptop may run voice without a camera"
+        );
+    }
+
+    #[test]
+    fn text_only_pi_profile_does_not_require_a_camera() {
+        assert!(!defaults_for(Some(HardwareProfile::RaspberryPi)).require_camera);
     }
 
     #[test]

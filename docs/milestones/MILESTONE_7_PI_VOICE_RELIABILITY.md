@@ -118,12 +118,46 @@ resolved profile is `raspberry-pi-hailo`.
     (R6) and as diagnostic events with timestamps, for verification.
   - Piper is used only for answers and existing fixed error notices.
 
+**Added 2026-11-22 after the first Pi run (owner-approved scope):**
+
+- **R9. One-command Pi launcher: `scripts/run-raspberry-pi-hailo.sh`.**
+  - Defaults for every path/device used so far (HEF, Hailo Apps, bridge
+    Python, Piper command/model/config, button device, microphone, speaker,
+    bridge generation settings), each overridable by an environment variable.
+  - Pre-flight: required files exist, button device exists, release binary
+    exists, and `rpicam-still --list-cameras` lists a camera. A missing camera
+    is fatal here, before the bridge spends time loading the model.
+  - Starts the Hailo bridge in the background, waits for `/healthz` to report
+    `ready` (bounded), then runs Independence in the foreground with
+    `--profile raspberry-pi-hailo`. Diagnostics and bridge output go to
+    timestamped files under `local-data/logs/`.
+  - **The bridge stops when Independence exits** (Ctrl+C, error, or normal
+    exit) — owner decision. If a bridge is already listening on the port, the
+    script refuses rather than reusing or killing a process it did not start.
+- **R11. Startup checks say what is actually unavailable.**
+  - For the `hailo-vlm` backend, a failed capability check says the Hailo
+    bridge is not reachable/ready (today's warning wrongly says text chat is
+    available).
+  - The `raspberry-pi-hailo` profile requires a working camera. At voice
+    startup Independence lists cameras once; if none is found (or listing
+    fails), it exits with a fatal error naming the fix (power off, reseat the
+    ribbon, check `rpicam-still --list-cameras`) before opening the microphone
+    or speaker. Other profiles are unchanged: the laptop and the text-only
+    `raspberry-pi` profile do not require a camera.
+
 Must be preserved: controller ownership of turns and photos, camera consent,
 one photo per request with replacement, cancellation semantics (Escape,
 new recording, shutdown), Ephemeral Mode, no transcript text in diagnostics,
 laptop behavior other than R1/R3/R5/R6.
 
 ## 4. Explicitly excluded work
+
+- Prompt/brevity and token-cap changes, temperature defaults, and
+  sentence-by-sentence speech (latency milestone).
+- Post-processing model answers (trimming cut-off sentences or repeated
+  text). Owner decision: it would hide model behavior that should be seen and
+  fixed at its source (prompt, token cap, temperature).
+- Keeping the bridge running between Independence runs (owner chose stop).
 
 - Other latency work (Appendix A): token cap defaults,
   voice-mode brevity prompt, sentence-by-sentence speech, bridge streaming,
@@ -308,6 +342,22 @@ in §11.
   "Ready" printed only when idle (after answer/failure); Escape prints
   "Cancelled." once; partial failures are diagnostics-only; startup prompt
   printed last.
+- R6 follow-up from the first Pi run (2026-11-22): releasing during a photo
+  printed "Thinking..." a second time after the transcript, because the model
+  dispatch printed it again once "Photo captured" had become the last status.
+  Voice mode now prints "Thinking..." only on release; covered by
+  `terminal_shows_thinking_once_when_release_comes_before_the_photo`.
+- R9: `scripts/run-raspberry-pi-hailo.sh` with env-overridable defaults,
+  pre-flight checks (binary, model, Hailo Apps, bridge Python, Piper/voice,
+  button device, curl, camera), refusal when the bridge port is already in
+  use, background bridge start with bounded `/healthz` wait, foreground
+  Independence with timestamped logs, and an EXIT trap that stops the bridge
+  (SIGTERM, then SIGKILL after 10 s). `tools/hailo_vlm_bridge.py` now treats
+  SIGTERM like Ctrl+C so the Hailo device is released in its `finally` block.
+- R11: `hailo_bridge_unavailable` warning replaces the misleading "text chat
+  is available" message for the `hailo-vlm` backend; `require_camera` profile
+  default (true only for `raspberry-pi-hailo`) makes voice startup fail with
+  `AppError::CameraRequired` before the microphone/speaker open.
 - R7: entry gesture, `EphemeralEntryGesture`, `--mode`, `run_with_mode`,
   `AppError::PrivateModeUnavailable` removed; `--mode` rejected with an
   explanation. `SecurityManager` lifecycle and `OperatingMode::Private` kept.
@@ -316,14 +366,23 @@ in §11.
 
 **Commands actually run (laptop, 2026-11-22):**
 
-- `cargo test` — 184 passed, 0 failed, 3 ignored (hardware checks).
+- `cargo test` — 187 passed, 0 failed, 3 ignored (hardware checks).
 - `cargo clippy --all-targets` — no warnings.
 - `cargo fmt --check` — clean.
 - `python3 -m unittest tools/tests/test_hailo_vlm_bridge.py
-  tools/tests/test_pi_hailo_shell_scripts.py` — 14 passed (`pytest` is not
-  installed on this laptop; bridge code is unchanged).
+  tools/tests/test_pi_hailo_shell_scripts.py` — 25 passed, including 10
+  launcher tests with a fake bridge, camera tool, and app (`pytest` and
+  `shellcheck` are not installed on this laptop).
 
-**Not yet tested:** everything in §9 on the Raspberry Pi — the `evtest` button
+**First Pi run (2026-11-22, 2 photo turns):** both completed; one released
+during capture and correctly waited for the photo; press → microphone open
+125 ms and 149 ms; no `failure_class` in the log; no transcript or answer text
+in diagnostics.
+
+**Not yet tested:** the launcher against the real bridge/HEF (actual model
+load time vs the 180 s default, SIGTERM release of the real Hailo device), the
+real `rpicam-still` output with and without a camera, and the rest of §9 on
+the Raspberry Pi — the `evtest` button
 check, the 15 scripted turns, real microphone/camera timing, and the
 press → `microphone.recording_started` ≤ 300 ms target. No release build or
 Pi build was run. The R3 fix is verified against a synthetic concurrent
@@ -340,6 +399,14 @@ microphone indicator (LED or short tone); the plain `raspberry-pi` profile
 still runs live partials (only `raspberry-pi-hailo` was in scope).
 
 ## 13. Owner decisions (recorded 2026-11-22)
+
+7. **Scope addition after the first Pi run:** add R9 (launcher) and R11
+   (startup camera/bridge checks). R10 (clean answer endings) was proposed and
+   rejected: answers are shown exactly as the model produced them, so model
+   problems stay visible.
+8. **Bridge lifetime:** the launcher stops the bridge when Independence exits.
+9. **Camera required on the Hailo Pi:** a missing camera is a fatal startup
+   error for `raspberry-pi-hailo` (launcher and application), not a warning.
 
 1. **Live partials on the Pi:** off for `raspberry-pi-hailo`; the final
    transcript satisfies the earlier transcription-logging request on the Pi.

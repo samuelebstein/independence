@@ -233,6 +233,8 @@ locked or encrypted. See [security/THREAT_MODEL.md](security/THREAT_MODEL.md).
 | --- | --- | --- | --- |
 | Interaction input | Crossterm raw-key terminal controls | Explicit selected Linux evdev keyboard used as buttons; no stdin reader; Ephemeral Mode starts at launch | Same physical-button adapter |
 | Live partial transcription | On while Talk is held | On | Off; final transcript only |
+| Camera at startup | Optional | Optional | Required: voice startup exits with a fix-it error if `rpicam-still --list-cameras` lists none |
+| Launcher | `cargo run -- --voice` | Direct binary | `scripts/run-raspberry-pi-hailo.sh` (pre-flight, bridge start/health/stop, logs) |
 | Microphone/output | CPAL/Rodio selected device or system default | Same libraries and device selectors; usually explicit USB device IDs | Same libraries and selectors |
 | Camera | V4L2 one-shot still capture | `rpicam-still` one-shot JPEG adapter | Same `rpicam-still` adapter; bridge allows up to four current images in capture order |
 | Default model runtime | local Ollama at `11434` | `gemma3:1b` for text-only experiments | Hailo VLM bridge at `127.0.0.1:11435`, alias `qwen2-vl:2b` |

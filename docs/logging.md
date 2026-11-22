@@ -72,6 +72,14 @@ jq -c 'select(.record_type == "interaction_summary") |
 Telemetry and diagnostic files are development artifacts. They are not
 encrypted, rotated, or an archive of conversations.
 
+## Pi launcher logs
+
+`scripts/run-raspberry-pi-hailo.sh` writes Independence diagnostics to
+`local-data/logs/raspberry-pi-hailo-<time>.log` (default level `debug`) and
+the Hailo bridge's own output to `local-data/logs/hailo-bridge-<time>.log`.
+The bridge log contains its startup/health messages and bounded failure
+reasons, not prompts, images, or answers.
+
 ## Voice capture outcomes
 
 Each voice recording reports how it ended through the

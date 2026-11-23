@@ -31,7 +31,20 @@ discarded when the process ends.
 
 ## Teach Sam About the Latest Milestone
 
-Milestone 7 makes the Pi voice loop reliable and starts it immediately.
+Milestone 8 attacks latency on the Hailo Pi. The model was already running at
+Hailo's advertised ~4.9 tokens/s; the wait came from what we asked of it. Voice
+answers now stream: each sentence is printed and spoken as soon as the model
+finishes it, with the next sentence synthesized while the current one plays.
+Escape or a new question stops the Hailo immediately instead of letting it
+finish an abandoned answer. Voice asks for one to three short sentences, a
+photo is sent only with the question that took it, the system prompt is loaded
+into the bridge once at startup instead of every turn, and Whisper processes a
+window sized to your question instead of 30 seconds. The bridge log now shows
+prompt tokens, time to first token, output tokens, and tokens/s for every
+question. See [the milestone](docs/milestones/MILESTONE_8_PI_VOICE_LATENCY.md)
+and [the learning notes](LEARNING.md#latest-milestone-where-the-pi-voice-latency-went-milestone-8).
+
+Milestone 7 made the Pi voice loop reliable and starts it immediately.
 Ephemeral Mode begins at launch (no five-second hold, no `--mode` option), and
 pressing ENTER opens the microphone at once: status lines such as
 "Listening...", "Transcribing...", and "Asking the local model..." are shown

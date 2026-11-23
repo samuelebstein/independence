@@ -275,6 +275,7 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         environment.pop("INDEPENDENCE_LOG", None)
         environment.pop("BRIDGE_TEMPERATURE", None)
         environment.pop("BRIDGE_MAX_GENERATED_TOKENS", None)
+        environment.pop("BRIDGE_SYSTEM_PROMPT_CACHE", None)
         environment.update(overrides)
         return environment
 
@@ -294,7 +295,7 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads((self.record / "bridge-args.json").read_text()),
-            ["--max-generated-tokens", "100"],
+            ["--max-generated-tokens", "100", "--temperature", "0.3"],
         )
         arguments = (self.record / "independence-args").read_text().split()
         self.assertEqual(
@@ -341,6 +342,14 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         self.assertIn("alsa:mic", arguments)
         self.assertIn("alsa:speaker", arguments)
         self.assertTrue((self.record / "independence-env").read_text().strip().endswith("|info"))
+
+    def test_system_prompt_cache_can_be_turned_off(self) -> None:
+        result = self._run(BRIDGE_SYSTEM_PROMPT_CACHE="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "--no-system-prompt-cache",
+            json.loads((self.record / "bridge-args.json").read_text()),
+        )
 
     def test_independence_failure_still_stops_the_bridge_and_returns_its_status(self) -> None:
         result = self._run(FAKE_INDEPENDENCE_STATUS="1")

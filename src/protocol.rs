@@ -263,6 +263,13 @@ pub enum Event {
         id: TurnId,
         source: CameraPhotoSource,
     },
+    /// One complete sentence of a streamed answer for `id`. It has display
+    /// and speech authority only while `id` is the controller's current turn,
+    /// and never enters history by itself.
+    TurnPartial {
+        id: TurnId,
+        text: String,
+    },
     TurnFinished(TurnFinished),
     AudioTurnFinished(AudioTurnFinished),
 }
@@ -368,6 +375,9 @@ pub enum TurnResult {
     Answer {
         answer: String,
         proposed_scene: Option<Photo>,
+        /// True when the answer's sentences were already delivered as
+        /// `Event::TurnPartial`, so acceptance must not display it again.
+        streamed: bool,
     },
     Failed {
         message: String,
@@ -398,6 +408,12 @@ pub enum Effect {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Output {
     Answer(String),
+    /// One authorized sentence of a streamed answer, shown and spoken as it
+    /// arrives.
+    AnswerSentence(String),
+    /// A streamed answer finished and entered history; its sentences were
+    /// already shown and spoken, so there is no text to repeat.
+    AnswerStreamed,
     Diagnostic(String),
     Cameras(Vec<CameraDescriptor>),
     Help,

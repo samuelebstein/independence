@@ -15,6 +15,26 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::protocol::CapturedAudio;
 use crate::telemetry::{self, Interaction};
 
+/// whisper.cpp's encoder normally processes a fixed 30-second window (1500
+/// context frames of 20 ms) no matter how short the recording is. Sizing the
+/// window to the clip makes the encoder do proportionally less work.
+const WHISPER_FULL_AUDIO_CTX: usize = 1500;
+const SAMPLES_PER_AUDIO_CTX_FRAME: usize = 16_000 / 50;
+/// Extra frames past the end of speech (~2.6 s) and a floor (~5 s), so the
+/// shortened window never clips the end of a question.
+const AUDIO_CTX_MARGIN: usize = 128;
+const AUDIO_CTX_MINIMUM: usize = 256;
+
+/// The encoder window for a 16 kHz clip: its length plus a margin, rounded up
+/// to a multiple of 64, between the floor and the full 30-second window.
+pub(crate) fn audio_ctx_for(samples: usize) -> usize {
+    let frames = samples.div_ceil(SAMPLES_PER_AUDIO_CTX_FRAME) + AUDIO_CTX_MARGIN;
+    frames
+        .div_ceil(64)
+        .saturating_mul(64)
+        .clamp(AUDIO_CTX_MINIMUM, WHISPER_FULL_AUDIO_CTX)
+}
+
 /// Returns a stable pointer to the cancellation flag for whisper.cpp's native
 /// abort callback. The caller keeps the `Arc` alive for the whole synchronous
 /// `WhisperState::full` call.
@@ -216,12 +236,14 @@ impl Transcriber for WhisperTranscriber {
         interaction: Option<&Interaction>,
     ) -> Result<String, TranscriptionError> {
         let audio_samples = audio.samples().len();
+        let audio_ctx = audio_ctx_for(audio_samples);
         let recognition = interaction.map(|interaction| {
             interaction.stage(
                 kind.operation(),
                 telemetry::fields([
                     ("transcription_kind", serde_json::json!(kind.label())),
                     ("input_samples", serde_json::json!(audio_samples)),
+                    ("audio_ctx", serde_json::json!(audio_ctx)),
                     (
                         "input_audio_duration_ms",
                         serde_json::json!((audio_samples as u64).saturating_mul(1_000) / 16_000),
@@ -252,6 +274,7 @@ impl Transcriber for WhisperTranscriber {
                 .map(|parallelism| parallelism.get().min(4) as i32)
                 .unwrap_or(1);
             parameters.set_n_threads(threads);
+            parameters.set_audio_ctx(audio_ctx as i32);
 
             install_cancellation_callback(&mut parameters, &cancelled);
             state.full(parameters, audio.samples()).map_err(|error| {
@@ -315,9 +338,31 @@ mod tests {
     use crate::protocol::CapturedAudio;
 
     use super::{
-        Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber,
+        Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber, audio_ctx_for,
         cancellation_callback_data, transcription_cancelled_callback,
     };
+
+    #[test]
+    fn the_encoder_window_fits_the_clip_with_margin() {
+        let second = 16_000;
+        // Short questions use the floor (about 5 s) instead of 30 s.
+        assert_eq!(audio_ctx_for(0), 256);
+        assert_eq!(audio_ctx_for(second), 256);
+        // 3 s of speech: 150 frames + 128 margin -> 278 -> 320.
+        assert_eq!(audio_ctx_for(3 * second), 320);
+        // The window always covers the clip itself plus the margin.
+        for seconds in 1..=29 {
+            let ctx = audio_ctx_for(seconds * second);
+            assert!(
+                ctx >= seconds * 50 + 128 || ctx == 1500,
+                "{seconds}s -> {ctx}"
+            );
+            assert!(ctx % 64 == 0 || ctx == 1500, "{seconds}s -> {ctx}");
+        }
+        // Long recordings use the full 30-second window.
+        assert_eq!(audio_ctx_for(30 * second), 1500);
+        assert_eq!(audio_ctx_for(40 * second), 1500);
+    }
 
     #[test]
     fn native_cancellation_callback_reads_the_expected_flag() {

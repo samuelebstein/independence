@@ -421,7 +421,8 @@ Every default can be overridden with an environment variable:
 | `PI_BUTTON_DEVICE` | `/dev/input/event2` |
 | `PI_AUDIO_INPUT` / `PI_AUDIO_OUTPUT` | `alsa:plughw:CARD=Device,DEV=0` |
 | `BRIDGE_MAX_GENERATED_TOKENS` | `100` |
-| `BRIDGE_TEMPERATURE` | empty (bridge default `0.1`) |
+| `BRIDGE_TEMPERATURE` | `0.3` |
+| `BRIDGE_SYSTEM_PROMPT_CACHE` | `1` (set `0` to re-read the system prompt every question) |
 | `BRIDGE_READY_TIMEOUT_SECONDS` | `180` |
 | `HAILO_VLM_HEF` | `$HOME/models/hailo10h/Qwen3-VL-2B-Instruct.hef` |
 | `HAILO_APPS_DIR` | `$HOME/code/hailo-apps-26.03.1` |
@@ -436,6 +437,17 @@ The bridge now treats SIGTERM like Ctrl+C, so it releases the Hailo device in
 an orderly way when the script stops it. Independence itself also requires a
 camera under this profile: run directly without one, it exits with the same
 fix-it message before opening the microphone.
+
+### Streaming, cancellation, and the system-prompt cache
+
+Voice answers stream: the bridge sends each token as Ollama-style NDJSON, and
+Independence speaks each sentence as soon as it is complete. When Independence
+cancels (Escape or a new question), the bridge notices the closed connection
+at the next token and stops generating, so the Hailo is free for the next
+question. At voice startup Independence sends the voice system prompt once;
+the bridge reads it, saves that context, and restores it for every question.
+Each request's metrics are logged as one `Hailo VLM request:` line (see
+[logging.md](logging.md#hailo-bridge-request-metrics)).
 
 ### Health, errors, and one-photo behavior
 

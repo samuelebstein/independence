@@ -4,12 +4,19 @@
 This program intentionally has no web framework dependency.  Hailo Apps already
 provides the hardware/runtime dependencies; the standard-library HTTP server is
 enough for one loopback-only local client.  It accepts the existing
-``/api/show`` and non-streaming ``/api/chat`` shapes, so the Rust application
-keeps owning capability checks, conversation history, camera consent, and turn
-authorization.
+``/api/show`` and ``/api/chat`` shapes (``stream: false`` returns one JSON
+object; ``stream: true`` returns Ollama-style newline-delimited JSON chunks), so
+the Rust application keeps owning capability checks, conversation history,
+camera consent, and turn authorization.
+
+Generation always runs through Hailo's streaming ``generate()`` so the bridge
+can measure it (time to first token, token counts, tokens/s) and stop it as
+soon as the client goes away. A request whose first message is the system
+prompt can reuse a saved context snapshot of that prompt instead of re-reading
+it every turn. The snapshot holds only the system prompt, never user content.
 
 The bridge never writes prompts, image bytes, base64 data, or model replies to
-its own logs or optional JSONL telemetry.
+its own logs or optional JSONL telemetry; it records counts and timings only.
 """
 
 from __future__ import annotations
@@ -28,11 +35,11 @@ import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
 
 
-BRIDGE_VERSION = "0.3.0"
+BRIDGE_VERSION = "0.4.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11435
 DEFAULT_MODEL = "qwen3-vl:2b-instruct"
@@ -80,6 +87,21 @@ class BackendInferenceError(Exception):
 
 class InvalidImageError(Exception):
     """A client input error discovered while decoding image bytes locally."""
+
+
+def _single_text(message: dict[str, Any]) -> str | None:
+    """The text of a prompt message made of exactly one text item."""
+
+    content = message.get("content")
+    if (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+    ):
+        return content[0]["text"]
+    return None
 
 
 def _safe_exception_detail(error: BaseException, limit: int = 240) -> str:
@@ -143,6 +165,7 @@ class BridgeConfig:
     temperature: float = DEFAULT_TEMPERATURE
     seed: int = DEFAULT_SEED
     telemetry_jsonl: str | None = None
+    system_prompt_cache: bool = True
 
     @property
     def endpoint(self) -> str:
@@ -155,6 +178,74 @@ class BridgeConfig:
 class BridgeResponse:
     status: int
     body: dict[str, Any]
+    # True when the response was already written chunk by chunk.
+    streamed: bool = False
+
+
+@dataclass
+class GenerationStats:
+    """Counts and timings for one generation. Never contains text."""
+
+    outcome: str = "completed"  # completed | aborted
+    lock_wait_ms: int = 0
+    system_prompt_cache: str = "off"  # off | hit | miss | unavailable
+    context_tokens_before: int | None = None
+    prompt_tokens: int | None = None
+    output_tokens: int = 0
+    time_to_first_token_ms: int | None = None
+    generation_ms: int = 0
+    tokens_per_second: float | None = None
+    hit_token_cap: bool = False
+
+    def fields(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "lock_wait_ms": self.lock_wait_ms,
+            "system_prompt_cache": self.system_prompt_cache,
+            "context_tokens_before": self.context_tokens_before,
+            "prompt_tokens": self.prompt_tokens,
+            "output_tokens": self.output_tokens,
+            "time_to_first_token_ms": self.time_to_first_token_ms,
+            "generation_ms": self.generation_ms,
+            "tokens_per_second": self.tokens_per_second,
+            "hit_token_cap": self.hit_token_cap,
+        }
+
+    def log_line(self) -> str:
+        parts = []
+        for key, value in self.fields().items():
+            if value is None:
+                value = "n/a"
+            elif isinstance(value, bool):
+                value = "yes" if value else "no"
+            parts.append(f"{key}={value}")
+        return "Hailo VLM request: " + " ".join(parts)
+
+    def ollama_metrics(self) -> dict[str, Any]:
+        """Ollama-compatible counters, so existing clients can read them."""
+
+        metrics: dict[str, Any] = {
+            "eval_count": self.output_tokens,
+            "total_duration": self.lock_wait_ms * 1_000_000 + self.generation_ms * 1_000_000,
+        }
+        if self.prompt_tokens is not None:
+            metrics["prompt_eval_count"] = self.prompt_tokens
+        if self.time_to_first_token_ms is not None:
+            metrics["prompt_eval_duration"] = self.time_to_first_token_ms * 1_000_000
+            metrics["eval_duration"] = max(
+                0, (self.generation_ms - self.time_to_first_token_ms) * 1_000_000
+            )
+        return metrics
+
+
+@dataclass
+class GenerationResult:
+    text: str
+    stats: GenerationStats
+
+
+# Receives each generated text piece; returns False to stop generation.
+TokenSink = Callable[[str], bool]
 
 
 @dataclass
@@ -163,14 +254,34 @@ class RequestMetadata:
     image_count: int = 0
     image_bytes: int = 0
     generation_ms: int | None = None
+    stream: bool = False
+    generation: GenerationStats | None = None
 
 
 class VlmBackend(Protocol):
     """The small bridge-owned contract that makes API tests hardware-free."""
 
-    def generate(self, prompt: list[dict[str, Any]], images: list[bytes]) -> str: ...
+    def generate(
+        self,
+        prompt: list[dict[str, Any]],
+        images: list[bytes],
+        on_token: TokenSink | None = None,
+    ) -> GenerationResult: ...
+
+    def prime_system_prompt(self, text: str) -> bool: ...
 
     def close(self) -> None: ...
+
+
+class ResponseSink(Protocol):
+    """The live HTTP connection, as seen by a request that streams or that
+    should stop when the client goes away."""
+
+    def begin_stream(self) -> bool: ...
+
+    def send_chunk(self, chunk: dict[str, Any]) -> bool: ...
+
+    def client_gone(self) -> bool: ...
 
 
 class HailoVlmBackend:
@@ -178,10 +289,18 @@ class HailoVlmBackend:
 
     Hailo's VLM context is cleared after every request.  Independence supplies
     accepted text history again in the next request, rather than leaving private
-    state resident in the accelerator runtime.
+    state resident in the accelerator runtime. The only state kept between
+    requests is an optional snapshot of the fixed, non-private system prompt.
     """
 
-    def __init__(self, hef_path: Path, max_generated_tokens: int, temperature: float = DEFAULT_TEMPERATURE, seed: int = DEFAULT_SEED) -> None:
+    def __init__(
+        self,
+        hef_path: Path,
+        max_generated_tokens: int,
+        temperature: float = DEFAULT_TEMPERATURE,
+        seed: int = DEFAULT_SEED,
+        system_prompt_cache: bool = True,
+    ) -> None:
         if not hef_path.is_file():
             raise BackendStartupError(
                 "HAILO_VLM_HEF must point to a downloaded, readable Hailo VLM .hef file."
@@ -206,6 +325,10 @@ class HailoVlmBackend:
         self._vdevice: Any | None = None
         self._vlm: Any | None = None
         self._generation_lock = threading.Lock()
+        self._cache_enabled = system_prompt_cache
+        self._system_text: str | None = None
+        self._system_snapshot: Any | None = None
+        self._recovery_sequence: str | None = None
         try:
             params = VDevice.create_params()
             # Hailo's shared VDevice group lets this local VLM coexist with
@@ -224,24 +347,163 @@ class HailoVlmBackend:
                 f"{_safe_exception_detail(error)} Check the HAT, HailoRT version, "
                 "and downloaded VLM model."
             ) from error
+        try:
+            # Hailo may append a fixed recovery sequence to a generation; it
+            # is a runtime artifact, not part of the answer.
+            self._recovery_sequence = self._vlm.get_generation_recovery_sequence()
+        except Exception:
+            self._recovery_sequence = None
 
-    def generate(self, prompt: list[dict[str, Any]], images: list[bytes]) -> str:
+    def _context_usage(self) -> int | None:
+        try:
+            return int(self._vlm.get_context_usage_size())
+        except Exception:
+            return None
+
+    def _clear(self) -> None:
+        try:
+            self._vlm.clear_context()
+        except Exception:
+            # A failed cleanup must not replace the safe inference error or
+            # expose a device/runtime diagnostic to a caller.
+            pass
+
+    def _build_system_snapshot(self, text: str) -> bool:
+        """Read only the system prompt and save that context (lock held).
+
+        Hailo has no "prefill only" call; like Hailo Apps' own context cache,
+        this generates one token so the prompt is read into the context, then
+        saves the context. On success the context still holds the system
+        prompt, so the caller can continue with the remaining messages.
+        """
+
+        self._clear()
+        try:
+            system = [{"role": "system", "content": [{"type": "text", "text": text}]}]
+            with self._vlm.generate(
+                prompt=system,
+                frames=[],
+                temperature=self._temperature,
+                seed=self._seed,
+                max_generated_tokens=1,
+            ) as generation:
+                for _token in generation:
+                    pass
+            snapshot = self._vlm.save_context()
+        except Exception as error:
+            print(
+                "Hailo VLM system prompt cache unavailable: "
+                f"{_safe_exception_detail(error)}; reading the system prompt every request",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._cache_enabled = False
+            self._system_text = None
+            self._system_snapshot = None
+            self._clear()
+            return False
+        if not snapshot:
+            self._cache_enabled = False
+            self._clear()
+            return False
+        self._system_text = text
+        self._system_snapshot = snapshot
+        return True
+
+    def prime_system_prompt(self, text: str) -> bool:
+        """Prepare the system prompt snapshot before the first question."""
+
+        with self._generation_lock:
+            if not self._cache_enabled:
+                return False
+            if self._system_text == text and self._system_snapshot is not None:
+                return True
+            try:
+                return self._build_system_snapshot(text)
+            finally:
+                self._clear()
+
+    def _start_from_system_prompt(
+        self, prompt: list[dict[str, Any]], stats: GenerationStats
+    ) -> list[dict[str, Any]]:
+        """Return the messages still to send, using the snapshot if possible."""
+
+        if not self._cache_enabled or not prompt or prompt[0].get("role") != "system":
+            stats.system_prompt_cache = "off"
+            return prompt
+        text = _single_text(prompt[0])
+        if text is None:
+            stats.system_prompt_cache = "off"
+            return prompt
+        if self._system_text == text and self._system_snapshot is not None:
+            try:
+                self._vlm.load_context(self._system_snapshot)
+            except Exception as error:
+                print(
+                    "Hailo VLM could not restore the system prompt snapshot: "
+                    f"{_safe_exception_detail(error)}; reading it in full",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._cache_enabled = False
+                self._system_snapshot = None
+                self._system_text = None
+                self._clear()
+                stats.system_prompt_cache = "unavailable"
+                return prompt
+            stats.system_prompt_cache = "hit"
+            return prompt[1:]
+        if self._build_system_snapshot(text):
+            stats.system_prompt_cache = "miss"
+            return prompt[1:]
+        stats.system_prompt_cache = "unavailable"
+        return prompt
+
+    def generate(
+        self,
+        prompt: list[dict[str, Any]],
+        images: list[bytes],
+        on_token: TokenSink | None = None,
+    ) -> GenerationResult:
         # Hailo validates that each image placeholder in ``prompt`` has a
         # matching frame. The bridge accepts one image, so these lists contain
         # either one matching pair or no image at all.
         frames = [self._prepare_image(image_bytes) for image_bytes in images]
+        stats = GenerationStats()
+        waiting_since = time.monotonic()
 
         with self._generation_lock:
+            stats.lock_wait_ms = int((time.monotonic() - waiting_since) * 1000)
+            parts: list[str] = []
             try:
-                # This follows the standalone Qwen3 smoke test exactly: the
-                # Hailo Apps VLM returns one complete string from generate_all.
-                response = self._vlm.generate_all(
-                    prompt=prompt,
+                messages = self._start_from_system_prompt(prompt, stats)
+                stats.context_tokens_before = self._context_usage()
+                started = time.monotonic()
+                first_token_at: float | None = None
+                # Streaming generation, so tokens can be measured, forwarded,
+                # and abandoned the moment the client no longer wants them.
+                with self._vlm.generate(
+                    prompt=messages,
                     frames=frames,
                     temperature=self._temperature,
                     seed=self._seed,
                     max_generated_tokens=self._max_generated_tokens,
-                )
+                ) as generation:
+                    for token in generation:
+                        if first_token_at is None:
+                            first_token_at = time.monotonic()
+                        stats.output_tokens += 1
+                        if self._recovery_sequence and token == self._recovery_sequence:
+                            continue
+                        piece = str(token).replace("<|im_end|>", "")
+                        if not piece:
+                            continue
+                        parts.append(piece)
+                        if on_token is not None and not on_token(piece):
+                            stats.outcome = "aborted"
+                            break
+                finished = time.monotonic()
+                context_after = self._context_usage()
             except Exception as error:
                 raise BackendInferenceError(
                     "Hailo VLM inference failed",
@@ -249,20 +511,27 @@ class HailoVlmBackend:
                     _safe_exception_detail(error),
                 ) from error
             finally:
-                try:
-                    self._vlm.clear_context()
-                except Exception:
-                    # A failed cleanup must not replace the safe inference
-                    # error or expose a device/runtime diagnostic to a caller.
-                    pass
+                self._clear()
 
-        text = str(response).split(". [{'type'")[0].split("<|im_end|>")[0].strip()
-        if not text:
+        stats.generation_ms = int((finished - started) * 1000)
+        if first_token_at is not None:
+            stats.time_to_first_token_ms = int((first_token_at - started) * 1000)
+            if stats.output_tokens > 1 and finished > first_token_at:
+                stats.tokens_per_second = round(
+                    (stats.output_tokens - 1) / (finished - first_token_at), 2
+                )
+        stats.hit_token_cap = stats.output_tokens >= self._max_generated_tokens
+        if stats.context_tokens_before is not None and context_after is not None:
+            prompt_tokens = context_after - stats.context_tokens_before - stats.output_tokens
+            stats.prompt_tokens = prompt_tokens if prompt_tokens >= 0 else None
+
+        text = "".join(parts).strip()
+        if not text and stats.outcome == "completed":
             raise BackendInferenceError(
                 "Hailo VLM returned no usable text",
                 "empty_generation",
             )
-        return text
+        return GenerationResult(text, stats)
 
     def _prepare_image(self, image_bytes: bytes) -> Any:
         if len(image_bytes) > MAX_IMAGE_BYTES:
@@ -288,6 +557,8 @@ class HailoVlmBackend:
 
     def close(self) -> None:
         with getattr(self, "_generation_lock", threading.Lock()):
+            self._system_snapshot = None
+            self._system_text = None
             if getattr(self, "_vlm", None) is not None:
                 try:
                     self._vlm.clear_context()
@@ -341,7 +612,13 @@ class BridgeApplication:
         self._telemetry = telemetry
         self._health = health or BackendHealth()
 
-    def handle(self, method: str, raw_path: str, body: bytes = b"") -> BridgeResponse:
+    def handle(
+        self,
+        method: str,
+        raw_path: str,
+        body: bytes = b"",
+        sink: ResponseSink | None = None,
+    ) -> BridgeResponse:
         route = urlsplit(raw_path).path
         started = time.monotonic()
         metadata = RequestMetadata()
@@ -392,12 +669,18 @@ class BridgeApplication:
                         },
                     )
             elif method == "POST" and route == "/api/chat":
-                response, metadata = self._chat(body)
+                response, metadata = self._chat(body, sink)
             else:
                 raise BridgeError(404, "the requested local API route is not available", "route_not_found")
         except BridgeError as error:
             outcome = error.outcome
             response = BridgeResponse(error.status, {"error": error.message})
+        except _StreamFailed as failure:
+            # Headers were already sent; the error went out as a final chunk.
+            outcome = "hailo_inference_failed"
+            self._health.mark_failure(failure.error)
+            metadata = failure.metadata
+            response = BridgeResponse(200, {}, streamed=True)
         except BackendInferenceError as error:
             outcome = "hailo_inference_failed"
             self._health.mark_failure(error)
@@ -457,6 +740,11 @@ class BridgeApplication:
         }
         if metadata.generation_ms is not None:
             event["hailo_generation_ms"] = metadata.generation_ms
+        if metadata.stream:
+            event["stream"] = True
+        if metadata.generation is not None:
+            for key, value in metadata.generation.fields().items():
+                event[f"generation_{key}"] = value
         self._telemetry.record(event)
 
     def _json_request(self, body: bytes) -> dict[str, Any]:
@@ -477,21 +765,29 @@ class BridgeApplication:
         if model != self._config.model:
             raise BridgeError(404, "the requested model is not served by this local bridge", "model_not_served")
 
-    def _chat(self, body: bytes) -> tuple[BridgeResponse, RequestMetadata]:
+    def _chat(
+        self, body: bytes, sink: ResponseSink | None = None
+    ) -> tuple[BridgeResponse, RequestMetadata]:
         request = self._json_request(body)
         self._require_served_model(request)
-        if request.get("stream", False) is not False:
-            raise BridgeError(
-                400,
-                "this local bridge supports only stream=false requests",
-                "streaming_not_supported",
-            )
+        stream = request.get("stream", False)
+        if not isinstance(stream, bool):
+            raise BridgeError(400, "stream must be true or false", "invalid_stream")
+        if stream and sink is None:
+            raise BridgeError(400, "streaming needs a live connection", "streaming_unavailable")
 
         messages = request.get("messages")
         if not isinstance(messages, list) or not messages:
             raise BridgeError(400, "the local request must contain messages", "missing_messages")
         if len(messages) > MAX_MESSAGES:
             raise BridgeError(413, "the local request has too many messages", "too_many_messages")
+
+        if (
+            len(messages) == 1
+            and isinstance(messages[0], dict)
+            and messages[0].get("role") == "system"
+        ):
+            return self._prime(messages[0])
 
         prompt: list[dict[str, Any]] = []
         image_bytes: list[bytes] = []
@@ -546,23 +842,121 @@ class BridgeApplication:
             message_count=len(messages),
             image_count=len(image_bytes),
             image_bytes=sum(len(image) for image in image_bytes),
+            stream=stream,
         )
+        if stream:
+            return self._chat_streaming(prompt, image_bytes, metadata, sink)  # type: ignore[arg-type]
+
+        def keep_going(_piece: str) -> bool:
+            # Stop as soon as the client has hung up (for example, a new
+            # question or Escape in Independence), so the Hailo is free.
+            return sink is None or not sink.client_gone()
+
         generation_started = time.monotonic()
-        answer = self._backend.generate(prompt, image_bytes)
+        result = self._backend.generate(prompt, image_bytes, keep_going)
         metadata.generation_ms = int((time.monotonic() - generation_started) * 1000)
+        metadata.generation = result.stats
+        _log_generation(result.stats)
         self._health.mark_ready()
         return (
             BridgeResponse(
                 200,
                 {
                     "model": self._config.model,
-                    "message": {"role": "assistant", "content": answer},
+                    "message": {"role": "assistant", "content": result.text},
                     "done": True,
-                    "done_reason": "stop",
+                    "done_reason": "length" if result.stats.hit_token_cap else "stop",
+                    **result.stats.ollama_metrics(),
                 },
             ),
             metadata,
         )
+
+    def _prime(self, message: dict[str, Any]) -> tuple[BridgeResponse, RequestMetadata]:
+        """A request holding only a system message prepares the system-prompt
+        snapshot without answering anything (Ollama answers an empty chat
+        with ``done_reason: load`` in the same spirit)."""
+
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise BridgeError(400, "the system message must be non-empty text", "invalid_message")
+        if len(content.encode("utf-8")) > MAX_TEXT_BYTES:
+            raise BridgeError(413, "the local message text exceeds the configured size limit", "text_too_large")
+        cached = self._backend.prime_system_prompt(content)
+        print(
+            "Hailo VLM system prompt "
+            + ("loaded and kept for every request" if cached else "cache is off; it is read every request"),
+            file=sys.stderr,
+            flush=True,
+        )
+        return (
+            BridgeResponse(
+                200,
+                {
+                    "model": self._config.model,
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": "load",
+                    "system_prompt_cached": cached,
+                },
+            ),
+            RequestMetadata(message_count=1),
+        )
+
+    def _chat_streaming(
+        self,
+        prompt: list[dict[str, Any]],
+        image_bytes: list[bytes],
+        metadata: RequestMetadata,
+        sink: ResponseSink,
+    ) -> tuple[BridgeResponse, RequestMetadata]:
+        """Write Ollama-style NDJSON chunks as tokens arrive.
+
+        A failed write means the client went away; generation stops at once.
+        """
+
+        if not sink.begin_stream():
+            metadata.generation = GenerationStats(outcome="aborted")
+            return BridgeResponse(200, {}, streamed=True), metadata
+
+        def forward(piece: str) -> bool:
+            return sink.send_chunk(
+                {
+                    "model": self._config.model,
+                    "message": {"role": "assistant", "content": piece},
+                    "done": False,
+                }
+            )
+
+        generation_started = time.monotonic()
+        try:
+            result = self._backend.generate(prompt, image_bytes, forward)
+        except BackendInferenceError as error:
+            sink.send_chunk(
+                {
+                    "error": error.public_message(),
+                    "code": error.code,
+                    "health": "degraded",
+                    "done": True,
+                }
+            )
+            metadata.generation_ms = int((time.monotonic() - generation_started) * 1000)
+            raise _StreamFailed(error, metadata) from error
+        metadata.generation_ms = int((time.monotonic() - generation_started) * 1000)
+        metadata.generation = result.stats
+        _log_generation(result.stats)
+        if result.stats.outcome == "completed":
+            self._health.mark_ready()
+            sink.send_chunk(
+                {
+                    "model": self._config.model,
+                    "message": {"role": "assistant", "content": ""},
+                    "done": True,
+                    "done_reason": "length" if result.stats.hit_token_cap else "stop",
+                    **result.stats.ollama_metrics(),
+                }
+            )
+        return BridgeResponse(200, {}, streamed=True), metadata
 
     def _decode_images(self, images: list[Any]) -> list[bytes]:
         if len(images) > MAX_IMAGES:
@@ -586,6 +980,83 @@ class BridgeApplication:
                 raise BridgeError(413, "the local image exceeds the configured size limit", "image_too_large")
             decoded_images.append(image)
         return decoded_images
+
+
+class _StreamFailed(Exception):
+    """A backend failure after streaming began (headers already sent)."""
+
+    def __init__(self, error: BackendInferenceError, metadata: RequestMetadata) -> None:
+        super().__init__(error.message)
+        self.error = error
+        self.metadata = metadata
+
+
+def _log_generation(stats: GenerationStats) -> None:
+    # Counts and timings only: this line goes to the launcher's bridge log.
+    print(stats.log_line(), file=sys.stderr, flush=True)
+
+
+class _ConnectionSink:
+    """A `ResponseSink` over one HTTP connection handled by the bridge."""
+
+    def __init__(self, handler: "BridgeRequestHandler") -> None:
+        self._handler = handler
+        self._open = True
+
+    def begin_stream(self) -> bool:
+        try:
+            self._handler.send_response(200)
+            self._handler.send_header("Content-Type", "application/x-ndjson")
+            self._handler.send_header("Cache-Control", "no-store")
+            # The body ends when the connection closes (HTTP/1.0 style).
+            self._handler.send_header("Connection", "close")
+            self._handler.end_headers()
+            self._handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self._open = False
+        return self._open
+
+    def send_chunk(self, chunk: dict[str, Any]) -> bool:
+        if not self._open:
+            return False
+        try:
+            line = json.dumps(chunk, separators=(",", ":")).encode("utf-8") + b"\n"
+            self._handler.wfile.write(line)
+            self._handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self._open = False
+            print(
+                "Hailo VLM client disconnected; generation stopped",
+                file=sys.stderr,
+                flush=True,
+            )
+        return self._open
+
+    def client_gone(self) -> bool:
+        """True once the client has closed its side of the connection.
+
+        The request body has already been read, so any readable end-of-file
+        means the client hung up.
+        """
+
+        if not self._open:
+            return True
+        try:
+            data = self._handler.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            self._open = False
+            return True
+        if data == b"":
+            self._open = False
+            print(
+                "Hailo VLM client disconnected; generation stopped",
+                file=sys.stderr,
+                flush=True,
+            )
+            return True
+        return False
 
 
 class BridgeHttpServer(ThreadingHTTPServer):
@@ -655,9 +1126,13 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 )
             )
             return
-        self._respond(self.server.application.handle("POST", self.path, body))
+        self._respond(
+            self.server.application.handle("POST", self.path, body, _ConnectionSink(self))
+        )
 
     def _respond(self, response: BridgeResponse) -> None:
+        if response.streamed:
+            return
         try:
             body = json.dumps(response.body, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
@@ -780,6 +1255,12 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
         default=DEFAULT_SEED,
         help="sampling seed (default: 42)",
     )
+    parser.add_argument(
+        "--no-system-prompt-cache",
+        dest="system_prompt_cache",
+        action="store_false",
+        help="read the system prompt in full on every request instead of reusing a snapshot",
+    )
     arguments = parser.parse_args(argv)
     if not arguments.model.strip():
         parser.error("--model must not be empty")
@@ -794,6 +1275,7 @@ def parse_arguments(argv: list[str] | None = None) -> BridgeConfig:
         temperature=arguments.temperature,
         seed=arguments.seed,
         telemetry_jsonl=arguments.telemetry_jsonl,
+        system_prompt_cache=arguments.system_prompt_cache,
     )
 
 
@@ -826,6 +1308,7 @@ def main(argv: list[str] | None = None) -> int:
             config.max_generated_tokens,
             config.temperature,
             config.seed,
+            config.system_prompt_cache,
         )
     except BackendStartupError as error:
         print(f"Hailo VLM bridge did not start: {error}", file=sys.stderr)

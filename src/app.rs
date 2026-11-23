@@ -76,6 +76,28 @@ enum AnswerSpeechEmission {
 }
 
 impl OutputMode<'_> {
+    /// Shows and (in voice) queues one streamed sentence. Each sentence is a
+    /// separate utterance in the same ordered queue, so synthesis of the next
+    /// overlaps playback of the current one.
+    fn emit_sentence(
+        &self,
+        sentence: String,
+        first: bool,
+        speech_owner: speak::SpeechOwner,
+    ) -> AnswerSpeechEmission {
+        speak::independence_says_sentence(&sentence, first);
+        match self {
+            Self::Line => AnswerSpeechEmission::None,
+            Self::Voice {
+                speech,
+                interaction,
+            } => match speech.say_with_interaction(speech_owner, sentence, interaction.clone()) {
+                Some(utterance_id) => AnswerSpeechEmission::Queued(utterance_id),
+                None => AnswerSpeechEmission::Unavailable,
+            },
+        }
+    }
+
     fn emit(
         &self,
         output: crate::protocol::Output,
@@ -465,8 +487,14 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     let result = async {
         match (resolved.pipeline, resolved.backend) {
             (VoicePipeline::TranscribeAndSpeak, ModelBackend::Ollama | ModelBackend::HailoVlm) => {
-                let client = configured_ollama_client(&resolved)?;
+                // Voice answers are spoken, so the system message asks for
+                // short spoken sentences (typed mode keeps the plain prompt).
+                let client = configured_ollama_client(&resolved)?
+                    .with_instructions(crate::think::voice_instructions());
                 discover_model_capabilities(&client, resolved.backend).await;
+                if resolved.backend == ModelBackend::HailoVlm {
+                    prime_voice_instructions(&client).await;
+                }
                 let camera = camera_service_for(resolved.camera_backend);
                 if resolved.require_camera {
                     // Checked before the microphone, speaker, or Whisper are
@@ -515,6 +543,20 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     // their application-owned buffers during their own shutdown.
     finish_ephemeral_session(&mut security, session)?;
     result
+}
+
+/// Asks the Hailo bridge to load the (fixed, non-private) voice system
+/// message once now, so no question has to wait for it to be read again.
+/// Failure only costs speed: the bridge then reads it with each question.
+async fn prime_voice_instructions(client: &OllamaClient) {
+    match client.prime_instructions().await {
+        Ok(true) => speak::process(
+            "model_system_prompt_cached",
+            "the voice system prompt is loaded once and reused for every question",
+        ),
+        Ok(false) => speak::background_warning("model_system_prompt_not_cached"),
+        Err(_) => speak::background_warning("model_system_prompt_prime_failed"),
+    }
 }
 
 fn camera_service_for(selection: CameraBackendSelection) -> CameraService {
@@ -629,13 +671,16 @@ async fn run_transcribe_and_speak(
         },
     );
     let mut runtime = VoiceRuntime::new(
-        Controller::new_ephemeral(),
+        // A photo is sent only with the question that took it.
+        Controller::new_ephemeral().with_photo_only_on_capturing_turn(),
         TurnRuntime::new(client, camera, main_event_sender),
         dictation,
         voice_aux_sender,
         speech,
     );
     runtime.live_partial_transcription = live_partial_transcription;
+    // Voice answers arrive and are spoken sentence by sentence.
+    runtime.turns.stream_answers = true;
     let mut partial_tick = tokio::time::interval(PARTIAL_TRANSCRIPTION_INTERVAL);
     partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -727,6 +772,7 @@ async fn apply_main_event(
     };
     let speech_owner = match &event {
         Event::TurnFinished(finished) => speak::SpeechOwner::Turn(finished.id),
+        Event::TurnPartial { id, .. } => speak::SpeechOwner::Turn(*id),
         _ => speak::SpeechOwner::System,
     };
     if let Event::TurnFinished(finished) = &event {
@@ -734,9 +780,14 @@ async fn apply_main_event(
     }
 
     let effects = controller.handle(event);
-    let accepted_answer = effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Display(crate::protocol::Output::Answer(_))));
+    let accepted_answer = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Display(
+                crate::protocol::Output::Answer(_) | crate::protocol::Output::AnswerStreamed
+            )
+        )
+    });
     let mut answer_speech = AnswerSpeechEmission::None;
     for effect in effects {
         let result = runtime
@@ -802,6 +853,11 @@ struct TurnRuntime {
     /// needs it; voice mode prints its own "Asking the local model..." when
     /// it sends the request.
     announce_thinking: bool,
+    /// Whether answers are requested as a stream and delivered sentence by
+    /// sentence (voice). Typed mode shows the whole answer at the end.
+    stream_answers: bool,
+    /// The streamed answer currently being shown/spoken, if any.
+    streamed_answer: Option<StreamedAnswer>,
     /// Cancellation returns control immediately, but an already-running
     /// bounded V4L2 closure can still own the camera gate. These background
     /// monitors finish telemetry only after that app-owned resource is idle;
@@ -814,6 +870,11 @@ struct RunningTurn {
     cancellation: CancellationToken,
     handle: JoinHandle<()>,
     interaction: Interaction,
+}
+
+struct StreamedAnswer {
+    owner: speak::SpeechOwner,
+    last_speech: AnswerSpeechEmission,
 }
 
 struct RuntimeEffectResult {
@@ -839,6 +900,8 @@ impl TurnRuntime {
             active: None,
             pending_interaction: None,
             announce_thinking: true,
+            stream_answers: false,
+            streamed_answer: None,
             cleanup_tasks: Vec::new(),
         }
     }
@@ -884,6 +947,30 @@ impl TurnRuntime {
             Effect::PrepareCamera(preparation) => self.prepare_camera(preparation),
             Effect::ListCameras => self.list_cameras(),
             Effect::CancelTurn(id) => self.cancel(id).await,
+            Effect::Display(crate::protocol::Output::AnswerSentence(sentence)) => {
+                let first = !matches!(
+                    &self.streamed_answer,
+                    Some(streamed) if streamed.owner == speech_owner
+                );
+                let speech = output_mode.emit_sentence(sentence, first, speech_owner);
+                self.streamed_answer = Some(StreamedAnswer {
+                    owner: speech_owner,
+                    last_speech: speech,
+                });
+                return RuntimeEffectResult::continued();
+            }
+            Effect::Display(crate::protocol::Output::AnswerStreamed) => {
+                // The answer is accepted; its completion follows the speech
+                // outcome of its last sentence.
+                let answer_speech = match self.streamed_answer.take() {
+                    Some(streamed) if streamed.owner == speech_owner => streamed.last_speech,
+                    _ => AnswerSpeechEmission::None,
+                };
+                return RuntimeEffectResult {
+                    keep_running: true,
+                    answer_speech,
+                };
+            }
             Effect::Display(output) => {
                 return RuntimeEffectResult {
                     keep_running: true,
@@ -957,6 +1044,7 @@ impl TurnRuntime {
         let camera = self.camera.clone();
         let event_sender = self.event_sender.clone();
         let worker_interaction = interaction.clone();
+        let stream = self.stream_answers;
         let handle = tokio::spawn(async move {
             let result = run_turn_with_interaction(
                 client,
@@ -965,6 +1053,7 @@ impl TurnRuntime {
                 request,
                 worker_cancellation.clone(),
                 worker_interaction,
+                stream,
             )
             .await;
 
@@ -1277,6 +1366,7 @@ impl VoiceRuntime {
         let turn_finished = matches!(event, Event::TurnFinished(_));
         let interaction = match &event {
             Event::TurnFinished(finished) => self.turns.active_interaction(finished.id),
+            Event::TurnPartial { id, .. } => self.turns.active_interaction(*id),
             _ => None,
         };
         let speech = self.speech.handle();
@@ -2223,6 +2313,57 @@ impl VoiceRuntime {
     }
 }
 
+/// Streams the answer and sends each complete sentence to the controller as
+/// soon as it exists. The final (possibly unpunctuated) remainder is sent
+/// before this returns, so every sentence precedes `TurnFinished`.
+async fn stream_answer_sentences(
+    client: &OllamaClient,
+    history: &[crate::think::ConversationTurn],
+    question: &str,
+    image_bytes: &[&[u8]],
+    interaction: &Interaction,
+    id: TurnId,
+    event_sender: &mpsc::Sender<Event>,
+) -> Result<crate::think::OllamaAnswer, ThinkError> {
+    let (piece_sender, mut pieces) = mpsc::unbounded_channel::<String>();
+    let ask = async move {
+        let mut forward = move |piece: &str| {
+            let _ = piece_sender.send(piece.to_owned());
+        };
+        client
+            .answer_streaming(
+                history,
+                question,
+                image_bytes,
+                Some(interaction),
+                &mut forward,
+            )
+            .await
+    };
+    let deliver = async {
+        let mut splitter = speak::sentences::SentenceSplitter::default();
+        let mut first = true;
+        while let Some(piece) = pieces.recv().await {
+            for sentence in splitter.push(&piece) {
+                if first {
+                    first = false;
+                    interaction.mark_first("answer.first_sentence_ready");
+                }
+                let _ = event_sender
+                    .send(Event::TurnPartial { id, text: sentence })
+                    .await;
+            }
+        }
+        if let Some(rest) = splitter.finish() {
+            let _ = event_sender
+                .send(Event::TurnPartial { id, text: rest })
+                .await;
+        }
+    };
+    let (answer, ()) = tokio::join!(ask, deliver);
+    answer
+}
+
 #[cfg(test)]
 async fn run_turn(
     client: Arc<OllamaClient>,
@@ -2240,6 +2381,7 @@ async fn run_turn(
         request,
         cancellation,
         interaction,
+        false,
     )
     .await
 }
@@ -2251,6 +2393,7 @@ async fn run_turn_with_interaction(
     request: TurnRequest,
     cancellation: CancellationToken,
     interaction: Interaction,
+    stream: bool,
 ) -> TurnResult {
     let TurnRequest {
         id,
@@ -2393,12 +2536,32 @@ async fn run_turn_with_interaction(
     interaction.mark("ollama.request_dispatch_started");
     let _ollama_in_flight = interaction.in_flight_guard("ollama");
 
-    let answer = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            return TurnResult::Cancelled;
-        },
-        answer = client.answer_with_telemetry(&history, &question, &image_bytes, Some(&interaction)) => answer,
+    let answer = if stream {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                // Dropping the stream closes the connection, which makes the
+                // Hailo bridge stop generating right away.
+                return TurnResult::Cancelled;
+            },
+            answer = stream_answer_sentences(
+                &client,
+                &history,
+                &question,
+                &image_bytes,
+                &interaction,
+                id,
+                &event_sender,
+            ) => answer,
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return TurnResult::Cancelled;
+            },
+            answer = client.answer_with_telemetry(&history, &question, &image_bytes, Some(&interaction)) => answer,
+        }
     };
 
     if cancellation.is_cancelled() {
@@ -2411,6 +2574,7 @@ async fn run_turn_with_interaction(
             TurnResult::Answer {
                 answer: answer.text,
                 proposed_scene,
+                streamed: stream,
             }
         }
         Err(error) => {
@@ -2851,6 +3015,20 @@ mod tests {
             let recording_id = self.start_hold().await;
             let text = self.release_hold(recording_id).await;
             (recording_id, text)
+        }
+
+        /// Handles streamed sentences and then the finished turn.
+        async fn accept_streamed_answer(&mut self) {
+            loop {
+                let event = within_test_timeout(self.main_events.recv())
+                    .await
+                    .expect("mock streamed completion");
+                let finished = matches!(event, Event::TurnFinished(_));
+                assert!(self.runtime.handle_main_event(event).await);
+                if finished {
+                    return;
+                }
+            }
         }
 
         async fn accept_next_answer(&mut self) {
@@ -3882,6 +4060,142 @@ mod tests {
         assert!(!lines.iter().any(|line| line.starts_with("Independence:")));
     }
 
+    fn ndjson(lines: &[serde_json::Value]) -> String {
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    #[tokio::test]
+    async fn voice_answer_streams_sentence_by_sentence_to_screen_and_speech() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ndjson(&[
+                json!({"message": {"role": "assistant", "content": "The fridge has"}, "done": false}),
+                json!({"message": {"role": "assistant", "content": " magnets. Some"}, "done": false}),
+                json!({"message": {"role": "assistant", "content": " are round."}, "done": false}),
+                json!({"message": {"role": "assistant", "content": ""}, "done": true, "done_reason": "stop"}),
+            ])))
+            .mount(&server)
+            .await;
+        let mut harness = voice_harness(
+            &server,
+            ["what is on it".to_owned()],
+            unused_camera_service(),
+        );
+        harness.runtime.turns.stream_answers = true;
+        crate::interface::test_terminal::start();
+
+        let _ = harness.submit_next_transcript().await;
+        harness.accept_streamed_answer().await;
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            [
+                "Listening...",
+                "Transcribing...",
+                "You: what is on it",
+                "Asking the local model...",
+                "Independence: The fridge has magnets.",
+                "              Some are round.",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+        assert_eq!(
+            harness.runtime.speech.handle().utterances_requested(),
+            2,
+            "each sentence is its own utterance"
+        );
+        let history = harness.runtime.controller.accepted_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].assistant,
+            "The fridge has magnets. Some are round."
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn a_new_press_during_a_streamed_answer_keeps_it_out_of_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(ndjson(&[
+                        json!({"message": {"role": "assistant", "content": "Too late."}, "done": false}),
+                        json!({"message": {"role": "assistant", "content": ""}, "done": true}),
+                    ]))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        let mut harness = voice_harness(
+            &server,
+            ["first question".to_owned(), "unused".to_owned()],
+            unused_camera_service(),
+        );
+        harness.runtime.turns.stream_answers = true;
+
+        let _ = harness.submit_next_transcript().await;
+        assert!(harness.runtime.controller.has_active_turn());
+        // Pressing ENTER again stops the in-flight answer.
+        let _second = harness.start_hold().await;
+        assert!(!harness.runtime.controller.has_active_turn());
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        while let Ok(event) = harness.main_events.try_recv() {
+            assert!(harness.runtime.handle_main_event(event).await);
+        }
+        assert!(harness.runtime.controller.accepted_history().is_empty());
+        assert_eq!(harness.runtime.speech.handle().utterances_requested(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_follow_up_after_a_photo_does_not_resend_the_photo() {
+        let server = MockServer::start().await;
+        mock_answer(&server, "an answer").await;
+        let mut harness = voice_harness(
+            &server,
+            ["what is this".to_owned(), "what color is it".to_owned()],
+            photo_camera(),
+        );
+        harness.runtime.controller = Controller::new().with_photo_only_on_capturing_turn();
+
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::Photo))
+                .await
+        );
+        let photo_finished = harness.next_aux_event().await;
+        assert!(harness.runtime.handle_aux_event(photo_finished).await);
+        let _ = harness.release_hold(recording_id).await;
+        harness.accept_next_answer().await;
+        let _ = harness.submit_next_transcript().await;
+        harness.accept_next_answer().await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let image_count = |index: usize| {
+            let body: serde_json::Value = serde_json::from_slice(&requests[index].body).unwrap();
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["images"].as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+        };
+        assert_eq!(
+            image_count(0),
+            1,
+            "the photo goes with the turn that took it"
+        );
+        assert_eq!(image_count(1), 0, "the follow-up sends text only");
+    }
+
     #[tokio::test]
     async fn press_opens_the_microphone_immediately_without_any_spoken_cue() {
         let server = MockServer::start().await;
@@ -4690,6 +5004,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "late old answer".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .await
@@ -4738,6 +5053,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "late cancelled answer".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .await

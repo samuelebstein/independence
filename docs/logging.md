@@ -80,6 +80,29 @@ the Hailo bridge's own output to `local-data/logs/hailo-bridge-<time>.log`.
 The bridge log contains its startup/health messages and bounded failure
 reasons, not prompts, images, or answers.
 
+## Hailo bridge request metrics
+
+Every generation adds one line to the bridge log, for example:
+
+```text
+Hailo VLM request: outcome=completed lock_wait_ms=0 system_prompt_cache=hit context_tokens_before=268 prompt_tokens=171 output_tokens=38 time_to_first_token_ms=1820 generation_ms=9400 tokens_per_second=4.88 hit_token_cap=no
+```
+
+| Field | Meaning |
+| --- | --- |
+| `outcome` | `completed`, or `aborted` when the client hung up mid-answer |
+| `lock_wait_ms` | Time waiting for a previous generation to release the Hailo |
+| `system_prompt_cache` | `hit` (snapshot restored), `miss` (built now), `off`, or `unavailable` |
+| `context_tokens_before` | Tokens already in context before this request (the cached system prompt) |
+| `prompt_tokens` | Tokens read for this request (history, question, 144 per image) |
+| `output_tokens` | Tokens generated |
+| `time_to_first_token_ms` | Reading the prompt (and image) until the first token |
+| `tokens_per_second` | Generation speed after the first token |
+| `hit_token_cap` | Whether the answer was cut off by `--max-generated-tokens` |
+
+The same fields appear as `generation_*` in the optional JSONL telemetry.
+Counts reveal roughly how long a question or answer was; no text is recorded.
+
 ## Voice capture outcomes
 
 Each voice recording reports how it ended through the

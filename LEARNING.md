@@ -817,7 +817,7 @@ more honest than a placeholder PIN. The next milestone remains **6.2 only
 after owner approval** of the key/recovery-format choices in the security
 documents.
 
-## Latest milestone: Pi voice reliability and immediate start (Milestone 7)
+## Previous milestone: Pi voice reliability and immediate start (Milestone 7)
 
 Two Pi sessions lost five of eleven turns. The logs showed one clear pattern:
 releasing ENTER while the camera was still capturing failed every time. The
@@ -866,3 +866,48 @@ Experiment: on the Pi, press `P` and release ENTER immediately five times in a
 row. Each turn should answer with the photo. Then run with
 `INDEPENDENCE_LOG=debug` and search the log for `failure_class` — there should
 be none.
+
+## Latest milestone: where the Pi voice latency went (Milestone 8)
+
+The first measurement surprised us: the Hailo-10H was already producing about
+4.9 tokens per second, exactly what Hailo publishes for Qwen3-VL-2B. The time
+went into *what* we asked it to do:
+
+- **Writing long answers.** At ~0.2 s per token, a 50-token answer is 10 s.
+  Voice now appends `src/think/voice.txt` to the system prompt (one to three
+  short spoken sentences), and the Pi launcher uses temperature 0.3 so low-
+  temperature loops do not run to the token cap.
+- **Waiting for the whole answer.** `generate_all` returned nothing until the
+  last token, and Piper then synthesized everything. Now the bridge streams
+  Ollama-style NDJSON, `SentenceSplitter` (`src/speak/sentences.rs`) emits
+  complete sentences, and each one is shown and spoken immediately while the
+  next is synthesized in parallel.
+- **A cancelled answer kept the Hailo busy.** The bridge held a lock until
+  the abandoned generation finished, so the next question queued behind it.
+  It now checks between tokens whether the client hung up and stops.
+- **Re-reading the same things.** The ~210-token system prompt is now read
+  once (Independence sends a system-only "prime" request at voice startup;
+  the bridge saves that context with `save_context()` and restores it per
+  question with `load_context()`), and a photo is sent only with the turn
+  that took it.
+- **Whisper's 30-second window.** whisper.cpp encodes 30 s of audio even for
+  a 3-second question. `audio_ctx_for` sizes the window to the clip plus about
+  2.6 s, with a 5-second floor.
+
+How the controller stays in charge with streaming: a streamed sentence is an
+`Event::TurnPartial { id, text }`. The controller authorizes it only while
+`id` is the current turn, exactly like a whole answer, and it is never
+history. Only the complete answer (`TurnResult::Answer { streamed: true }`) is
+written to history, once. Cancel mid-answer and nothing enters history.
+
+Hailo has no "read the prompt without answering" call, so priming generates a
+single token from the system message alone (the same trick Hailo Apps uses
+for its context cache). If that ever hurts answer quality, start the launcher
+with `BRIDGE_SYSTEM_PROMPT_CACHE=0`.
+
+Experiment: run `scripts/run-raspberry-pi-hailo.sh`, ask the same question
+twice, and compare the two `Hailo VLM request:` lines in
+`local-data/logs/hailo-bridge-*.log`: `system_prompt_cache=hit` and a smaller
+`prompt_tokens` on the second show the cache working, and
+`time_to_first_token_ms` shows how soon the first sentence could be spoken.
+

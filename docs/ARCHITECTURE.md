@@ -152,8 +152,12 @@ one Ephemeral session.
 `src/think/mod.rs` contains `OllamaClient` and the `/api/chat` request shape.
 Despite its historical name, it is a strict loopback-only client for the small
 Ollama-compatible protocol Independence uses. It sends an editable system
-prompt from `src/think/teacher.txt`, accepted history, current question, and
-base64 image bytes when present. Responses are non-streaming. The ordinary
+prompt from `src/think/teacher.txt` (voice adds `src/think/voice.txt`, asking
+for one to three short spoken sentences), accepted history, current question,
+and base64 image bytes when present. Typed mode requests a whole answer
+(`stream: false`); voice requests `stream: true` and reads Ollama's
+newline-delimited JSON chunks as they arrive. An answer cut off by the token
+cap (`done_reason: length`) is accepted exactly as produced. The ordinary
 default is `http://127.0.0.1:11434` and `qwen3-vl:4b-instruct`; it disables
 redirects and ambient proxy routing, and has explicit 2-second connect and
 120-second request timeouts.
@@ -169,13 +173,39 @@ no cloud fallback in the application.
 `ModelBackend::HailoVlm` reuses that deliberately narrow client contract but
 selects `tools/hailo_vlm_bridge.py` at `127.0.0.1:11435` by default. The bridge
 is a separate local Python process: it validates the same request, advertises
-`vision`, decodes up to four current images in capture order, converts each for
-Hailo Qwen2-VL, and returns the same non-streaming response shape. It owns neither
-conversation history nor camera access, clears Hailo context after each
-generation, and binds numeric loopback only. Its optional `hailo_vlm.*` JSONL
-metadata excludes prompts, image data, and answers. See
-[raspberry-pi-hailo.md](raspberry-pi-hailo.md) for installation and the
-hardware verification boundary.
+`vision`, accepts one current image, converts it for Hailo Qwen3-VL, and
+returns either one JSON answer or Ollama-style NDJSON chunks. It always
+generates through Hailo's streaming `generate()`, so it can report per request
+the lock wait, prompt tokens, time to first token, output tokens, tokens/s,
+and whether the cap was hit, and so it stops generating as soon as the client
+hangs up (Escape or a new question no longer leaves the Hailo busy). It owns
+neither conversation history nor camera access and clears Hailo context after
+each generation; the one exception is a snapshot of the fixed system prompt,
+read once (Independence primes it at voice startup) and restored for each
+request instead of being re-read. The snapshot never contains user content.
+It binds numeric loopback only. Its log lines and optional `hailo_vlm.*` JSONL
+contain counts and timings, never prompts, image data, or answers. See
+[raspberry-pi-hailo-qwen3.md](raspberry-pi-hailo-qwen3.md) for installation and
+the hardware verification boundary.
+
+### Voice answers stream sentence by sentence (Milestone 8)
+
+```text
+bridge tokens -> OllamaClient::answer_streaming -> SentenceSplitter
+  -> Event::TurnPartial { TurnId, sentence }
+  -> Controller: authorized only while TurnId is current
+  -> Output::AnswerSentence -> terminal line + Piper utterance
+complete answer -> TurnResult::Answer { streamed: true }
+  -> Controller writes history once -> Output::AnswerStreamed
+```
+
+A sentence is display/speech authority only for the current turn and never
+history by itself; a cancelled stream's sentences never enter history. The
+speech worker plays one sentence while a helper thread synthesizes the next
+queued one, so sentences follow without a synthesis gap. Voice sends a photo
+only with the question that took it (`Controller::with_photo_only_on_capturing_turn`);
+follow-ups use text history. Whisper sizes its encoder window (`audio_ctx`) to
+the clip instead of always processing 30 seconds.
 
 ## Terminal interface, diagnostics, and optional local audio
 

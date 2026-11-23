@@ -28,9 +28,11 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${PI_BUTTON_DEVICE:=/dev/input/event2}"
 : "${PI_AUDIO_INPUT:=alsa:plughw:CARD=Device,DEV=0}"
 : "${PI_AUDIO_OUTPUT:=alsa:plughw:CARD=Device,DEV=0}"
-# Bridge generation settings. An empty value keeps the bridge's own default.
+# Bridge generation settings (Milestone 8 owner decisions: cap 100, 0.3).
 : "${BRIDGE_MAX_GENERATED_TOKENS:=100}"
-: "${BRIDGE_TEMPERATURE:=}"
+: "${BRIDGE_TEMPERATURE:=0.3}"
+# 1 keeps the voice system prompt loaded between questions; 0 re-reads it.
+: "${BRIDGE_SYSTEM_PROMPT_CACHE:=1}"
 : "${BRIDGE_READY_TIMEOUT_SECONDS:=180}"
 : "${INDEPENDENCE_LOG:=debug}"
 : "${INDEPENDENCE_BIN:=$repository_root/target/release/independence}"
@@ -83,6 +85,7 @@ bridge_arguments=()
 [[ -n "$BRIDGE_MAX_GENERATED_TOKENS" ]] &&
   bridge_arguments+=(--max-generated-tokens "$BRIDGE_MAX_GENERATED_TOKENS")
 [[ -n "$BRIDGE_TEMPERATURE" ]] && bridge_arguments+=(--temperature "$BRIDGE_TEMPERATURE")
+[[ "$BRIDGE_SYSTEM_PROMPT_CACHE" == 0 ]] && bridge_arguments+=(--no-system-prompt-cache)
 
 bridge_pid=""
 stop_bridge() {

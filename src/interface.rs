@@ -57,6 +57,20 @@ pub fn answer(text: &str) {
     clear_status();
 }
 
+/// Displays one sentence of a streamed answer as it is spoken. The first
+/// sentence is labelled like a whole answer; later sentences are indented
+/// beneath it so the answer still reads as one block.
+pub fn answer_sentence(text: &str, first: bool) {
+    const LABEL: &str = "Independence: ";
+    if first {
+        write_terminal(|writer| write_prefixed_text(writer, LABEL, text));
+    } else {
+        let indent = " ".repeat(LABEL.len());
+        write_terminal(|writer| write_prefixed_text(writer, &indent, text));
+    }
+    clear_status();
+}
+
 /// Displays one accepted final microphone transcript. Partial transcripts are
 /// deliberately not rendered or retained by this interface.
 ///
@@ -149,6 +163,9 @@ pub fn error(message: &str) {
 pub fn emit(output: Output) {
     match output {
         Output::Answer(answer) => self::answer(&answer),
+        Output::AnswerSentence(sentence) => answer_sentence(&sentence, false),
+        // Its sentences were already shown as they arrived.
+        Output::AnswerStreamed => {}
         Output::Diagnostic(message) => diagnostic(&message),
         Output::Cameras(cameras) => {
             if cameras.is_empty() {

@@ -30,6 +30,22 @@ const MAX_IMAGES_PER_REQUEST: usize = 1;
 /// The editable behavioral guidance sent as Ollama's system message.
 pub const TEACHER_INSTRUCTIONS: &str = include_str!("teacher.txt");
 
+/// Extra guidance appended to the system message in voice mode only, so
+/// spoken answers stay short. It is a request to the model, not enforcement:
+/// the token cap is the enforced bound.
+pub const VOICE_INSTRUCTIONS: &str = include_str!("voice.txt");
+
+/// The system message used for voice turns: the teacher guidance plus the
+/// voice addition. It is identical on every voice request, which lets the
+/// Hailo bridge keep it loaded instead of re-reading it each turn.
+pub fn voice_instructions() -> String {
+    format!(
+        "{}\n\n{}",
+        TEACHER_INSTRUCTIONS.trim_end(),
+        VOICE_INSTRUCTIONS.trim()
+    )
+}
+
 /// One successfully accepted user/assistant exchange.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationTurn {
@@ -183,6 +199,8 @@ pub struct OllamaClient {
     http: Client,
     config: OllamaConfig,
     capabilities: Arc<RwLock<Option<ModelCapabilities>>>,
+    /// The system message sent with every chat request.
+    instructions: Arc<str>,
 }
 
 /// A complete non-streaming Ollama answer plus optional server-reported
@@ -259,11 +277,51 @@ impl OllamaClient {
             http,
             config,
             capabilities: Arc::new(RwLock::new(None)),
+            instructions: Arc::from(TEACHER_INSTRUCTIONS),
         })
+    }
+
+    /// Replaces the system message (voice mode adds `VOICE_INSTRUCTIONS`).
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Arc::from(instructions.into());
+        self
+    }
+
+    pub fn instructions(&self) -> &str {
+        &self.instructions
     }
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Asks the local Hailo bridge to read the system message once and keep
+    /// it loaded, so later questions do not re-read it. Sends only the fixed
+    /// system message, never conversation content. Returns whether the
+    /// bridge reports the system message as cached.
+    pub async fn prime_instructions(&self) -> Result<bool, ThinkError> {
+        let endpoint = self.config.chat_url()?;
+        let request = ChatRequest {
+            model: self.config.model.clone(),
+            messages: vec![ChatMessage::system(&self.instructions)],
+            stream: false,
+        };
+        let response = self
+            .http
+            .post(endpoint.clone())
+            .json(&request)
+            .send()
+            .await
+            .map_err(|source| ThinkError::Request { endpoint, source })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_error(status, response).await);
+        }
+        let primed = response
+            .json::<PrimeResponse>()
+            .await
+            .map_err(ThinkError::InvalidResponse)?;
+        Ok(primed.system_prompt_cached.unwrap_or(false))
     }
 
     pub fn supports_images(&self) -> bool {
@@ -423,6 +481,35 @@ impl OllamaClient {
         images: &[&[u8]],
         interaction: Option<&Interaction>,
     ) -> Result<OllamaAnswer, ThinkError> {
+        self.chat(history, question, images, interaction, None)
+            .await
+    }
+
+    /// Requests a streamed answer (`stream: true`). Each text piece is passed
+    /// to `on_text` as it arrives; the complete answer is returned at the end.
+    /// Dropping this future closes the connection, which makes the local
+    /// Hailo bridge stop generating.
+    pub async fn answer_streaming(
+        &self,
+        history: &[ConversationTurn],
+        question: &str,
+        images: &[&[u8]],
+        interaction: Option<&Interaction>,
+        on_text: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<OllamaAnswer, ThinkError> {
+        self.chat(history, question, images, interaction, Some(on_text))
+            .await
+    }
+
+    async fn chat(
+        &self,
+        history: &[ConversationTurn],
+        question: &str,
+        images: &[&[u8]],
+        interaction: Option<&Interaction>,
+        on_text: Option<&mut (dyn FnMut(&str) + Send)>,
+    ) -> Result<OllamaAnswer, ThinkError> {
+        let stream = on_text.is_some();
         if images.len() > MAX_IMAGES_PER_REQUEST {
             return Err(ThinkError::TooManyImages {
                 max: MAX_IMAGES_PER_REQUEST,
@@ -441,10 +528,12 @@ impl OllamaClient {
         }
         let image_bytes = images.iter().map(|bytes| bytes.len()).sum::<usize>();
         if let Some(interaction) = interaction {
-            interaction.unavailable(
-                "ollama.first_token_latency",
-                "current /api/chat request uses stream=false",
-            );
+            if !stream {
+                interaction.unavailable(
+                    "ollama.first_token_latency",
+                    "this /api/chat request uses stream=false",
+                );
+            }
             interaction.unavailable(
                 "ollama.server_queue_depth",
                 "the current Ollama API response does not expose server queue depth",
@@ -459,7 +548,7 @@ impl OllamaClient {
                 ("accepted_history_turns", serde_json::json!(history.len())),
                 ("image_count", serde_json::json!(images.len())),
                 ("total_image_bytes", serde_json::json!(image_bytes)),
-                ("stream", serde_json::json!(false)),
+                ("stream", serde_json::json!(stream)),
             ]));
         }
 
@@ -499,7 +588,14 @@ impl OllamaClient {
                 ]),
             )
         });
-        let request = ChatRequest::new(&self.config.model, history, question, &encoded_images);
+        let request = ChatRequest::new(
+            &self.config.model,
+            &self.instructions,
+            history,
+            question,
+            &encoded_images,
+            stream,
+        );
         if let Some(stage) = preparation {
             stage.finish("completed", telemetry::Fields::new());
         }
@@ -557,6 +653,15 @@ impl OllamaClient {
             );
         }
 
+        if let Some(on_text) = on_text {
+            let (text, statistics) = read_stream(response, interaction, on_text).await?;
+            self.record_statistics(interaction, &statistics);
+            if text.trim().is_empty() {
+                return Err(ThinkError::EmptyAnswer);
+            }
+            return Ok(OllamaAnswer { text, statistics });
+        }
+
         let mut decoding = interaction.map(|interaction| {
             interaction.stage("ollama.response.decode", telemetry::Fields::new())
         });
@@ -571,21 +676,12 @@ impl OllamaClient {
         }
 
         let statistics = response.statistics();
-        if let Some(interaction) = interaction {
-            interaction.set_ollama(statistics.telemetry_fields());
-            interaction.record_ollama_statistics(OllamaMetricData {
-                model: &self.config.model,
-                total_duration_ns: statistics.total_duration_ns,
-                load_duration_ns: statistics.load_duration_ns,
-                prompt_eval_duration_ns: statistics.prompt_eval_duration_ns,
-                eval_duration_ns: statistics.eval_duration_ns,
-                prompt_eval_count: statistics.prompt_eval_count,
-                prompt_eval_cached_count: statistics.prompt_eval_cached_count,
-                eval_count: statistics.eval_count,
-            });
-        }
+        self.record_statistics(interaction, &statistics);
 
-        if response.done != Some(true) || response.done_reason.as_deref() == Some("length") {
+        // A `length` answer reached the token cap. It is accepted exactly as
+        // the model produced it (cut off), so model behavior stays visible;
+        // `done_reason` records the truncation in telemetry.
+        if response.done != Some(true) {
             return Err(ThinkError::IncompleteResponse);
         }
 
@@ -603,6 +699,187 @@ impl OllamaClient {
             statistics,
         })
     }
+
+    fn record_statistics(&self, interaction: Option<&Interaction>, statistics: &OllamaStatistics) {
+        if let Some(interaction) = interaction {
+            interaction.set_ollama(statistics.telemetry_fields());
+            interaction.record_ollama_statistics(OllamaMetricData {
+                model: &self.config.model,
+                total_duration_ns: statistics.total_duration_ns,
+                load_duration_ns: statistics.load_duration_ns,
+                prompt_eval_duration_ns: statistics.prompt_eval_duration_ns,
+                eval_duration_ns: statistics.eval_duration_ns,
+                prompt_eval_count: statistics.prompt_eval_count,
+                prompt_eval_cached_count: statistics.prompt_eval_cached_count,
+                eval_count: statistics.eval_count,
+            });
+        }
+    }
+}
+
+/// Reads Ollama's newline-delimited JSON stream: text chunks with
+/// `done: false`, then one final `done: true` chunk carrying statistics. An
+/// `error` chunk (for example, the Hailo failing mid-answer) ends the stream.
+async fn read_stream(
+    mut response: reqwest::Response,
+    interaction: Option<&Interaction>,
+    on_text: &mut (dyn FnMut(&str) + Send),
+) -> Result<(String, OllamaStatistics), ThinkError> {
+    let mut receiving = interaction
+        .map(|interaction| interaction.stage("ollama.stream.receive", telemetry::Fields::new()));
+    let mut parser = StreamParser::default();
+    let mut text = String::new();
+    let mut first_text = true;
+    let mut ended = false;
+    loop {
+        let events = if ended {
+            parser.finish()
+        } else {
+            match response.chunk().await {
+                Ok(Some(chunk)) => parser.push(&chunk),
+                Ok(None) => {
+                    ended = true;
+                    continue;
+                }
+                Err(error) => {
+                    if let Some(stage) = receiving.take() {
+                        stage.finish("connection_failure", telemetry::Fields::new());
+                    }
+                    return Err(ThinkError::InvalidResponse(error));
+                }
+            }
+        };
+        for event in events {
+            match event {
+                StreamEvent::Text(piece) => {
+                    if first_text {
+                        first_text = false;
+                        if let Some(interaction) = interaction {
+                            interaction.mark_first("ollama.first_text_received");
+                        }
+                    }
+                    text.push_str(&piece);
+                    on_text(&piece);
+                }
+                StreamEvent::Done(statistics) => {
+                    if let Some(stage) = receiving.take() {
+                        stage.finish("completed", telemetry::Fields::new());
+                    }
+                    return Ok((text, statistics));
+                }
+                StreamEvent::Failed(error) => {
+                    if let Some(stage) = receiving.take() {
+                        stage.finish("stream_error", telemetry::Fields::new());
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if ended {
+            break;
+        }
+    }
+    if let Some(stage) = receiving.take() {
+        stage.finish("incomplete", telemetry::Fields::new());
+    }
+    Err(ThinkError::IncompleteResponse)
+}
+
+enum StreamEvent {
+    Text(String),
+    Done(OllamaStatistics),
+    Failed(ThinkError),
+}
+
+/// Splits arbitrary network chunks into complete NDJSON lines.
+#[derive(Default)]
+struct StreamParser {
+    pending: Vec<u8>,
+}
+
+impl StreamParser {
+    fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
+        self.pending.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=newline).collect();
+            if Self::parse_line(&line[..line.len() - 1], &mut events) {
+                break;
+            }
+        }
+        events
+    }
+
+    /// The last line may lack a newline; a server that ignored
+    /// `stream: true` sends one whole JSON object this way.
+    fn finish(&mut self) -> Vec<StreamEvent> {
+        let line = std::mem::take(&mut self.pending);
+        let mut events = Vec::new();
+        Self::parse_line(&line, &mut events);
+        events
+    }
+
+    /// Returns true when the line ended the stream.
+    fn parse_line(line: &[u8], events: &mut Vec<StreamEvent>) -> bool {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            return false;
+        }
+        match serde_json::from_slice::<StreamChunk>(line) {
+            Ok(chunk) => chunk.into_events(events),
+            Err(_) => {
+                events.push(StreamEvent::Failed(ThinkError::Stream {
+                    detail: ": the local model sent an unreadable stream line".into(),
+                }));
+                true
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(flatten)]
+    response: ChatResponse,
+    error: Option<String>,
+    code: Option<String>,
+    health: Option<String>,
+}
+
+impl StreamChunk {
+    /// Appends this chunk's events; returns true when it ended the stream.
+    fn into_events(self, events: &mut Vec<StreamEvent>) -> bool {
+        if let Some(message) = self.error {
+            let metadata = match (self.code, self.health) {
+                (Some(code), Some(health)) => format!(" [code={code}; health={health}]"),
+                (Some(code), None) => format!(" [code={code}]"),
+                (None, Some(health)) => format!(" [health={health}]"),
+                (None, None) => String::new(),
+            };
+            events.push(StreamEvent::Failed(ThinkError::Stream {
+                detail: format!(": {}{metadata}", truncate_for_diagnostic(&message)),
+            }));
+            return true;
+        }
+        let statistics = self.response.statistics();
+        let content = self
+            .response
+            .message
+            .map(|message| message.content)
+            .unwrap_or_default();
+        if !content.is_empty() {
+            events.push(StreamEvent::Text(content));
+        }
+        if self.response.done == Some(true) {
+            events.push(StreamEvent::Done(statistics));
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Deserialize)]
+struct PrimeResponse {
+    system_prompt_cached: Option<bool>,
 }
 
 impl OllamaStatistics {
@@ -697,12 +974,14 @@ struct ChatRequest {
 impl ChatRequest {
     fn new(
         model: &str,
+        instructions: &str,
         history: &[ConversationTurn],
         question: &str,
         encoded_images: &[String],
+        stream: bool,
     ) -> Self {
         let mut messages = Vec::with_capacity(2 + history.len() * 2);
-        messages.push(ChatMessage::system(TEACHER_INSTRUCTIONS));
+        messages.push(ChatMessage::system(instructions));
 
         for turn in history {
             messages.push(ChatMessage::user(&turn.user, &[]));
@@ -714,7 +993,7 @@ impl ChatRequest {
         Self {
             model: model.to_owned(),
             messages,
-            stream: false,
+            stream,
         }
     }
 }
@@ -839,8 +1118,11 @@ pub enum ThinkError {
     #[error("Ollama returned invalid JSON: {0}")]
     InvalidResponse(#[source] reqwest::Error),
 
-    #[error("Ollama returned an incomplete or length-truncated answer; no answer was accepted")]
+    #[error("Ollama returned an incomplete answer; no answer was accepted")]
     IncompleteResponse,
+
+    #[error("the local model stopped mid-answer{detail}")]
+    Stream { detail: String },
 
     #[error("Ollama returned an empty answer; no answer was accepted")]
     EmptyAnswer,
@@ -867,6 +1149,7 @@ impl ThinkError {
             Self::Http { .. } => "http_error",
             Self::InvalidResponse(_) => "decode_failure",
             Self::IncompleteResponse => "incomplete_response",
+            Self::Stream { .. } => "stream_error",
             Self::EmptyAnswer => "empty_answer",
             Self::BuildClient(_)
             | Self::InvalidEndpoint(_)
@@ -893,7 +1176,8 @@ mod tests {
 
     use super::{
         CapabilityStatus, ConversationTurn, OllamaClient, OllamaConfig, OllamaStatistics,
-        TEACHER_INSTRUCTIONS, ThinkError,
+        StreamEvent, StreamParser, TEACHER_INSTRUCTIONS, ThinkError, VOICE_INSTRUCTIONS,
+        voice_instructions,
     };
 
     fn client(server: &MockServer) -> OllamaClient {
@@ -907,6 +1191,217 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), future)
             .await
             .expect("mock HTTP test exceeded its three-second timeout")
+    }
+
+    fn ndjson(lines: &[serde_json::Value]) -> String {
+        lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>()
+    }
+
+    #[tokio::test]
+    async fn an_answer_cut_off_by_the_token_cap_is_accepted_as_produced() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "cut off mid"},
+                "done": true,
+                "done_reason": "length",
+                "eval_count": 100
+            })))
+            .mount(&server)
+            .await;
+
+        let answer = within_test_timeout(client(&server).answer(&[], "hello", &[]))
+            .await
+            .unwrap();
+        assert_eq!(answer.text, "cut off mid");
+        assert_eq!(answer.statistics.done_reason.as_deref(), Some("length"));
+    }
+
+    #[tokio::test]
+    async fn streaming_passes_each_piece_on_and_returns_the_whole_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": true,
+                "messages": [
+                    {"role": "system", "content": TEACHER_INSTRUCTIONS},
+                    {"role": "user", "content": "hello"}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ndjson(&[
+                json!({"message": {"role": "assistant", "content": "One."}, "done": false}),
+                json!({"message": {"role": "assistant", "content": " Two."}, "done": false}),
+                json!({"message": {"role": "assistant", "content": ""}, "done": true,
+                       "done_reason": "stop", "eval_count": 2, "prompt_eval_count": 40}),
+            ])))
+            .mount(&server)
+            .await;
+
+        let mut pieces = Vec::new();
+        let mut collect = |piece: &str| pieces.push(piece.to_owned());
+        let answer = within_test_timeout(client(&server).answer_streaming(
+            &[],
+            "hello",
+            &[],
+            None,
+            &mut collect,
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(pieces, ["One.", " Two."]);
+        assert_eq!(answer.text, "One. Two.");
+        assert_eq!(answer.statistics.eval_count, Some(2));
+        assert_eq!(answer.statistics.prompt_eval_count, Some(40));
+    }
+
+    #[tokio::test]
+    async fn a_stream_error_chunk_is_a_diagnosable_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ndjson(&[
+                json!({"message": {"role": "assistant", "content": "Half"}, "done": false}),
+                json!({"error": "Hailo VLM inference failed: device stopped",
+                       "code": "hailo_inference_failed", "health": "degraded", "done": true}),
+            ])))
+            .mount(&server)
+            .await;
+
+        let mut ignore = |_: &str| {};
+        let error = within_test_timeout(client(&server).answer_streaming(
+            &[],
+            "hello",
+            &[],
+            None,
+            &mut ignore,
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ThinkError::Stream { .. }));
+        let message = error.to_string();
+        assert!(message.contains("Hailo VLM") && message.contains("health=degraded"));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_stream_true_still_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "Whole answer."},
+                "done": true,
+                "done_reason": "stop"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut pieces = Vec::new();
+        let mut collect = |piece: &str| pieces.push(piece.to_owned());
+        let answer = within_test_timeout(client(&server).answer_streaming(
+            &[],
+            "hello",
+            &[],
+            None,
+            &mut collect,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(answer.text, "Whole answer.");
+        assert_eq!(pieces, ["Whole answer."]);
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_without_done_is_incomplete() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(ndjson(&[json!({
+                "message": {"role": "assistant", "content": "Half"}, "done": false
+            })])))
+            .mount(&server)
+            .await;
+
+        let mut ignore = |_: &str| {};
+        let error = within_test_timeout(client(&server).answer_streaming(
+            &[],
+            "hello",
+            &[],
+            None,
+            &mut ignore,
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ThinkError::IncompleteResponse));
+    }
+
+    #[test]
+    fn stream_lines_survive_arbitrary_network_chunk_boundaries() {
+        let body = ndjson(&[
+            json!({"message": {"content": "héllo"}, "done": false}),
+            json!({"message": {"content": " world"}, "done": false}),
+            json!({"message": {"content": ""}, "done": true, "done_reason": "stop"}),
+        ]);
+        for split in 1..body.len() {
+            let mut parser = StreamParser::default();
+            let mut text = String::new();
+            let mut done = false;
+            for part in body.as_bytes().chunks(split) {
+                for event in parser.push(part) {
+                    match event {
+                        StreamEvent::Text(piece) => text.push_str(&piece),
+                        StreamEvent::Done(_) => done = true,
+                        StreamEvent::Failed(error) => panic!("split {split}: {error}"),
+                    }
+                }
+            }
+            assert_eq!(text, "héllo world", "split {split}");
+            assert!(done, "split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn priming_sends_only_the_system_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_json(json!({
+                "model": "test-model",
+                "stream": false,
+                "messages": [{"role": "system", "content": voice_instructions()}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": ""},
+                "done": true,
+                "done_reason": "load",
+                "system_prompt_cached": true
+            })))
+            .mount(&server)
+            .await;
+
+        let primed = within_test_timeout(
+            client(&server)
+                .with_instructions(voice_instructions())
+                .prime_instructions(),
+        )
+        .await
+        .unwrap();
+        assert!(primed);
+    }
+
+    #[test]
+    fn voice_instructions_extend_the_teacher_prompt() {
+        let voice = voice_instructions();
+        assert!(voice.starts_with(TEACHER_INSTRUCTIONS.trim_end()));
+        assert!(voice.ends_with(VOICE_INSTRUCTIONS.trim()));
+        assert!(voice.contains("short spoken sentences"));
+        assert_eq!(
+            voice,
+            voice_instructions(),
+            "identical every time, so it can stay cached"
+        );
     }
 
     #[tokio::test]
@@ -1124,11 +1619,6 @@ mod tests {
             ResponseTemplate::new(200).set_body_json(json!({
                 "message": {"role": "assistant", "content": "partial"},
                 "done": false
-            })),
-            ResponseTemplate::new(200).set_body_json(json!({
-                "message": {"role": "assistant", "content": "partial"},
-                "done": true,
-                "done_reason": "length"
             })),
         ];
 

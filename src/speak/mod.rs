@@ -16,6 +16,7 @@ use crate::{
 
 pub mod audio;
 pub mod playback;
+pub mod sentences;
 pub mod tts;
 pub mod worker;
 
@@ -131,6 +132,12 @@ pub fn independence_says(text: &str) {
     interface::answer(text);
 }
 
+/// Displays one sentence of a streamed answer. The first sentence carries the
+/// "Independence:" label; later ones continue beneath it.
+pub fn independence_says_sentence(text: &str, first: bool) {
+    interface::answer_sentence(text, first);
+}
+
 /// Displays only a final recognized microphone transcript. Partial text stays
 /// out of both diagnostics and the terminal interface.
 pub fn user_transcript(stage: &'static str, text: &str) {
@@ -222,6 +229,8 @@ pub fn welcome() {
 pub fn emit(output: Output) {
     let kind = match &output {
         Output::Answer(_) => "answer",
+        Output::AnswerSentence(_) => "answer_sentence",
+        Output::AnswerStreamed => "answer_streamed",
         Output::Diagnostic(_) => "notice",
         Output::Cameras(_) => "camera_list",
         Output::Help => "help",

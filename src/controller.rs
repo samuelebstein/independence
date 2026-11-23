@@ -20,6 +20,10 @@ pub const MAX_HISTORY_TURNS: usize = 6;
 #[derive(Debug, Default)]
 pub struct Controller {
     mode: OperatingMode,
+    /// When true, a question without a new photo sends the last accepted
+    /// photo again so follow-ups can refer to it (typed `/camera`). Voice
+    /// sets this false: a photo is sent only with the turn that took it.
+    resend_accepted_photos: bool,
     session: Session,
     active: Option<ActiveTurn>,
     pending_camera: Option<PendingCamera>,
@@ -92,9 +96,26 @@ impl Controller {
     pub(crate) fn new_ephemeral() -> Self {
         Self {
             mode: OperatingMode::Ephemeral,
+            resend_accepted_photos: true,
             next_turn_id: 1,
             next_camera_request_id: 1,
             ..Self::default()
+        }
+    }
+
+    /// Voice policy: send a photo only with the question that captured it.
+    /// Follow-ups use the text history alone, which saves the model from
+    /// re-reading the image on every turn.
+    pub(crate) fn with_photo_only_on_capturing_turn(mut self) -> Self {
+        self.resend_accepted_photos = false;
+        self
+    }
+
+    fn follow_up_photos(&self) -> Vec<Photo> {
+        if self.resend_accepted_photos {
+            self.session.photos.clone()
+        } else {
+            Vec::new()
         }
     }
 
@@ -124,6 +145,7 @@ impl Controller {
     pub(crate) fn new_private_for_test() -> Self {
         Self {
             mode: OperatingMode::Private,
+            resend_accepted_photos: true,
             next_turn_id: 1,
             next_camera_request_id: 1,
             ..Self::default()
@@ -142,6 +164,7 @@ impl Controller {
             Event::CameraCaptureReady { id, source } => {
                 self.handle_camera_capture_ready(id, source)
             }
+            Event::TurnPartial { id, text } => self.handle_turn_partial(id, text),
             Event::TurnFinished(finished) => self.handle_turn_finished(finished),
             Event::AudioTurnFinished(finished) => self.handle_audio_turn_finished(finished),
         }
@@ -168,14 +191,14 @@ impl Controller {
         match input {
             Input::Ask(question) => self.start_turn(
                 question,
-                VisualRequest::UseAccepted(self.session.photos.clone()),
+                VisualRequest::UseAccepted(self.follow_up_photos()),
                 SceneCommit::Unchanged,
             ),
             Input::AskWithPhotos { question, photos } => {
                 if photos.is_empty() {
                     return self.start_turn(
                         question,
-                        VisualRequest::UseAccepted(self.session.photos.clone()),
+                        VisualRequest::UseAccepted(self.follow_up_photos()),
                         SceneCommit::Unchanged,
                     );
                 }
@@ -410,6 +433,17 @@ impl Controller {
         )))]
     }
 
+    /// A streamed sentence may be shown and spoken only while its turn is the
+    /// current one. It is not history: only the complete answer is accepted.
+    fn handle_turn_partial(&mut self, id: TurnId, text: String) -> Vec<Effect> {
+        if !matches!(self.active.as_ref(), Some(ActiveTurn::Text(active)) if active.id == id)
+            || text.trim().is_empty()
+        {
+            return Vec::new();
+        }
+        vec![Effect::Display(Output::AnswerSentence(text))]
+    }
+
     fn handle_turn_finished(&mut self, finished: TurnFinished) -> Vec<Effect> {
         // A result is eligible only while its ID is the controller's active ID.
         // This makes a late completion from a stopped, reset, or superseded
@@ -430,7 +464,8 @@ impl Controller {
             TurnResult::Answer {
                 answer,
                 proposed_scene,
-            } => self.accept_answer(active, answer, proposed_scene),
+                streamed,
+            } => self.accept_answer(active, answer, proposed_scene, streamed),
         }
     }
 
@@ -463,6 +498,7 @@ impl Controller {
         active: TextTurn,
         answer: String,
         proposed_scene: Option<Photo>,
+        streamed: bool,
     ) -> Vec<Effect> {
         if answer.trim().is_empty() {
             return vec![Effect::Display(Output::Diagnostic(
@@ -489,6 +525,14 @@ impl Controller {
                     "worker returned an inconsistent scene result; no answer was accepted".into(),
                 ))];
             }
+        }
+
+        if streamed {
+            self.session.history.push(ConversationTurn {
+                user: active.question,
+                assistant: answer,
+            });
+            return vec![Effect::Display(Output::AnswerStreamed)];
         }
 
         self.session.history.push(ConversationTurn {
@@ -637,8 +681,147 @@ mod tests {
             result: TurnResult::Answer {
                 answer: answer.into(),
                 proposed_scene: scene,
+                streamed: false,
             },
         }));
+    }
+
+    fn ask_with_photo(controller: &mut Controller, question: &str, photo: Photo) -> TurnRequest {
+        controller
+            .handle(Event::Input(Input::AskWithPhotos {
+                question: question.into(),
+                photos: vec![photo],
+            }))
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::StartTurn(request) => Some(request),
+                _ => None,
+            })
+            .expect("a photo question should start a turn")
+    }
+
+    #[test]
+    fn streamed_sentences_are_authorized_only_for_the_current_turn() {
+        let mut controller = Controller::new();
+        let old = start_ask(&mut controller, "first question");
+        let current = start_ask(&mut controller, "second question");
+
+        assert!(
+            controller
+                .handle(Event::TurnPartial {
+                    id: old.id,
+                    text: "stale sentence.".into(),
+                })
+                .is_empty(),
+            "a superseded turn cannot display or speak"
+        );
+        assert_eq!(
+            controller.handle(Event::TurnPartial {
+                id: current.id,
+                text: "Current sentence.".into(),
+            }),
+            vec![Effect::Display(Output::AnswerSentence(
+                "Current sentence.".into()
+            ))]
+        );
+        assert!(
+            controller.accepted_history().is_empty(),
+            "a sentence alone is never history"
+        );
+    }
+
+    #[test]
+    fn a_streamed_answer_enters_history_once_without_being_shown_again() {
+        let mut controller = Controller::new();
+        let request = start_ask(&mut controller, "question");
+        controller.handle(Event::TurnPartial {
+            id: request.id,
+            text: "One.".into(),
+        });
+
+        let effects = controller.handle(Event::TurnFinished(TurnFinished {
+            id: request.id,
+            result: TurnResult::Answer {
+                answer: "One. Two.".into(),
+                proposed_scene: None,
+                streamed: true,
+            },
+        }));
+
+        assert_eq!(effects, vec![Effect::Display(Output::AnswerStreamed)]);
+        assert_eq!(controller.accepted_history().len(), 1);
+        assert_eq!(controller.accepted_history()[0].assistant, "One. Two.");
+        assert!(
+            controller
+                .handle(Event::TurnPartial {
+                    id: request.id,
+                    text: "late.".into(),
+                })
+                .is_empty(),
+            "a finished turn accepts no more sentences"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_streamed_answer_never_enters_history() {
+        let mut controller = Controller::new();
+        let request = start_ask(&mut controller, "question");
+        controller.handle(Event::TurnPartial {
+            id: request.id,
+            text: "Spoken already.".into(),
+        });
+        controller.handle(Event::Input(Input::Stop));
+        controller.handle(Event::TurnFinished(TurnFinished {
+            id: request.id,
+            result: TurnResult::Answer {
+                answer: "Spoken already. More.".into(),
+                proposed_scene: None,
+                streamed: true,
+            },
+        }));
+        assert!(controller.accepted_history().is_empty());
+    }
+
+    #[test]
+    fn voice_policy_sends_a_photo_only_with_the_turn_that_took_it() {
+        let mut controller = Controller::new().with_photo_only_on_capturing_turn();
+        let photo_turn = ask_with_photo(
+            &mut controller,
+            "what is this?",
+            Photo::test_photo("scene.png"),
+        );
+        assert!(matches!(
+            photo_turn.visual,
+            VisualRequest::UseAccepted(ref photos) if photos.len() == 1
+        ));
+        successful_answer(&mut controller, photo_turn.id, "a scene", None);
+
+        let follow_up = start_ask(&mut controller, "and what color is it?");
+        assert!(matches!(
+            follow_up.visual,
+            VisualRequest::UseAccepted(ref photos) if photos.is_empty()
+        ));
+        assert_eq!(
+            follow_up.history.len(),
+            1,
+            "text history still carries the context"
+        );
+    }
+
+    #[test]
+    fn typed_policy_still_resends_the_accepted_photo() {
+        let mut controller = Controller::new();
+        let photo_turn = ask_with_photo(
+            &mut controller,
+            "what is this?",
+            Photo::test_photo("scene.png"),
+        );
+        successful_answer(&mut controller, photo_turn.id, "a scene", None);
+        let follow_up = start_ask(&mut controller, "and what color is it?");
+        assert!(matches!(
+            follow_up.visual,
+            VisualRequest::UseAccepted(ref photos) if photos.len() == 1
+        ));
     }
 
     #[test]
@@ -662,6 +845,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "old answer".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -688,6 +872,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "too late".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -714,6 +899,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "too late".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -767,6 +953,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "too late".into(),
                         proposed_scene: Some(Photo::test_photo("new.png")),
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -937,6 +1124,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "still accepted".into(),
                         proposed_scene: None,
+                        streamed: false,
                     },
                 }))
                 .contains(&Effect::Display(Output::Answer("still accepted".into())))
@@ -1004,6 +1192,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "too late".into(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(1))),
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -1049,6 +1238,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "too late".into(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(0))),
+                        streamed: false,
                     },
                 }))
                 .is_empty()
@@ -1091,6 +1281,7 @@ mod tests {
                     result: TurnResult::Answer {
                         answer: "late camera answer".into(),
                         proposed_scene: Some(Photo::test_camera_photo(camera(0))),
+                        streamed: false,
                     },
                 }))
                 .is_empty()

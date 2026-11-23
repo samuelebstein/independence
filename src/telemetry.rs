@@ -368,6 +368,17 @@ impl Interaction {
             .record_ollama_statistics(&statistics);
     }
 
+    /// Records a milestone only the first time it happens in this
+    /// interaction (for example, the first spoken sentence of a streamed
+    /// answer), so later repeats cannot move it.
+    pub fn mark_first(&self, milestone: &'static str) {
+        let mut first = false;
+        self.with_state(|state| first = !state.milestones_ms.contains_key(milestone));
+        if first {
+            self.mark(milestone);
+        }
+    }
+
     pub fn mark(&self, milestone: &'static str) {
         let elapsed = self.inner.started.elapsed();
         self.with_state(|state| {

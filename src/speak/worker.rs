@@ -8,11 +8,11 @@ use std::{
     io,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::mpsc as tokio_mpsc;
@@ -31,6 +31,9 @@ use super::{
 };
 
 const PLAYBACK_QUEUE_CAPACITY: usize = 8;
+/// How often the synthesis helper checks whether playback has finished while
+/// it waits for the next utterance.
+const PREFETCH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The application state that authorized an utterance. A model answer carries
 /// its existing `TurnId`; a fixed error notice is owned by the system. Either
@@ -417,7 +420,7 @@ fn worker_loop<S, P>(
     playback: P,
     generation: Arc<AtomicU64>,
 ) where
-    S: Synthesizer,
+    S: Synthesizer + Send,
     P: Playback,
 {
     worker_loop_with_metrics(
@@ -441,36 +444,127 @@ fn worker_loop_with_metrics<S, P>(
     generation: Arc<AtomicU64>,
     queue_metrics: WorkerQueueMetrics,
 ) where
-    S: Synthesizer,
+    S: Synthesizer + Send,
     P: Playback,
 {
-    while let Ok(command) = receiver.recv() {
-        match command {
-            SpeechCommand::Shutdown => break,
-            SpeechCommand::Speak(request) => process_request(
+    let mut receiver = receiver;
+    // An utterance synthesized while the previous one was playing.
+    let mut ready: Option<(SpeechRequest, Vec<u8>)> = None;
+    let mut stopping = false;
+    loop {
+        let (request, audio) = match ready.take() {
+            Some(ready) => ready,
+            None if stopping => break,
+            None => match receiver.recv() {
+                Ok(SpeechCommand::Speak(request)) => {
+                    match synthesize_request(
+                        request,
+                        &event_sender,
+                        &mut synthesizer,
+                        &generation,
+                        &queue_metrics,
+                    ) {
+                        Some(ready) => ready,
+                        None => continue,
+                    }
+                }
+                Ok(SpeechCommand::Shutdown) | Err(_) => break,
+            },
+        };
+
+        // Play this utterance on this thread while a helper thread
+        // synthesizes the next queued one, so a streamed answer's sentences
+        // follow each other without a synthesis gap. Order is unchanged: the
+        // helper takes requests from the same queue, one at a time.
+        let playing = AtomicBool::new(true);
+        let prefetched = thread::scope(|scope| {
+            let prefetch = scope.spawn(|| {
+                prefetch_next(
+                    &mut receiver,
+                    &playing,
+                    &event_sender,
+                    &mut synthesizer,
+                    &generation,
+                    &queue_metrics,
+                )
+            });
+            play_request(
                 request,
+                audio,
                 &event_sender,
-                &mut synthesizer,
                 &mut playback,
                 &generation,
                 &queue_metrics,
-            ),
+            );
+            playing.store(false, Ordering::Release);
+            prefetch.join().expect("speech synthesis helper panicked")
+        });
+        match prefetched {
+            Prefetch::Ready(next) => ready = Some(next),
+            Prefetch::Stop => stopping = true,
+            Prefetch::Nothing => {}
         }
     }
 
     info!(target: "speech", event = "worker_stopped", "speech");
 }
 
-fn process_request<S, P>(
+enum Prefetch {
+    Ready((SpeechRequest, Vec<u8>)),
+    Stop,
+    Nothing,
+}
+
+/// Waits (while the current utterance plays) for the next request and
+/// synthesizes it. Returns as soon as playback ends if nothing arrived.
+fn prefetch_next<S>(
+    receiver: &mut Receiver<SpeechCommand>,
+    playing: &AtomicBool,
+    event_sender: &tokio_mpsc::Sender<SpeechEvent>,
+    synthesizer: &mut S,
+    generation: &AtomicU64,
+    queue_metrics: &WorkerQueueMetrics,
+) -> Prefetch
+where
+    S: Synthesizer,
+{
+    loop {
+        match receiver.recv_timeout(PREFETCH_POLL_INTERVAL) {
+            Ok(SpeechCommand::Speak(request)) => {
+                return match synthesize_request(
+                    request,
+                    event_sender,
+                    synthesizer,
+                    generation,
+                    queue_metrics,
+                ) {
+                    Some(ready) => Prefetch::Ready(ready),
+                    None => Prefetch::Nothing,
+                };
+            }
+            Ok(SpeechCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                return Prefetch::Stop;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !playing.load(Ordering::Acquire) {
+                    return Prefetch::Nothing;
+                }
+            }
+        }
+    }
+}
+
+/// Synthesizes one request. On cancellation or failure it reports the
+/// outcome itself and returns `None`.
+fn synthesize_request<S>(
     request: SpeechRequest,
     event_sender: &tokio_mpsc::Sender<SpeechEvent>,
     synthesizer: &mut S,
-    playback: &mut P,
     generation: &AtomicU64,
     queue_metrics: &WorkerQueueMetrics,
-) where
+) -> Option<(SpeechRequest, Vec<u8>)>
+where
     S: Synthesizer,
-    P: Playback,
 {
     queue_metrics.pending_depth.fetch_sub(1, Ordering::AcqRel);
     queue_metrics.active_work.fetch_add(1, Ordering::AcqRel);
@@ -490,7 +584,7 @@ fn process_request<S, P>(
             SpeechOutcome::Cancelled,
             queue_metrics.active_work.as_ref(),
         );
-        return;
+        return None;
     }
 
     let synthesis = request
@@ -560,7 +654,7 @@ fn process_request<S, P>(
                 SpeechOutcome::Cancelled,
                 queue_metrics.active_work.as_ref(),
             );
-            return;
+            return None;
         }
         Err(_error) => {
             if let Some(stage) = synthesis {
@@ -583,10 +677,24 @@ fn process_request<S, P>(
                 SpeechOutcome::SynthesisFailed,
                 queue_metrics.active_work.as_ref(),
             );
-            return;
+            return None;
         }
     };
 
+    Some((request, audio))
+}
+
+/// Plays one synthesized utterance and reports its outcome.
+fn play_request<P>(
+    request: SpeechRequest,
+    audio: Vec<u8>,
+    event_sender: &tokio_mpsc::Sender<SpeechEvent>,
+    playback: &mut P,
+    generation: &AtomicU64,
+    queue_metrics: &WorkerQueueMetrics,
+) where
+    P: Playback,
+{
     if request_is_stale(&request, generation) {
         info!(
             target: "speech",
@@ -616,7 +724,9 @@ fn process_request<S, P>(
         // backend to start. It measures software dispatch, not sound at ears.
         interaction.mark("speech.playback_started");
         if matches!(request.owner, SpeechOwner::Turn(_)) {
-            interaction.mark("final_answer.playback_started");
+            // A streamed answer is several utterances; "first audio" is the
+            // first sentence's playback.
+            interaction.mark_first("final_answer.playback_started");
         }
     }
     let playback_stage = request
@@ -808,6 +918,90 @@ mod tests {
             self.played.lock().unwrap().push(request.utterance_id);
             Ok(PlaybackResult::Completed)
         }
+    }
+
+    /// Playback that stays "playing" until the next utterance has been
+    /// synthesized (or a timeout), recording whether that overlap happened.
+    struct OverlapProbePlayback {
+        synth_calls: Arc<Mutex<Vec<u64>>>,
+        played: Arc<Mutex<Vec<u64>>>,
+        overlapped: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Playback for OverlapProbePlayback {
+        fn play(
+            &mut self,
+            request: PlaybackRequest,
+            _current_generation: &AtomicU64,
+        ) -> Result<PlaybackResult, PlaybackError> {
+            let next = request.utterance_id + 1;
+            let deadline = Instant::now() + std::time::Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if self.synth_calls.lock().unwrap().contains(&next) {
+                    self.overlapped.lock().unwrap().push(request.utterance_id);
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            self.played.lock().unwrap().push(request.utterance_id);
+            Ok(PlaybackResult::Completed)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_next_sentence_is_synthesized_while_the_current_one_plays() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let (event_sender, mut event_receiver) = tokio_mpsc::channel(8);
+        let generation = Arc::new(AtomicU64::new(1));
+        let synth_calls = Arc::new(Mutex::new(Vec::new()));
+        let played = Arc::new(Mutex::new(Vec::new()));
+        let overlapped = Arc::new(Mutex::new(Vec::new()));
+        for id in 1..=3 {
+            sender
+                .send(SpeechCommand::Speak(request(id, 1, "A sentence.")))
+                .unwrap();
+        }
+        sender.send(SpeechCommand::Shutdown).unwrap();
+        let worker = {
+            let synth_calls = synth_calls.clone();
+            let played = played.clone();
+            let overlapped = overlapped.clone();
+            thread::spawn(move || {
+                worker_loop(
+                    receiver,
+                    event_sender,
+                    FakeSynthesizer {
+                        calls: synth_calls.clone(),
+                        results: VecDeque::new(),
+                    },
+                    OverlapProbePlayback {
+                        synth_calls,
+                        played,
+                        overlapped,
+                    },
+                    generation,
+                );
+            })
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                event_receiver.recv().await.unwrap().outcome,
+                SpeechOutcome::Played
+            );
+        }
+        worker.join().unwrap();
+
+        assert_eq!(
+            played.lock().unwrap().as_slice(),
+            &[1, 2, 3],
+            "order is kept"
+        );
+        assert_eq!(synth_calls.lock().unwrap().as_slice(), &[1, 2, 3]);
+        assert_eq!(
+            overlapped.lock().unwrap().as_slice(),
+            &[1, 2],
+            "sentences 2 and 3 were synthesized during the previous playback"
+        );
     }
 
     struct FailingPlayback;

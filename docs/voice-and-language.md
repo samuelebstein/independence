@@ -3,7 +3,9 @@
 Independence speaks with one Piper voice and listens with one Whisper model.
 Both can be swapped at launch, which is enough to practise another language
 (for example Spanish) entirely offline. Downloading the files is a one-time
-setup step; nothing goes online while Independence runs.
+setup step; nothing goes online while Independence runs (a voice that would
+make Piper download something while speaking is refused; see the Chinese
+pinyin voices below).
 
 ## The three settings
 
@@ -80,6 +82,74 @@ scripts/run-raspberry-pi-hailo.sh --check
 Drop `--check` to start. `--check` runs every setup check (files, Piper,
 Whisper model and language, button device, camera, bridge port), lists every
 problem at once, and starts nothing.
+
+## Chinese (Mandarin) setup
+
+Whisper's multilingual model already understands Mandarin (`zh`); only the
+voice is new. Piper has three Mandarin voices, all `zh_CN`:
+
+| Voice | Pronunciation | Extra download |
+| --- | --- | --- |
+| `huayan` (medium, x_low) | espeak-ng (`cmn`) | none |
+| `chaowen` (medium) | pinyin, via the g2pW model | g2pW, once |
+| `xiao_ya` (medium) | pinyin, via the g2pW model | g2pW, once |
+
+**Start with `huayan`.** It works like the HAL and Spanish voices:
+
+```bash
+cd ~/code/independence
+mkdir -p local-data/piper/zh_CN-huayan-medium
+curl -fL -o local-data/piper/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx
+curl -fL -o local-data/piper/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx.json
+# (ggml-base.bin from the Spanish setup above is also the Chinese Whisper model.)
+
+cargo run -- --voice \
+  --tts-model local-data/piper/zh_CN-huayan-medium/zh_CN-huayan-medium.onnx \
+  --whisper-model local-data/whisper/ggml-base.bin \
+  --whisper-language zh
+```
+
+On the Pi, use `INDEPENDENCE_TTS_MODEL`, `INDEPENDENCE_WHISPER_MODEL`, and
+`INDEPENDENCE_WHISPER_LANGUAGE=zh` with `scripts/run-raspberry-pi-hailo.sh`,
+as in the Spanish example.
+
+### The pinyin voices and g2pW
+
+`chaowen` and `xiao_ya` turn characters into pinyin with g2pW, a separate
+model. **If g2pW is missing, Piper downloads it from the internet the first
+time the voice speaks.** Independence does not allow that: it runs Piper in
+the voice's own folder and refuses to start with a pinyin voice unless
+`g2pW/g2pw.onnx` is already there. Download it once, next to the voice:
+
+```bash
+voice=local-data/piper/zh_CN-chaowen-medium
+mkdir -p "$voice/g2pW"
+curl -fL -o "$voice/zh_CN-chaowen-medium.onnx" \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/chaowen/medium/zh_CN-chaowen-medium.onnx
+curl -fL -o "$voice/zh_CN-chaowen-medium.onnx.json" \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/zh/zh_CN/chaowen/medium/zh_CN-chaowen-medium.onnx.json
+curl -fL "https://huggingface.co/datasets/rhasspy/piper-checkpoints/resolve/main/zh/zh_CN/_resources/g2pw.tar.gz?download=true" |
+  tar -xz -C "$voice/g2pW"
+test -f "$voice/g2pW/g2pw.onnx" && echo "g2pW ready"
+```
+
+Caveats, not yet measured:
+
+- Independence starts Piper once per sentence, so a pinyin voice also loads
+  g2pW once per sentence. Expect it to be noticeably slower than `huayan`,
+  especially on the Pi.
+- Pinyin voices need a Piper new enough to know them (the laptop's 1.8.0
+  does). Check the Pi's Piper with:
+  `~/.local/share/independence/piper-venv/bin/python -c "from piper.config import PhonemeType; print(PhonemeType.PINYIN)"`
+
+### Chinese text in Independence
+
+- Answers are split into sentences at `。`, `！`, and `？` (no space needed),
+  so Chinese answers stream sentence by sentence like English ones.
+- Whisper sometimes writes Traditional characters even for Mandarin speech.
+  The model reads both.
 
 ## Choosing `es` or `auto`
 

@@ -625,6 +625,9 @@ async fn run_transcribe_and_speak(
         mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
     let (control_sender, mut control_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let tts_model = resolved.piper.model_path().to_path_buf();
+    // Before the microphone or speaker opens: a Chinese "pinyin" voice
+    // without its pronunciation model would make Piper download one.
+    speak::tts::check_voice_is_offline(&resolved.piper).map_err(AppError::VoiceNotOffline)?;
     let speech = speak::SpeechService::with_configuration(
         resolved.piper,
         speak::playback::OutputSelection::from_requested_id(resolved.audio_output),
@@ -2666,6 +2669,9 @@ pub enum AppError {
 
     #[error("could not start the local speech worker: {0}")]
     Speech(#[source] io::Error),
+
+    #[error("the selected Piper voice cannot run offline: {0}")]
+    VoiceNotOffline(#[source] speak::tts::SynthesisError),
 
     #[error("could not inspect local audio output devices: {0}")]
     AudioOutput(#[source] speak::playback::PlaybackError),

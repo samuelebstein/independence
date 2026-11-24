@@ -235,8 +235,11 @@ fn announce_security_lifecycle(security: &SecurityManager) {
 /// can obtain any other kind of session.
 fn enter_ephemeral_mode(security: &mut SecurityManager) -> Result<EphemeralSession, AppError> {
     let session = security.enter_ephemeral().map_err(AppError::Security)?;
+    // Logged now, when the session begins. The terminal says "Ephemeral Mode
+    // is active" later, together with the ready line, so the person sees it
+    // only once input will actually be accepted.
     speak::process(
-        "operating_mode",
+        "ephemeral_mode_entered",
         "Ephemeral Mode active — temporary context only; private data is unavailable",
     );
     Ok(session)
@@ -687,6 +690,8 @@ async fn run_transcribe_and_speak(
     runtime.turns.stream_answers = true;
     let mut partial_tick = tokio::time::interval(PARTIAL_TRANSCRIPTION_INTERVAL);
     partial_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Everything above is set up; the next press is heard.
+    speak::voice_ready();
 
     loop {
         let event = tokio::select! {
@@ -2743,9 +2748,15 @@ mod tests {
 
     #[test]
     fn application_launch_enters_ephemeral_mode_once_without_any_gesture() {
+        crate::interface::test_terminal::start();
         let mut security = SecurityManager::new();
         let session = enter_ephemeral_mode(&mut security)
             .expect("launching the application enters the temporary mode immediately");
+        assert!(
+            crate::interface::test_terminal::lines().is_empty(),
+            "the session starts at launch, but the terminal announces it only \
+             with the ready line, once input is accepted"
+        );
         assert_eq!(security.state(), SecurityState::Uninitialized);
         assert_eq!(security.active_mode(), Some(OperatingMode::Ephemeral));
         assert!(

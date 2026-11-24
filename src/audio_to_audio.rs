@@ -101,6 +101,7 @@ pub(crate) async fn run(
             resolved.backend.label()
         ),
     );
+    speak::ephemeral_mode_notice();
     match microphone {
         Ok(label) => speak::voice_log(&format!(
             "audio-to-audio ready — microphone: {label}; hold Enter to record, release to submit; no Whisper, Piper, camera, or listening/thinking cue is used"

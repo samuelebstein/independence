@@ -221,7 +221,18 @@ pub fn usage(detail: &str) {
     error!(target: "process", event = "usage", "invalid command-line usage");
 }
 
+/// Tells the person the session is temporary. Each mode shows it right
+/// before its ready line, not at launch, so nothing appears while setup is
+/// still running.
+pub fn ephemeral_mode_notice() {
+    process(
+        "operating_mode",
+        "Ephemeral Mode active — temporary context only; private data is unavailable",
+    );
+}
+
 pub fn welcome() {
+    ephemeral_mode_notice();
     process("ready", "Independence is ready; type /help for commands");
 }
 
@@ -261,6 +272,7 @@ pub fn voice_log(message: &str) {
 /// Displays non-sensitive setup information before standalone dictation
 /// enters READY.
 pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
+    ephemeral_mode_notice();
     process("mode", "dictation — local transcription only");
     match microphone {
         Ok(microphone) => process("microphone", microphone),
@@ -287,7 +299,9 @@ pub fn dictation_welcome(microphone: Result<&str, &str>, model_path: &Path, mode
 
 /// Displays setup information for button-controlled voice questions.
 pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_available: bool) {
-    process("mode", "voice — local transcription and local Ollama");
+    // Setup details are logged only. The terminal shows one line, from
+    // `voice_ready`, once the runtime can actually take a question.
+    process("voice_mode", "voice — local transcription and local Ollama");
     match microphone {
         Ok(microphone) => process("microphone", microphone),
         Err(message) => warning("microphone_unavailable", message),
@@ -302,17 +316,18 @@ pub fn voice_welcome(microphone: Result<&str, &str>, model_path: &Path, model_av
         format!("{} ({availability})", model_path.display()),
     );
     process(
-        "controls",
-        "Release ENTER to submit. Press P while holding ENTER to take a photo. Press ESC to cancel.",
-    );
-    process(
         "safety",
         "Spoken command-like text is treated as a question, not a terminal command.",
     );
-    // The prompt comes last so it is the line the person acts on.
+}
+
+/// The first line the person acts on in voice mode, shown once everything
+/// is set up and the first press will be heard.
+pub fn voice_ready() {
+    ephemeral_mode_notice();
     process(
-        "voice_prompt",
-        "hold down Enter to start recording/transcription",
+        "voice_ready",
+        "voice mode ready — hold enter to speak; p while holding takes a photo; esc cancels",
     );
 }
 

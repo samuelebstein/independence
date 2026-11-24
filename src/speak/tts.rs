@@ -80,6 +80,46 @@ impl PiperConfig {
     }
 }
 
+/// Piper's Chinese "pinyin" voices need a separate pronunciation model
+/// (g2pW). If it is missing, Piper downloads it from the internet on first
+/// use. Independence never lets that happen silently: the model must already
+/// be in this folder next to the voice, or the voice is refused.
+pub const PRONUNCIATION_MODEL_DIR: &str = "g2pW";
+const PRONUNCIATION_MODEL_FILE: &str = "g2pw.onnx";
+
+/// Piper runs with the voice's folder as its working directory, so the
+/// resources it looks for relative to that (g2pW) are found next to the voice
+/// instead of wherever Independence was started.
+fn voice_directory(config: &PiperConfig) -> PathBuf {
+    std::path::absolute(&config.model_path)
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The pronunciation-model folder this voice needs, if it needs one. Only
+/// the voice's own config decides (`"phoneme_type": "pinyin"`); an unreadable
+/// config is reported by synthesis itself.
+pub fn pronunciation_model_dir(config: &PiperConfig) -> Option<PathBuf> {
+    let bytes = std::fs::read(&config.config_path).ok()?;
+    let voice: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    (voice
+        .get("phoneme_type")
+        .and_then(serde_json::Value::as_str)
+        == Some("pinyin"))
+    .then(|| voice_directory(config).join(PRONUNCIATION_MODEL_DIR))
+}
+
+/// Refuses a voice that would make Piper download something while it speaks.
+pub fn check_voice_is_offline(config: &PiperConfig) -> Result<(), SynthesisError> {
+    match pronunciation_model_dir(config) {
+        Some(directory) if !directory.join(PRONUNCIATION_MODEL_FILE).is_file() => {
+            Err(SynthesisError::MissingPronunciationModel(directory))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A generation-stamped request. The speech worker changes generation before
 /// cancelling, so a late local process result cannot reach playback.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,12 +179,21 @@ impl Synthesizer for PiperCli {
                 self.config.config_path.clone(),
             ));
         }
+        // Checked on every utterance, not just at launch, so a pronunciation
+        // model removed while running still cannot trigger a download.
+        check_voice_is_offline(&self.config)?;
 
+        // Absolute paths, because Piper runs in the voice's folder.
+        let model_path = std::path::absolute(&self.config.model_path)
+            .unwrap_or_else(|_| self.config.model_path.clone());
+        let config_path = std::path::absolute(&self.config.config_path)
+            .unwrap_or_else(|_| self.config.config_path.clone());
         let mut child = Command::new(&self.config.command)
+            .current_dir(voice_directory(&self.config))
             .arg("--model")
-            .arg(&self.config.model_path)
+            .arg(&model_path)
             .arg("--config")
-            .arg(&self.config.config_path)
+            .arg(&config_path)
             .arg("--output-file")
             .arg("-")
             .stdin(Stdio::piped())
@@ -232,6 +281,11 @@ pub enum SynthesisError {
     #[error("Piper model configuration file is missing: {0}")]
     MissingConfig(PathBuf),
 
+    #[error(
+        "this Piper voice needs the g2pW pronunciation model in {0}, and Piper would download it from the internet while speaking. Download it once first (see docs/voice-and-language.md)"
+    )]
+    MissingPronunciationModel(PathBuf),
+
     #[error("could not start local Piper command {command}: {source}")]
     Spawn {
         command: String,
@@ -282,7 +336,48 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{PiperConfig, SynthesisRequest, generation_changed};
+    use super::{
+        PiperConfig, SynthesisError, SynthesisRequest, check_voice_is_offline, generation_changed,
+        pronunciation_model_dir,
+    };
+
+    fn voice_with_config(directory: &std::path::Path, config: &str) -> PiperConfig {
+        let model = directory.join("zh_CN-chaowen-medium.onnx");
+        let config_path = directory.join("zh_CN-chaowen-medium.onnx.json");
+        std::fs::write(&model, b"").unwrap();
+        std::fs::write(&config_path, config).unwrap();
+        PiperConfig::new("piper", model, config_path)
+    }
+
+    #[test]
+    fn pinyin_voices_are_refused_until_their_pronunciation_model_is_local() {
+        let directory = tempfile::tempdir().unwrap();
+        let voice = voice_with_config(directory.path(), r#"{"phoneme_type": "pinyin"}"#);
+        let expected = directory.path().join("g2pW");
+        assert_eq!(pronunciation_model_dir(&voice), Some(expected.clone()));
+        assert!(matches!(
+            check_voice_is_offline(&voice),
+            Err(SynthesisError::MissingPronunciationModel(path)) if path == expected
+        ));
+
+        std::fs::create_dir(&expected).unwrap();
+        std::fs::write(expected.join("g2pw.onnx"), b"").unwrap();
+        assert!(check_voice_is_offline(&voice).is_ok());
+    }
+
+    #[test]
+    fn espeak_voices_need_no_pronunciation_model() {
+        let directory = tempfile::tempdir().unwrap();
+        for config in [
+            r#"{"phoneme_type": "espeak", "espeak": {"voice": "cmn"}}"#,
+            r#"{"espeak": {"voice": "en-us"}}"#,
+            "not json",
+        ] {
+            let voice = voice_with_config(directory.path(), config);
+            assert_eq!(pronunciation_model_dir(&voice), None, "{config}");
+            assert!(check_voice_is_offline(&voice).is_ok());
+        }
+    }
 
     #[test]
     fn generation_check_rejects_an_obsolete_request() {

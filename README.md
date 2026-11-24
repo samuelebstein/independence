@@ -34,7 +34,9 @@ discarded when the process ends.
 Since Milestone 8 (not a milestone of its own): the Piper voice, the Whisper
 model, and the language Whisper listens for can be chosen at launch
 (`--tts-model`, `--whisper-model`, `--whisper-language`, or matching
-environment variables), which is enough to practise Spanish offline. A
+environment variables), which is enough to practise Spanish or Mandarin offline. Chinese answers stream
+sentence by sentence (`。`, `！`, `？`), and a Piper voice that would download a
+pronunciation model while speaking is refused at launch. A
 non-English language with an English-only Whisper model stops the launch
 instead of mishearing. On the Pi, `scripts/run-raspberry-pi-hailo.sh --check`
 checks the whole setup at once. See [voice and language](docs/voice-and-language.md).

@@ -10,8 +10,19 @@ const ABBREVIATIONS: &[&str] = &[
     "e.g", "i.e", "etc", "vs", "mr", "mrs", "ms", "dr", "st", "prof", "approx", "no", "fig",
 ];
 
-/// A sentence longer than this is flushed at the last comma or space, so a
-/// run-on answer still starts speaking within a bounded wait.
+/// Chinese and Japanese full-width sentence ends. Unlike `.`, they never
+/// appear inside numbers or abbreviations, and the text after them has no
+/// space, so they end a sentence on their own.
+const FULL_WIDTH_ENDS: [char; 3] = ['。', '！', '？'];
+
+/// Closing quotes and brackets that belong to the sentence they follow.
+const CLOSERS: [char; 13] = [
+    '"', '\'', ')', ']', '”', '’', '」', '』', '）', '】', '.', '!', '?',
+];
+
+/// A sentence longer than this is flushed at the last comma or space (or, in
+/// text without spaces such as Chinese, at the limit itself), so a run-on
+/// answer still starts speaking within a bounded wait.
 const MAX_SENTENCE_CHARS: usize = 220;
 
 #[derive(Debug, Default)]
@@ -51,22 +62,26 @@ impl SentenceSplitter {
             if character == '\n' {
                 return Some(index + 1);
             }
-            if !matches!(character, '.' | '!' | '?' | '…') {
+            let full_width = FULL_WIDTH_ENDS.contains(&character);
+            if !full_width && !matches!(character, '.' | '!' | '?' | '…') {
                 continue;
             }
             // Include closing quotes/brackets and repeated punctuation.
             let mut end = index + character.len_utf8();
             while let Some(&(next_index, next)) = characters.peek() {
-                if matches!(next, '"' | '\'' | ')' | ']' | '”' | '’' | '.' | '!' | '?') {
+                if CLOSERS.contains(&next) || FULL_WIDTH_ENDS.contains(&next) {
                     end = next_index + next.len_utf8();
                     characters.next();
                 } else {
                     break;
                 }
             }
-            // A boundary needs following whitespace: "3.5" or "e.g." mid-word
-            // is not an end, and the next piece may still extend this one.
+            // A boundary needs a following character, so a closing quote in
+            // the next piece still joins this sentence. After `.`, `!`, or
+            // `?` it must be whitespace: "3.5" or "e.g." mid-word is not an
+            // end. After a full-width end, any character will do.
             match characters.peek() {
+                Some(_) if full_width => return Some(end),
                 Some(&(_, next)) if next.is_whitespace() => {
                     if character == '.' && ends_with_abbreviation(&text[..index]) {
                         continue;
@@ -83,11 +98,18 @@ impl SentenceSplitter {
                 .nth(MAX_SENTENCE_CHARS)
                 .map_or(text.len(), |(index, _)| index);
             let window = &text[..limit];
-            let cut = window
-                .rfind(", ")
-                .map(|index| index + 1)
+            let after_comma = [", ", "，", "、"]
+                .iter()
+                .filter_map(|comma| {
+                    window
+                        .rfind(comma)
+                        .map(|index| index + comma.trim_end().len())
+                })
+                .max();
+            let cut = after_comma
                 .or_else(|| window.rfind(' '))
-                .filter(|&index| index > 0)?;
+                .filter(|&index| index > 0)
+                .unwrap_or(limit);
             return Some(cut);
         }
         None
@@ -184,6 +206,51 @@ mod tests {
         let text = "One. Two! Three? Four… Five";
         let joined = split_all(&[text]).join(" ");
         assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn chinese_sentences_split_without_spaces() {
+        let mut splitter = SentenceSplitter::default();
+        assert!(
+            splitter.push("你好。").is_empty(),
+            "wait for the next character"
+        );
+        assert_eq!(splitter.push("今天"), ["你好。"]);
+        assert_eq!(
+            split_all(&["这是苹果。", "你喜欢吗？我很喜欢！", "好"]),
+            ["这是苹果。", "你喜欢吗？", "我很喜欢！", "好"]
+        );
+    }
+
+    #[test]
+    fn chinese_closing_quotes_stay_with_their_sentence() {
+        assert_eq!(
+            split_all(&["他说：「你好。", "」然后走了。"]),
+            ["他说：「你好。」", "然后走了。"]
+        );
+    }
+
+    #[test]
+    fn token_sized_chinese_pieces_give_the_same_sentences() {
+        let text = "苹果是红色的。香蕉呢？黄色的！";
+        let pieces: Vec<String> = text.chars().map(String::from).collect();
+        let piecewise = split_all(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(piecewise, split_all(&[text]));
+        assert_eq!(piecewise.concat(), text, "nothing lost or reordered");
+    }
+
+    #[test]
+    fn a_run_on_chinese_sentence_is_flushed_at_a_comma_or_the_limit() {
+        let with_comma = format!("{}，{}", "字".repeat(150), "字".repeat(150));
+        let sentences = split_all(&[&with_comma]);
+        assert_eq!(sentences[0], format!("{}，", "字".repeat(150)));
+        assert_eq!(sentences.concat(), with_comma);
+
+        let no_break = "字".repeat(500);
+        let sentences = split_all(&[&no_break]);
+        assert!(sentences.len() >= 2, "{sentences:?}");
+        assert!(sentences.iter().all(|s| s.chars().count() <= 220));
+        assert_eq!(sentences.concat(), no_break);
     }
 
     #[test]

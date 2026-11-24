@@ -400,10 +400,16 @@ cargo build --release
 scripts/run-raspberry-pi-hailo.sh
 ```
 
-The script checks the model file, Hailo Apps, bridge Python, Piper and the HAL
-voice, the button device, the release binary, and the camera
-(`rpicam-still --list-cameras`). Any missing piece stops it with one message
-naming the fix; a missing camera is fatal because this profile requires it.
+The script checks the model file, Hailo Apps, bridge Python, Piper and the
+voice, the Whisper model and language, the button device, the release binary,
+and the camera (`rpicam-still --list-cameras`). Every check runs, and each
+problem is listed with the fix; a missing camera is fatal because this profile
+requires it. To check the whole setup without starting anything:
+
+```bash
+scripts/run-raspberry-pi-hailo.sh --check
+```
+
 It refuses to start if something already listens on the bridge port (for
 example, a bridge left running in another terminal). It then starts the
 bridge in the background, waits for `/healthz` to report `ready`, and runs
@@ -429,7 +435,10 @@ Every default can be overridden with an environment variable:
 | `HAILO_APPS_DIR` | `$HOME/code/hailo-apps-26.03.1` |
 | `HAILO_VLM_PYTHON` | `$HOME/.venvs/hailo-qwen3-smoke/bin/python` |
 | `INDEPENDENCE_PIPER_COMMAND` | `$HOME/.local/share/independence/piper-venv/bin/piper` |
-| `INDEPENDENCE_TTS_MODEL` / `INDEPENDENCE_TTS_CONFIG` | `local-data/piper/hal/hal.onnx(.json)` |
+| `INDEPENDENCE_TTS_MODEL` | `local-data/piper/hal/hal.onnx` |
+| `INDEPENDENCE_TTS_CONFIG` | the voice model path plus `.json` |
+| `INDEPENDENCE_WHISPER_MODEL` | `local-data/whisper/ggml-base.en.bin` |
+| `INDEPENDENCE_WHISPER_LANGUAGE` | `en` (`es`, another code, or `auto` need `ggml-base.bin`; see [voice and language](voice-and-language.md)) |
 | `INDEPENDENCE_LOG` | `debug` |
 
 For example: `BRIDGE_TEMPERATURE=0.4 PI_BUTTON_DEVICE=/dev/input/event3 scripts/run-raspberry-pi-hailo.sh`.

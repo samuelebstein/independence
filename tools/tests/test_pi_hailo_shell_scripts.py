@@ -207,6 +207,8 @@ FAKE_INDEPENDENCE = """\
 printf '%s\\n' "$@" > "$FAKE_RECORD_DIR/independence-args"
 printf '%s|%s|%s|%s\\n' "$INDEPENDENCE_PIPER_COMMAND" "$INDEPENDENCE_TTS_MODEL" \\
   "$INDEPENDENCE_TTS_CONFIG" "$INDEPENDENCE_LOG" > "$FAKE_RECORD_DIR/independence-env"
+printf '%s|%s\\n' "$INDEPENDENCE_WHISPER_MODEL" "$INDEPENDENCE_WHISPER_LANGUAGE" \\
+  > "$FAKE_RECORD_DIR/independence-whisper"
 test -e "$FAKE_RECORD_DIR/bridge-stopped" && echo "bridge stopped too early" >&2 && exit 9
 printf 'diagnostic line\\n' >&2
 exit "${FAKE_INDEPENDENCE_STATUS:-0}"
@@ -224,7 +226,16 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         self.logs = self.root / "logs"
         self.port = _free_loopback_port()
 
-        for name in ("model.hef", "hal.onnx", "hal.onnx.json", "event2"):
+        for name in (
+            "model.hef",
+            "hal.onnx",
+            "hal.onnx.json",
+            "es_MX-claude-high.onnx",
+            "es_MX-claude-high.onnx.json",
+            "ggml-base.en.bin",
+            "ggml-base.bin",
+            "event2",
+        ):
             (self.root / name).touch()
         (self.root / "hailo-apps").mkdir()
         for name in ("python", "piper"):
@@ -261,6 +272,7 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
                 "INDEPENDENCE_PIPER_COMMAND": str(self.root / "piper"),
                 "INDEPENDENCE_TTS_MODEL": str(self.root / "hal.onnx"),
                 "INDEPENDENCE_TTS_CONFIG": str(self.root / "hal.onnx.json"),
+                "INDEPENDENCE_WHISPER_MODEL": str(self.root / "ggml-base.en.bin"),
                 "PI_BUTTON_DEVICE": str(self.root / "event2"),
                 "INDEPENDENCE_BIN": str(self.root / "independence"),
                 "BRIDGE_LAUNCHER": str(self.root / "bridge"),
@@ -276,12 +288,13 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         environment.pop("BRIDGE_TEMPERATURE", None)
         environment.pop("BRIDGE_MAX_GENERATED_TOKENS", None)
         environment.pop("BRIDGE_SYSTEM_PROMPT_CACHE", None)
+        environment.pop("INDEPENDENCE_WHISPER_LANGUAGE", None)
         environment.update(overrides)
-        return environment
+        return {key: value for key, value in environment.items() if value != "<unset>"}
 
-    def _run(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+    def _run(self, *arguments: str, **overrides: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(PI_HAILO_RUN_SCRIPT)],
+            [str(PI_HAILO_RUN_SCRIPT), *arguments],
             cwd=REPOSITORY_ROOT,
             env=self._environment(**overrides),
             text=True,
@@ -342,6 +355,76 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         self.assertIn("alsa:mic", arguments)
         self.assertIn("alsa:speaker", arguments)
         self.assertTrue((self.record / "independence-env").read_text().strip().endswith("|info"))
+
+    def test_whisper_defaults_to_english_and_reaches_independence(self) -> None:
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.record / "independence-whisper").read_text().strip(),
+            f"{self.root / 'ggml-base.en.bin'}|en",
+        )
+
+    def test_spanish_voice_and_whisper_need_only_their_paths_and_language(self) -> None:
+        result = self._run(
+            INDEPENDENCE_TTS_MODEL=str(self.root / "es_MX-claude-high.onnx"),
+            INDEPENDENCE_TTS_CONFIG="<unset>",
+            INDEPENDENCE_WHISPER_MODEL=str(self.root / "ggml-base.bin"),
+            INDEPENDENCE_WHISPER_LANGUAGE="es",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.record / "independence-env").read_text().strip().split("|")[1:3],
+            [
+                str(self.root / "es_MX-claude-high.onnx"),
+                str(self.root / "es_MX-claude-high.onnx.json"),
+            ],
+            "the voice's own config follows the voice",
+        )
+        self.assertEqual(
+            (self.record / "independence-whisper").read_text().strip(),
+            f"{self.root / 'ggml-base.bin'}|es",
+        )
+
+    def test_another_language_with_the_english_only_whisper_model_fails_before_the_bridge(
+        self,
+    ) -> None:
+        result = self._run(INDEPENDENCE_WHISPER_LANGUAGE="es")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("English-only", result.stderr)
+        self.assertIn("ggml-base.bin", result.stderr)
+        self.assertFalse((self.record / "bridge-args.json").exists())
+
+    def test_check_reports_success_and_starts_nothing(self) -> None:
+        result = self._run("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("All checks passed", result.stdout)
+        self.assertIn("Whisper: ggml-base.en.bin (language: en)", result.stdout)
+        self.assertFalse((self.record / "bridge-args.json").exists())
+        self.assertFalse((self.record / "independence-args").exists())
+
+    def test_check_lists_every_problem_at_once(self) -> None:
+        self._camera(present=False)
+        result = self._run(
+            "--check",
+            INDEPENDENCE_BIN=str(self.root / "not-built"),
+            INDEPENDENCE_WHISPER_MODEL=str(self.root / "missing-whisper.bin"),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cargo build --release", result.stdout)
+        self.assertIn("missing-whisper.bin", result.stdout)
+        self.assertIn("no camera detected", result.stdout)
+        self.assertIn("3 problem(s) found", result.stderr)
+        self.assertFalse((self.record / "bridge-args.json").exists())
+
+    def test_a_normal_start_reports_every_problem_too(self) -> None:
+        result = self._run(
+            INDEPENDENCE_BIN=str(self.root / "not-built"),
+            PI_BUTTON_DEVICE=str(self.root / "event99"),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cargo build --release", result.stderr)
+        self.assertIn("/dev/input/by-id", result.stderr)
+        self.assertIn("--check", result.stderr)
 
     def test_system_prompt_cache_can_be_turned_off(self) -> None:
         result = self._run(BRIDGE_SYSTEM_PROMPT_CACHE="0")

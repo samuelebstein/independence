@@ -103,6 +103,15 @@ Hailo VLM request: outcome=completed lock_wait_ms=0 system_prompt_cache=hit cont
 The same fields appear as `generation_*` in the optional JSONL telemetry.
 Counts reveal roughly how long a question or answer was; no text is recorded.
 
+## Voice language setup
+
+At voice startup, one `voice_language_configured` line records the Whisper
+language code (`en`, `es`, `auto`, …) and the *file names* of the Whisper
+model and Piper voice, without their directories. It is configuration only:
+no audio, transcript, or answer text. If a non-English language is paired with
+an English-only Whisper model, the first transcription fails with
+`failure_class=english_only_model` (normally the launch refuses this first).
+
 ## Voice capture outcomes
 
 Each voice recording reports how it ended through the

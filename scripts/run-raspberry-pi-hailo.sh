@@ -7,14 +7,23 @@
 # Every default below can be overridden with an environment variable, e.g.
 #   PI_BUTTON_DEVICE=/dev/input/event3 scripts/run-raspberry-pi-hailo.sh
 #
+#   scripts/run-raspberry-pi-hailo.sh --check
+# checks everything this script needs, reports every problem at once, and
+# exits without starting anything.
+#
 # Nothing here contacts the network: the bridge binds loopback only and the
 # health check uses curl against that loopback address.
 set -euo pipefail
 
-if [[ $# -ne 0 ]]; then
-  printf '%s\n' 'usage: scripts/run-raspberry-pi-hailo.sh   (configure with environment variables; see the top of this file)' >&2
-  exit 2
-fi
+check_only=0
+case "$*" in
+  "") ;;
+  --check) check_only=1 ;;
+  *)
+    printf '%s\n' 'usage: scripts/run-raspberry-pi-hailo.sh [--check]   (configure with environment variables; see the top of this file)' >&2
+    exit 2
+    ;;
+esac
 
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -23,8 +32,14 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${HAILO_APPS_DIR:=$HOME/code/hailo-apps-26.03.1}"
 : "${HAILO_VLM_PYTHON:=$HOME/.venvs/hailo-qwen3-smoke/bin/python}"
 : "${INDEPENDENCE_PIPER_COMMAND:=$HOME/.local/share/independence/piper-venv/bin/piper}"
+# The Piper voice. Its config defaults to the same path plus `.json`, so
+# changing only INDEPENDENCE_TTS_MODEL switches voices.
 : "${INDEPENDENCE_TTS_MODEL:=$repository_root/local-data/piper/hal/hal.onnx}"
-: "${INDEPENDENCE_TTS_CONFIG:=$repository_root/local-data/piper/hal/hal.onnx.json}"
+: "${INDEPENDENCE_TTS_CONFIG:=$INDEPENDENCE_TTS_MODEL.json}"
+# What Whisper listens for: `en`, another language code such as `es`, or
+# `auto`. Anything but `en` needs a multilingual model (ggml-base.bin).
+: "${INDEPENDENCE_WHISPER_MODEL:=$repository_root/local-data/whisper/ggml-base.en.bin}"
+: "${INDEPENDENCE_WHISPER_LANGUAGE:=en}"
 : "${PI_BUTTON_DEVICE:=/dev/input/event2}"
 : "${PI_AUDIO_INPUT:=alsa:plughw:CARD=Device,DEV=0}"
 : "${PI_AUDIO_OUTPUT:=alsa:plughw:CARD=Device,DEV=0}"
@@ -47,32 +62,85 @@ fail() {
 }
 
 # --- Pre-flight checks (before anything slow starts) ------------------------
-[[ -x "$INDEPENDENCE_BIN" ]] ||
-  fail "$INDEPENDENCE_BIN is not built. Run: cargo build --release"
-[[ -x "$BRIDGE_LAUNCHER" ]] || fail "bridge launcher $BRIDGE_LAUNCHER is missing or not executable"
-[[ -r "$HAILO_VLM_HEF" ]] || fail "Hailo model file not found: $HAILO_VLM_HEF (set HAILO_VLM_HEF)"
-[[ -d "$HAILO_APPS_DIR" ]] || fail "Hailo Apps not found: $HAILO_APPS_DIR (set HAILO_APPS_DIR)"
-[[ -x "$HAILO_VLM_PYTHON" ]] || fail "bridge Python not found: $HAILO_VLM_PYTHON (set HAILO_VLM_PYTHON)"
-[[ -x "$INDEPENDENCE_PIPER_COMMAND" ]] ||
-  fail "Piper not found: $INDEPENDENCE_PIPER_COMMAND (set INDEPENDENCE_PIPER_COMMAND)"
-[[ -r "$INDEPENDENCE_TTS_MODEL" ]] || fail "voice model not found: $INDEPENDENCE_TTS_MODEL"
-[[ -r "$INDEPENDENCE_TTS_CONFIG" ]] || fail "voice config not found: $INDEPENDENCE_TTS_CONFIG"
-[[ -e "$PI_BUTTON_DEVICE" ]] ||
-  fail "button device $PI_BUTTON_DEVICE does not exist. List devices with: ls -l /dev/input/by-id/ (then set PI_BUTTON_DEVICE)"
-command -v curl >/dev/null 2>&1 || fail "curl is required for the bridge health check"
-command -v "$RPICAM_STILL" >/dev/null 2>&1 || fail "$RPICAM_STILL was not found; install rpicam-apps"
+# Every check runs, so one attempt lists everything that needs fixing.
+problems=()
+check() { # check <message if it fails> <test command...>
+  local message="$1"
+  shift
+  if "$@"; then
+    ((check_only)) && printf '  ok       %s\n' "${message%%:*}"
+  else
+    problems+=("$message")
+    ((check_only)) && printf '  PROBLEM  %s\n' "$message"
+  fi
+  return 0
+}
+has_command() { command -v "$1" >/dev/null 2>&1; }
+# English-only Whisper models are named *.en.bin and cannot hear other languages.
+whisper_model_fits_language() {
+  [[ "$INDEPENDENCE_WHISPER_LANGUAGE" == en || "$INDEPENDENCE_WHISPER_MODEL" != *.en.bin ]]
+}
+camera_is_listed() {
+  local camera_list
+  camera_list="$("$RPICAM_STILL" --list-cameras 2>&1 || true)"
+  grep -Eq '^[[:space:]]*[0-9]+[[:space:]]*:' <<<"$camera_list"
+}
+bridge_port_is_free() {
+  ! curl --silent --output /dev/null --max-time 2 "$bridge_url/healthz"
+}
 
+((check_only)) && printf '%s\n' 'Checking the Raspberry Pi Hailo setup:'
+check "Independence release build: $INDEPENDENCE_BIN is not built. Run: cargo build --release" \
+  test -x "$INDEPENDENCE_BIN"
+check "bridge launcher: $BRIDGE_LAUNCHER is missing or not executable" test -x "$BRIDGE_LAUNCHER"
+check "Hailo model: file not found: $HAILO_VLM_HEF (set HAILO_VLM_HEF)" test -r "$HAILO_VLM_HEF"
+check "Hailo Apps: not found: $HAILO_APPS_DIR (set HAILO_APPS_DIR)" test -d "$HAILO_APPS_DIR"
+check "bridge Python: not found: $HAILO_VLM_PYTHON (set HAILO_VLM_PYTHON)" test -x "$HAILO_VLM_PYTHON"
+check "Piper: not found: $INDEPENDENCE_PIPER_COMMAND (set INDEPENDENCE_PIPER_COMMAND)" \
+  test -x "$INDEPENDENCE_PIPER_COMMAND"
+check "voice model: not found: $INDEPENDENCE_TTS_MODEL (set INDEPENDENCE_TTS_MODEL)" \
+  test -r "$INDEPENDENCE_TTS_MODEL"
+check "voice config: not found: $INDEPENDENCE_TTS_CONFIG (download the voice's .onnx.json next to it)" \
+  test -r "$INDEPENDENCE_TTS_CONFIG"
+check "Whisper model: not found: $INDEPENDENCE_WHISPER_MODEL (set INDEPENDENCE_WHISPER_MODEL)" \
+  test -r "$INDEPENDENCE_WHISPER_MODEL"
+check "Whisper language: \`$INDEPENDENCE_WHISPER_LANGUAGE\` needs a multilingual model, but $INDEPENDENCE_WHISPER_MODEL is English-only. Download ggml-base.bin and set INDEPENDENCE_WHISPER_MODEL" \
+  whisper_model_fits_language
+check "button device: $PI_BUTTON_DEVICE does not exist. List devices with: ls -l /dev/input/by-id/ (then set PI_BUTTON_DEVICE)" \
+  test -e "$PI_BUTTON_DEVICE"
+check "curl: required for the bridge health check" has_command curl
+check "rpicam-still: $RPICAM_STILL was not found; install rpicam-apps" has_command "$RPICAM_STILL"
 # The raspberry-pi-hailo profile requires a camera. Fail now, before the
 # bridge spends time loading the model. Independence repeats this check.
-camera_list="$("$RPICAM_STILL" --list-cameras 2>&1 || true)"
-if ! grep -Eq '^[[:space:]]*[0-9]+[[:space:]]*:' <<<"$camera_list"; then
-  fail "no camera detected. Power off, reseat both ends of the camera ribbon, power on, and check: $RPICAM_STILL --list-cameras"
+if has_command "$RPICAM_STILL"; then
+  check "camera: no camera detected. Power off, reseat both ends of the camera ribbon, power on, and check: $RPICAM_STILL --list-cameras" \
+    camera_is_listed
 fi
-
 # Refuse to share the port with a bridge (or anything else) this script did
 # not start: it would be ambiguous which process answers and who stops it.
-if curl --silent --output /dev/null --max-time 2 "$bridge_url/healthz"; then
-  fail "something is already listening at $bridge_url. Stop the other Hailo bridge first (it may be running in another terminal)."
+if has_command curl; then
+  check "bridge port: something is already listening at $bridge_url. Stop the other Hailo bridge first (it may be running in another terminal)." \
+    bridge_port_is_free
+fi
+
+if ((${#problems[@]})); then
+  if ((check_only)); then
+    printf '%s problem(s) found. Fix them, then run this check again.\n' "${#problems[@]}" >&2
+  else
+    for problem in "${problems[@]}"; do
+      printf 'Cannot start Independence: %s\n' "$problem" >&2
+    done
+    ((${#problems[@]} > 1)) &&
+      printf '%s\n' 'Run scripts/run-raspberry-pi-hailo.sh --check for the full list.' >&2
+  fi
+  exit 2
+fi
+if ((check_only)); then
+  printf 'All checks passed. Voice: %s; Whisper: %s (language: %s).\n' \
+    "$(basename "$INDEPENDENCE_TTS_MODEL")" "$(basename "$INDEPENDENCE_WHISPER_MODEL")" \
+    "$INDEPENDENCE_WHISPER_LANGUAGE"
+  printf '%s\n' 'Start Independence with: scripts/run-raspberry-pi-hailo.sh'
+  exit 0
 fi
 
 # --- Start the bridge ------------------------------------------------------
@@ -135,7 +203,8 @@ done
 
 # --- Run Independence in the foreground --------------------------------------
 printf 'Diagnostics: %s\n' "$independence_log"
-export INDEPENDENCE_PIPER_COMMAND INDEPENDENCE_TTS_MODEL INDEPENDENCE_TTS_CONFIG INDEPENDENCE_LOG
+export INDEPENDENCE_PIPER_COMMAND INDEPENDENCE_TTS_MODEL INDEPENDENCE_TTS_CONFIG INDEPENDENCE_LOG \
+  INDEPENDENCE_WHISPER_MODEL INDEPENDENCE_WHISPER_LANGUAGE
 set +e
 "$INDEPENDENCE_BIN" \
   --voice \

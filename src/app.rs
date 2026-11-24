@@ -548,6 +548,14 @@ pub async fn run_voice_with_options(options: VoiceLaunchOptions) -> Result<(), A
     result
 }
 
+/// A model file's name without its directory, for logs that should not
+/// record where on the machine (or under whose home directory) it lives.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Asks the Hailo bridge to load the (fixed, non-private) voice system
 /// message once now, so no question has to wait for it to be read again.
 /// Failure only costs speed: the bridge then reads it with each question.
@@ -616,6 +624,7 @@ async fn run_transcribe_and_speak(
     let (speech_event_sender, mut speech_event_receiver) =
         mpsc::channel(VOICE_AUX_CHANNEL_CAPACITY);
     let (control_sender, mut control_receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    let tts_model = resolved.piper.model_path().to_path_buf();
     let speech = speak::SpeechService::with_configuration(
         resolved.piper,
         speak::playback::OutputSelection::from_requested_id(resolved.audio_output),
@@ -648,9 +657,22 @@ async fn run_transcribe_and_speak(
         ),
     );
 
+    // Configuration only (no speech): which language Whisper listens for and
+    // which Piper voice answers, so a log shows how a session was set up.
+    info!(
+        target: "process",
+        event = "voice_language_configured",
+        whisper_language = resolved.whisper_language.code(),
+        whisper_model = %file_name(&resolved.whisper_model),
+        tts_model = %file_name(&tts_model),
+        "voice language configured"
+    );
     let dictation = DictationSession::with_services(
         Arc::new(CpalRecorder::with_requested_name(resolved.microphone)),
-        Arc::new(WhisperTranscriber::new(resolved.whisper_model)),
+        Arc::new(
+            WhisperTranscriber::new(resolved.whisper_model)
+                .with_language(resolved.whisper_language),
+        ),
         dictation_event_sender,
     );
     let microphone_label = dictation.microphone_label();

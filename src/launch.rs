@@ -7,6 +7,8 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
+use crate::dictation::WhisperLanguage;
+
 /// Private Mode is deliberately not a launch option until Ephemeral Mode is
 /// mature and an authenticated private session exists. Saying so explicitly is
 /// clearer than a generic "unknown option" for someone following older notes.
@@ -151,6 +153,13 @@ pub struct VoiceLaunchOptions {
     pub model: Option<String>,
     pub pipeline: Option<VoicePipeline>,
     pub backend: Option<ModelBackend>,
+    /// Piper voice (`.onnx`); its config is the same path plus `.json`.
+    /// Wins over `INDEPENDENCE_TTS_MODEL`/`INDEPENDENCE_TTS_CONFIG`.
+    pub tts_model: Option<PathBuf>,
+    /// Whisper model file. Wins over `INDEPENDENCE_WHISPER_MODEL`.
+    pub whisper_model: Option<PathBuf>,
+    /// Spoken language, or `auto`. Wins over `INDEPENDENCE_WHISPER_LANGUAGE`.
+    pub whisper_language: Option<WhisperLanguage>,
 }
 
 /// The top-level action selected from argv.
@@ -240,6 +249,17 @@ fn parse_voice_options(values: &[&str]) -> Result<VoiceLaunchOptions, String> {
                 ModelBackend::parse(value)?,
                 "--backend",
             )?,
+            "--tts-model" => set_once(&mut options.tts_model, PathBuf::from(value), "--tts-model")?,
+            "--whisper-model" => set_once(
+                &mut options.whisper_model,
+                PathBuf::from(value),
+                "--whisper-model",
+            )?,
+            "--whisper-language" => set_once(
+                &mut options.whisper_language,
+                WhisperLanguage::parse(value)?,
+                "--whisper-language",
+            )?,
             "--audio-backend" => {
                 return Err("`--audio-backend` was renamed to `--backend`".into());
             }
@@ -311,7 +331,55 @@ mod tests {
                 model: None,
                 pipeline: None,
                 backend: None,
+                tts_model: None,
+                whisper_model: None,
+                whisper_language: None,
             }))
+        );
+    }
+
+    #[test]
+    fn voice_and_language_options_are_parsed() {
+        let options = match parse(&[
+            "--voice",
+            "--tts-model",
+            "local-data/piper/es/es_MX-claude-high.onnx",
+            "--whisper-model",
+            "local-data/whisper/ggml-base.bin",
+            "--whisper-language",
+            "Spanish",
+        ])
+        .unwrap()
+        {
+            LaunchCommand::Voice(options) => options,
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(
+            options.tts_model,
+            Some("local-data/piper/es/es_MX-claude-high.onnx".into())
+        );
+        assert_eq!(
+            options.whisper_model,
+            Some("local-data/whisper/ggml-base.bin".into())
+        );
+        assert_eq!(
+            options
+                .whisper_language
+                .as_ref()
+                .map(|language| language.code()),
+            Some("es"),
+            "full language names are stored as whisper.cpp's code"
+        );
+        assert!(parse(&["--voice", "--whisper-language", "klingon"]).is_err());
+        assert!(
+            parse(&[
+                "--voice",
+                "--whisper-language",
+                "es",
+                "--whisper-language",
+                "en"
+            ])
+            .is_err()
         );
     }
 

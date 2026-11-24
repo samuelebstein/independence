@@ -10,6 +10,7 @@ use std::{env, ffi::OsString, path::PathBuf};
 use thiserror::Error;
 
 use crate::{
+    dictation::{WhisperLanguage, transcribe::is_english_only_model_name},
     launch::{HardwareProfile, ModelBackend, VoiceInputMode, VoiceLaunchOptions, VoicePipeline},
     speak::tts::{DEFAULT_HAL_MODEL, DEFAULT_PIPER_COMMAND, PiperConfig},
     think::{OllamaConfig, ThinkError},
@@ -73,6 +74,7 @@ pub(crate) struct ResolvedVoiceProfile {
     pub microphone: Option<String>,
     pub audio_output: Option<String>,
     pub whisper_model: PathBuf,
+    pub whisper_language: WhisperLanguage,
     pub piper: PiperConfig,
     /// The selected model's name belongs to the backend choice, not to a
     /// hardware profile. The fixture backend deliberately leaves it unused.
@@ -97,6 +99,7 @@ struct EnvironmentOverrides {
     microphone: Option<String>,
     audio_output: Option<String>,
     whisper_model: Option<PathBuf>,
+    whisper_language: Option<String>,
     tts_command: Option<OsString>,
     tts_model: Option<PathBuf>,
     tts_config: Option<PathBuf>,
@@ -115,6 +118,7 @@ impl EnvironmentOverrides {
             microphone: nonempty_var("INDEPENDENCE_MICROPHONE"),
             audio_output: nonempty_var("INDEPENDENCE_AUDIO_OUTPUT"),
             whisper_model: env::var_os("INDEPENDENCE_WHISPER_MODEL").map(PathBuf::from),
+            whisper_language: nonempty_var("INDEPENDENCE_WHISPER_LANGUAGE"),
             tts_command: env::var_os("INDEPENDENCE_PIPER_COMMAND"),
             tts_model: env::var_os("INDEPENDENCE_TTS_MODEL").map(PathBuf::from),
             tts_config: env::var_os("INDEPENDENCE_TTS_CONFIG").map(PathBuf::from),
@@ -249,15 +253,43 @@ fn resolve_with_environment(
         None
     };
 
-    let whisper_model = environment
+    let whisper_model = options
         .whisper_model
+        .clone()
+        .or(environment.whisper_model)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_WHISPER_MODEL));
-    let tts_model = environment
-        .tts_model
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_HAL_MODEL));
-    let tts_config = environment
-        .tts_config
-        .unwrap_or_else(|| PathBuf::from(format!("{}.json", tts_model.display())));
+    let whisper_language = match (&options.whisper_language, &environment.whisper_language) {
+        (Some(language), _) => language.clone(),
+        (None, Some(value)) => {
+            WhisperLanguage::parse(value).map_err(ProfileError::InvalidWhisperLanguage)?
+        }
+        (None, None) => WhisperLanguage::english(),
+    };
+    if !whisper_language.is_english() && is_english_only_model_name(&whisper_model) {
+        // Caught here, before any model or device starts: whisper.cpp would
+        // otherwise quietly transcribe the other language as English.
+        return Err(ProfileError::EnglishOnlyWhisperModel {
+            language: whisper_language.code().to_owned(),
+            model: whisper_model,
+        });
+    }
+    // A voice chosen with --tts-model always uses its own config file, so an
+    // environment config left over for another voice cannot be paired with it.
+    let (tts_model, tts_config) = match &options.tts_model {
+        Some(model) => (
+            model.clone(),
+            PathBuf::from(format!("{}.json", model.display())),
+        ),
+        None => {
+            let model = environment
+                .tts_model
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_HAL_MODEL));
+            let config = environment
+                .tts_config
+                .unwrap_or_else(|| PathBuf::from(format!("{}.json", model.display())));
+            (model, config)
+        }
+    };
     let piper = PiperConfig::new(
         environment
             .tts_command
@@ -275,6 +307,7 @@ fn resolve_with_environment(
         microphone: options.audio_input.clone().or(environment.microphone),
         audio_output: options.audio_output.clone().or(environment.audio_output),
         whisper_model,
+        whisper_language,
         piper,
         model,
         ollama,
@@ -302,6 +335,13 @@ pub enum ProfileError {
     EmptyModel,
     #[error("invalid local Ollama configuration: {0}")]
     Ollama(#[source] ThinkError),
+    #[error("INDEPENDENCE_WHISPER_LANGUAGE: {0}")]
+    InvalidWhisperLanguage(String),
+    #[error(
+        "Whisper language `{language}` needs a multilingual model, but {} is English-only. Download ggml-base.bin and pass --whisper-model (or set INDEPENDENCE_WHISPER_MODEL)",
+        model.display()
+    )]
+    EnglishOnlyWhisperModel { language: String, model: PathBuf },
 }
 
 #[cfg(test)]
@@ -371,6 +411,118 @@ mod tests {
             !resolved.require_camera,
             "a laptop may run voice without a camera"
         );
+    }
+
+    #[test]
+    fn defaults_keep_english_whisper_and_the_hal_voice() {
+        let resolved = resolve_with_environment(
+            &VoiceLaunchOptions::default(),
+            EnvironmentOverrides::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.whisper_language.code(), "en");
+        assert_eq!(
+            resolved.whisper_model,
+            std::path::Path::new("local-data/whisper/ggml-base.en.bin")
+        );
+        assert_eq!(
+            resolved.piper.model_path(),
+            std::path::Path::new("local-data/piper/hal/hal.onnx")
+        );
+        assert_eq!(
+            resolved.piper.config_path(),
+            std::path::Path::new("local-data/piper/hal/hal.onnx.json")
+        );
+    }
+
+    #[test]
+    fn tts_model_flag_brings_its_own_config_and_beats_the_environment() {
+        let options = VoiceLaunchOptions {
+            tts_model: Some("voices/es_MX-claude-high.onnx".into()),
+            ..VoiceLaunchOptions::default()
+        };
+        let resolved = resolve_with_environment(
+            &options,
+            EnvironmentOverrides {
+                // As the Pi launcher used to set: HAL's config must not be
+                // paired with the Spanish voice.
+                tts_model: Some("hal/hal.onnx".into()),
+                tts_config: Some("hal/hal.onnx.json".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.piper.model_path(),
+            std::path::Path::new("voices/es_MX-claude-high.onnx")
+        );
+        assert_eq!(
+            resolved.piper.config_path(),
+            std::path::Path::new("voices/es_MX-claude-high.onnx.json")
+        );
+    }
+
+    #[test]
+    fn whisper_language_and_model_come_from_flags_then_environment() {
+        let from_environment = resolve_with_environment(
+            &VoiceLaunchOptions::default(),
+            EnvironmentOverrides {
+                whisper_model: Some("whisper/ggml-base.bin".into()),
+                whisper_language: Some("auto".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(from_environment.whisper_language.code(), "auto");
+        assert_eq!(
+            from_environment.whisper_model,
+            std::path::Path::new("whisper/ggml-base.bin")
+        );
+
+        let options = VoiceLaunchOptions {
+            whisper_model: Some("whisper/ggml-small.bin".into()),
+            whisper_language: Some(crate::dictation::WhisperLanguage::parse("es").unwrap()),
+            ..VoiceLaunchOptions::default()
+        };
+        let from_flags = resolve_with_environment(
+            &options,
+            EnvironmentOverrides {
+                whisper_model: Some("whisper/ggml-base.bin".into()),
+                whisper_language: Some("auto".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(from_flags.whisper_language.code(), "es");
+        assert_eq!(
+            from_flags.whisper_model,
+            std::path::Path::new("whisper/ggml-small.bin")
+        );
+
+        let invalid = resolve_with_environment(
+            &VoiceLaunchOptions::default(),
+            EnvironmentOverrides {
+                whisper_language: Some("klingon".into()),
+                ..EnvironmentOverrides::default()
+            },
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("klingon"));
+    }
+
+    #[test]
+    fn another_language_with_an_english_only_whisper_model_fails_at_launch() {
+        for language in ["es", "auto"] {
+            let options = VoiceLaunchOptions {
+                whisper_language: Some(crate::dictation::WhisperLanguage::parse(language).unwrap()),
+                ..VoiceLaunchOptions::default()
+            };
+            let error = resolve_with_environment(&options, EnvironmentOverrides::default())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("English-only"), "{error}");
+            assert!(error.contains("ggml-base.bin"), "{error}");
+        }
     }
 
     #[test]

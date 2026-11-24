@@ -204,8 +204,9 @@ history by itself; a cancelled stream's sentences never enter history. The
 speech worker plays one sentence while a helper thread synthesizes the next
 queued one, so sentences follow without a synthesis gap. Voice sends a photo
 only with the question that took it (`Controller::with_photo_only_on_capturing_turn`);
-follow-ups use text history. Whisper sizes its encoder window (`audio_ctx`) to
-the clip instead of always processing 30 seconds.
+follow-ups use text history. Whisper processes its full 30-second window by
+default; a window sized to the clip (`audio_ctx`) is available only with
+`INDEPENDENCE_WHISPER_SIZED_WINDOW=1` because it caused repeated phrases.
 
 ## Terminal interface, diagnostics, and optional local audio
 

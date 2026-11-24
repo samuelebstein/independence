@@ -671,8 +671,12 @@ async fn run_transcribe_and_speak(
         },
     );
     let mut runtime = VoiceRuntime::new(
-        // A photo is sent only with the question that took it.
-        Controller::new_ephemeral().with_photo_only_on_capturing_turn(),
+        // A photo is sent only with the question that took it, and the
+        // conversation keeps its last exchanges instead of needing /reset,
+        // which cannot be typed in voice mode.
+        Controller::new_ephemeral()
+            .with_photo_only_on_capturing_turn()
+            .with_rolling_history(),
         TurnRuntime::new(client, camera, main_event_sender),
         dictation,
         voice_aux_sender,
@@ -1567,9 +1571,10 @@ impl VoiceRuntime {
             DictationEvent::TranscriptReady { recording_id, text }
                 if text.trim().is_empty() && self.draft_matches_recording(*recording_id) =>
             {
+                // No words were heard: nothing to ask. The dictation
+                // controller shows "No speech heard".
                 self.cancel_draft();
-                self.speech.handle().cancel_all("empty_transcript");
-                Some((*recording_id, "failed"))
+                Some((*recording_id, "no_speech"))
             }
             DictationEvent::RecordingLimitReached { recording_id }
                 if self.draft_matches_recording(*recording_id) =>
@@ -1678,6 +1683,7 @@ impl VoiceRuntime {
             // transcript log. Avoid printing it once here and once there.
             DictationOutput::Transcript(_) => {}
             DictationOutput::TooShort => speak::voice_log(speak::TOO_SHORT_VOICE_LOG),
+            DictationOutput::NoSpeech => speak::voice_log(speak::NO_SPEECH_VOICE_LOG),
             DictationOutput::Diagnostic(message) => speak::warning("dictation", message),
         }
     }
@@ -2224,9 +2230,6 @@ impl VoiceRuntime {
         };
 
         speak::user_transcript("final", &transcript);
-        // The request is about to go to the local model; this is where the
-        // long wait is, so say so separately from transcription.
-        speak::voice_log("model request started");
         speak::voice_submission(&transcript, photos.len());
         let input = if photos.is_empty() {
             Input::Ask(transcript)
@@ -2238,7 +2241,14 @@ impl VoiceRuntime {
         };
         self.turns.set_pending_interaction(interaction);
         self.draft = None;
-        self.handle_main_event(Event::Input(input)).await
+        let keep_running = self.handle_main_event(Event::Input(input)).await;
+        if self.controller.has_active_turn() {
+            // The request really went to the local model; this is where the
+            // long wait is, so say so separately from transcription. (If the
+            // controller refused it, its message was shown instead.)
+            speak::voice_log("model request started");
+        }
+        keep_running
     }
 
     fn draft_matches_recording(&self, recording_id: RecordingId) -> bool {
@@ -2280,7 +2290,7 @@ impl VoiceRuntime {
 
     fn complete_pending_recording(&mut self, recording_id: RecordingId, outcome: &'static str) {
         if let Some(interaction) = self.cancelled_recordings.remove(&recording_id) {
-            if outcome == "cancelled" || outcome == "too_short" {
+            if matches!(outcome, "cancelled" | "too_short" | "no_speech") {
                 interaction.mark("cancellation.local_cleanup_completed");
             } else {
                 interaction.mark("dictation.cleanup_completed_after_failure");
@@ -3984,6 +3994,43 @@ mod tests {
                 "Ready. Hold ENTER to speak.",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_shows_no_speech_and_sends_nothing_when_no_words_were_heard() {
+        let server = MockServer::start().await;
+        // Whisper's markers such as "[BLANK_AUDIO]" are removed before the
+        // transcript reaches the runtime, leaving an empty transcript.
+        let mut harness = voice_harness(&server, [String::new()], unused_camera_service());
+        crate::interface::test_terminal::start();
+
+        let recording_id = harness.start_hold().await;
+        assert!(
+            harness
+                .runtime
+                .handle_dictation_event(DictationEvent::Input(DictationInput::HoldEnd))
+                .await
+        );
+        let finished = harness.next_dictation_event().await;
+        assert!(harness.runtime.handle_dictation_event(finished).await);
+        let transcript = harness.next_dictation_event().await;
+        assert!(matches!(
+            &transcript,
+            DictationEvent::TranscriptReady { recording_id: id, .. } if *id == recording_id
+        ));
+        assert!(harness.runtime.handle_dictation_event(transcript).await);
+
+        assert_eq!(
+            crate::interface::test_terminal::lines(),
+            [
+                "Listening...",
+                "Transcribing...",
+                "No speech heard. Hold ENTER, speak, then release.",
+                "Ready. Hold ENTER to speak.",
+            ]
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(harness.runtime.controller.accepted_history().is_empty());
     }
 
     #[tokio::test]

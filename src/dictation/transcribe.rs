@@ -25,6 +25,33 @@ const SAMPLES_PER_AUDIO_CTX_FRAME: usize = 16_000 / 50;
 const AUDIO_CTX_MARGIN: usize = 128;
 const AUDIO_CTX_MINIMUM: usize = 256;
 
+/// Removes Whisper's non-speech annotations such as `[BLANK_AUDIO]`,
+/// `[ Silence ]`, `[Music]`, or `(wind blowing)`. They describe the audio, not
+/// words the person said, and must never be sent to the model as a question.
+/// Returns an empty string when nothing but such markers (or punctuation) was
+/// recognized.
+pub(crate) fn without_non_speech_markers(raw: &str) -> String {
+    let mut kept = String::with_capacity(raw.len());
+    let mut depth_square = 0usize;
+    let mut depth_round = 0usize;
+    for character in raw.chars() {
+        match character {
+            '[' => depth_square += 1,
+            ']' if depth_square > 0 => depth_square -= 1,
+            '(' => depth_round += 1,
+            ')' if depth_round > 0 => depth_round -= 1,
+            _ if depth_square == 0 && depth_round == 0 => kept.push(character),
+            _ => {}
+        }
+    }
+    let kept = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if kept.chars().any(char::is_alphanumeric) {
+        kept
+    } else {
+        String::new()
+    }
+}
+
 /// The encoder window for a 16 kHz clip: its length plus a margin, rounded up
 /// to a multiple of 64, between the floor and the full 30-second window.
 pub(crate) fn audio_ctx_for(samples: usize) -> usize {
@@ -125,6 +152,10 @@ pub enum TranscriptionError {
 pub struct WhisperTranscriber {
     model_path: PathBuf,
     context: Mutex<Option<Arc<WhisperContext>>>,
+    /// True only when `INDEPENDENCE_WHISPER_SIZED_WINDOW=1`. The sized window
+    /// is faster but made Whisper repeat phrases on the Pi ("What is gravity?
+    /// What is gravity?"), so the full 30-second window is the default.
+    sized_window: bool,
 }
 
 impl WhisperTranscriber {
@@ -140,9 +171,12 @@ impl WhisperTranscriber {
         // the terminal, where they could interleave with intentionally shown
         // transcript text. It is safe to call more than once.
         whisper_rs::install_logging_hooks();
+        let sized_window = std::env::var("INDEPENDENCE_WHISPER_SIZED_WINDOW")
+            .is_ok_and(|value| value.trim() == "1");
         Self {
             model_path,
             context: Mutex::new(None),
+            sized_window,
         }
     }
 
@@ -236,7 +270,11 @@ impl Transcriber for WhisperTranscriber {
         interaction: Option<&Interaction>,
     ) -> Result<String, TranscriptionError> {
         let audio_samples = audio.samples().len();
-        let audio_ctx = audio_ctx_for(audio_samples);
+        let audio_ctx = if self.sized_window {
+            audio_ctx_for(audio_samples)
+        } else {
+            WHISPER_FULL_AUDIO_CTX
+        };
         let recognition = interaction.map(|interaction| {
             interaction.stage(
                 kind.operation(),
@@ -298,14 +336,9 @@ impl Transcriber for WhisperTranscriber {
                 })?;
                 text.push_str(segment);
             }
-            let text = text.trim().to_owned();
-            if text.is_empty() {
-                return Err(TranscriptionError::Failed(
-                    "local transcription returned no text".into(),
-                ));
-            }
-
-            Ok(text)
+            // An empty result means no words were heard; callers treat it as
+            // "no speech", not as a recognition failure.
+            Ok(without_non_speech_markers(&text))
         })();
         if let Some(stage) = recognition {
             let (outcome, fields) = match &result {
@@ -339,8 +372,31 @@ mod tests {
 
     use super::{
         Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber, audio_ctx_for,
-        cancellation_callback_data, transcription_cancelled_callback,
+        cancellation_callback_data, transcription_cancelled_callback, without_non_speech_markers,
     };
+
+    #[test]
+    fn whisper_non_speech_markers_are_not_words() {
+        for marker in [
+            "[BLANK_AUDIO]",
+            "[ Silence ]",
+            " [Music] ",
+            "(wind blowing)",
+            "[BLANK_AUDIO] .",
+            "",
+            "   ",
+        ] {
+            assert_eq!(without_non_speech_markers(marker), "", "{marker:?}");
+        }
+        assert_eq!(
+            without_non_speech_markers(" [Music] What is this plant?"),
+            "What is this plant?"
+        );
+        assert_eq!(
+            without_non_speech_markers(" Reset the session."),
+            "Reset the session."
+        );
+    }
 
     #[test]
     fn the_encoder_window_fits_the_clip_with_margin() {

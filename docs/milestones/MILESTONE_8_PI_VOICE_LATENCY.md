@@ -290,6 +290,23 @@ a question worth asking, ask it; otherwise just answer." `voice.txt` no longer
 discourages follow-up questions. Asking is left to the model's judgment in
 both modes.
 
+**Fixes from the first Pi run of this branch (2026-11-22):**
+
+- Voice reached the 6-exchange limit and told the person to type `/reset`,
+  which button mode cannot read. Voice now keeps the last 6 exchanges and
+  forgets the oldest (`Controller::with_rolling_history`); typed mode keeps
+  the limit and `/reset`.
+- Whisper's non-speech markers (`[BLANK_AUDIO]`, `[ Silence ]`, …) were sent to
+  the model as questions. They are now removed; a recording with no words
+  shows "No speech heard. Hold ENTER, speak, then release." and sends nothing.
+- "Asking the local model..." is printed only when a request actually starts.
+- **P5 failed its accuracy check and is off by default.** With the sized
+  `audio_ctx`, Whisper repeated phrases ("What is gravity? What is gravity?",
+  one question five times) — a known effect of shrinking whisper.cpp's
+  encoder window. The full 30-second window is the default again;
+  `INDEPENDENCE_WHISPER_SIZED_WINDOW=1` enables the sized window for
+  experiments only. Whisper stays at ~2 s per question.
+
 **Implementation decision beyond the plan (for owner review):** the client
 previously rejected answers with `done_reason: length`. The bridge now reports
 that honestly whenever the cap is hit, and in streaming the sentences have

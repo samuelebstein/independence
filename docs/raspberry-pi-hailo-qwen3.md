@@ -423,6 +423,7 @@ Every default can be overridden with an environment variable:
 | `BRIDGE_MAX_GENERATED_TOKENS` | `100` |
 | `BRIDGE_TEMPERATURE` | `0.3` |
 | `BRIDGE_SYSTEM_PROMPT_CACHE` | `1` (set `0` to re-read the system prompt every question) |
+| `INDEPENDENCE_WHISPER_SIZED_WINDOW` | unset (set `1` to try a Whisper window sized to the question: faster, but it caused repeated phrases in testing) |
 | `BRIDGE_READY_TIMEOUT_SECONDS` | `180` |
 | `HAILO_VLM_HEF` | `$HOME/models/hailo10h/Qwen3-VL-2B-Instruct.hef` |
 | `HAILO_APPS_DIR` | `$HOME/code/hailo-apps-26.03.1` |

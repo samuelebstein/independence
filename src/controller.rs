@@ -24,6 +24,10 @@ pub struct Controller {
     /// photo again so follow-ups can refer to it (typed `/camera`). Voice
     /// sets this false: a photo is sent only with the turn that took it.
     resend_accepted_photos: bool,
+    /// When true (voice), the session keeps the most recent
+    /// `MAX_HISTORY_TURNS` exchanges, forgetting the oldest, instead of
+    /// refusing new questions until `/reset`, which voice cannot type.
+    rolling_history: bool,
     session: Session,
     active: Option<ActiveTurn>,
     pending_camera: Option<PendingCamera>,
@@ -109,6 +113,21 @@ impl Controller {
     pub(crate) fn with_photo_only_on_capturing_turn(mut self) -> Self {
         self.resend_accepted_photos = false;
         self
+    }
+
+    /// Voice policy: keep the last `MAX_HISTORY_TURNS` exchanges and forget
+    /// the oldest one when a new answer is accepted.
+    pub(crate) fn with_rolling_history(mut self) -> Self {
+        self.rolling_history = true;
+        self
+    }
+
+    fn remember(&mut self, turn: ConversationTurn) {
+        self.session.history.push(turn);
+        if self.rolling_history {
+            let excess = self.session.history.len().saturating_sub(MAX_HISTORY_TURNS);
+            self.session.history.drain(..excess);
+        }
     }
 
     fn follow_up_photos(&self) -> Vec<Photo> {
@@ -269,10 +288,12 @@ impl Controller {
         // preflight stale before it can supersede anything.
         self.pending_camera = None;
 
-        if !matches!(
-            scene_commit,
-            SceneCommit::ReplaceWithWorkerPhoto | SceneCommit::ReplaceKnown(_)
-        ) && self.session.history.len() >= MAX_HISTORY_TURNS
+        if !self.rolling_history
+            && !matches!(
+                scene_commit,
+                SceneCommit::ReplaceWithWorkerPhoto | SceneCommit::ReplaceKnown(_)
+            )
+            && self.session.history.len() >= MAX_HISTORY_TURNS
         {
             let restart = match self.mode {
                 OperatingMode::Ephemeral => "/reset to start a new temporary session",
@@ -528,14 +549,14 @@ impl Controller {
         }
 
         if streamed {
-            self.session.history.push(ConversationTurn {
+            self.remember(ConversationTurn {
                 user: active.question,
                 assistant: answer,
             });
             return vec![Effect::Display(Output::AnswerStreamed)];
         }
 
-        self.session.history.push(ConversationTurn {
+        self.remember(ConversationTurn {
             user: active.question,
             assistant: answer.clone(),
         });
@@ -805,6 +826,35 @@ mod tests {
             follow_up.history.len(),
             1,
             "text history still carries the context"
+        );
+    }
+
+    #[test]
+    fn voice_history_rolls_instead_of_requiring_a_reset() {
+        let mut controller = Controller::new().with_rolling_history();
+        for index in 0..MAX_HISTORY_TURNS + 3 {
+            let request = start_ask(&mut controller, &format!("question {index}"));
+            assert_eq!(
+                request.history.len(),
+                index.min(MAX_HISTORY_TURNS),
+                "the model sees at most the last {MAX_HISTORY_TURNS} exchanges"
+            );
+            successful_answer(
+                &mut controller,
+                request.id,
+                &format!("answer {index}"),
+                None,
+            );
+        }
+        let history = controller.accepted_history();
+        assert_eq!(history.len(), MAX_HISTORY_TURNS);
+        assert_eq!(
+            history[0].user, "question 3",
+            "the oldest exchanges were forgotten"
+        );
+        assert_eq!(
+            history.last().unwrap().user,
+            format!("question {}", MAX_HISTORY_TURNS + 2)
         );
     }
 

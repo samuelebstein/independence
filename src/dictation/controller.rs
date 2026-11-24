@@ -343,9 +343,7 @@ impl DictationController {
             } if active == recording_id => {
                 self.phase = Phase::Ready;
                 if text.trim().is_empty() {
-                    let mut effects = vec![DictationEffect::Display(DictationOutput::Diagnostic(
-                        "local transcription returned no text".into(),
-                    ))];
+                    let mut effects = vec![DictationEffect::Display(DictationOutput::NoSpeech)];
                     effects.extend(ready_effects());
                     return effects;
                 }

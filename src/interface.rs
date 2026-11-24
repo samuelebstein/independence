@@ -32,6 +32,9 @@ what is displayed here.
 /// button). This is guidance, not a failure.
 pub const TOO_SHORT_MESSAGE: &str = "Recording too short. Hold ENTER while you speak.";
 
+/// The single startup line in voice mode, shown once a press will be heard.
+pub const VOICE_READY_MESSAGE: &str = "Voice mode is ready. Hold ENTER to speak, then release to send. While holding, press P to take a photo or ESC to cancel.";
+
 /// Shown when recognition heard no words (silence or background noise).
 pub const NO_SPEECH_MESSAGE: &str = "No speech heard. Hold ENTER, speak, then release.";
 
@@ -255,13 +258,12 @@ pub fn process_status(event: &str, detail: &str) {
         "ready" => Some("Independence is ready. Type /help for commands."),
         "operating_mode" => Some("Ephemeral Mode is active. Your conversation is temporary."),
         "ephemeral_session_cleared" => Some("Temporary conversation cleared."),
-        "voice_prompt" => Some("Hold ENTER to speak."),
+        "voice_ready" => Some(VOICE_READY_MESSAGE),
         "dictation_ready" => Some("Ready. Press ENTER to start recording."),
         "recording" | "microphone_capture_started" => Some("Listening..."),
         "transcribing" => Some("Transcribing..."),
         "mode" => match detail {
             value if value.starts_with("dictation") => Some("Dictation mode is ready."),
-            value if value.starts_with("voice") => Some("Voice mode is ready."),
             _ => None,
         },
         "controls" => Some(detail),
@@ -484,6 +486,28 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).expect("terminal text is UTF-8"),
             "Independence: first\r\nsecond\r\n"
+        );
+    }
+
+    #[test]
+    fn voice_startup_shows_one_ready_line_after_setup() {
+        super::test_terminal::start();
+        crate::speak::voice_welcome(
+            Ok("USB microphone"),
+            std::path::Path::new("models/ggml-base.en.bin"),
+            true,
+        );
+        assert!(
+            super::test_terminal::lines().is_empty(),
+            "setup details are logged, not shown before the runtime is ready"
+        );
+        crate::speak::voice_ready();
+        assert_eq!(
+            super::test_terminal::lines(),
+            [
+                "Ephemeral Mode is active. Your conversation is temporary.",
+                super::VOICE_READY_MESSAGE,
+            ]
         );
     }
 

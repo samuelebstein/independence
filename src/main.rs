@@ -46,7 +46,7 @@ async fn main() {
 
 fn usage_and_exit(detail: &str) -> ! {
     let usage = format!(
-        "{detail}. usage: cargo run -- [--dictate [--audio-input <exact device id>]|--voice [--profile raspberry-pi|raspberry-pi-hailo] [--input terminal|buttons] [--input-device <stable /dev/input path>] [--audio-input <exact device id>] [--audio-output <exact device id>] [--model <model>] [--backend ollama|hailo-vlm|fixture] [--pipeline transcribe-and-speak|audio-to-audio]|--audio-devices|--audio-input-devices|--input-devices|--speak-test [--audio-output <exact device id>]"
+        "{detail}. usage: cargo run -- [--dictate [--audio-input <exact device id>]|--voice [--profile raspberry-pi|raspberry-pi-hailo] [--input terminal|buttons] [--input-device <stable /dev/input path>] [--audio-input <exact device id>] [--audio-output <exact device id>] [--model <model>] [--backend ollama|hailo-vlm|fixture] [--pipeline transcribe-and-speak|audio-to-audio] [--tts-model <piper .onnx>] [--whisper-model <ggml .bin>] [--whisper-language en|es|...|auto]|--audio-devices|--audio-input-devices|--input-devices|--speak-test [--audio-output <exact device id>]"
     );
     independence::speak::usage(&usage);
     std::process::exit(2);

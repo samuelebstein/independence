@@ -9,6 +9,8 @@ pub mod audio;
 mod controller;
 pub(crate) mod transcribe;
 
+pub use transcribe::WhisperLanguage;
+
 use std::{
     collections::HashMap,
     io,

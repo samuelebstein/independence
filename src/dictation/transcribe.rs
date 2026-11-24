@@ -15,6 +15,68 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::protocol::CapturedAudio;
 use crate::telemetry::{self, Interaction};
 
+/// The spoken language Whisper listens for: a language code such as `en` or
+/// `es`, or `auto` to detect the language of each recording.
+///
+/// whisper.cpp owns language detection and the list of supported languages;
+/// Independence asks it whether a value is known, so a typo fails at launch
+/// instead of on the first recording. Full names (`spanish`) are accepted and
+/// stored as their code (`es`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhisperLanguage(String);
+
+impl WhisperLanguage {
+    pub fn english() -> Self {
+        Self("en".to_owned())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim().to_ascii_lowercase();
+        if value == "auto" {
+            return Ok(Self(value));
+        }
+        // whisper.cpp reports an unknown language on stderr; route that into
+        // the application log instead of the terminal. Safe to repeat.
+        whisper_rs::install_logging_hooks();
+        // Letters only also keeps a NUL byte away from the C lookup.
+        let known = (!value.is_empty()
+            && value
+                .chars()
+                .all(|character| character.is_ascii_lowercase()))
+        .then(|| whisper_rs::get_lang_id(&value))
+        .flatten()
+        .and_then(whisper_rs::get_lang_str);
+        match known {
+            Some(code) => Ok(Self(code.to_owned())),
+            None => Err(format!(
+                "unknown Whisper language `{value}`; use a language code such as `en` or `es`, or `auto`"
+            )),
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_english(&self) -> bool {
+        self.0 == "en"
+    }
+}
+
+impl Default for WhisperLanguage {
+    fn default() -> Self {
+        Self::english()
+    }
+}
+
+/// whisper.cpp's English-only models are named `*.en.bin` (for example
+/// `ggml-base.en.bin`). They cannot transcribe any other language.
+pub fn is_english_only_model_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".en.bin"))
+}
+
 /// whisper.cpp's encoder normally processes a fixed 30-second window (1500
 /// context frames of 20 ms) no matter how short the recording is. Sizing the
 /// window to the clip makes the encoder do proportionally less work.
@@ -156,6 +218,8 @@ pub struct WhisperTranscriber {
     /// is faster but made Whisper repeat phrases on the Pi ("What is gravity?
     /// What is gravity?"), so the full 30-second window is the default.
     sized_window: bool,
+    /// English unless the voice launch chose another language or `auto`.
+    language: WhisperLanguage,
 }
 
 impl WhisperTranscriber {
@@ -177,7 +241,16 @@ impl WhisperTranscriber {
             model_path,
             context: Mutex::new(None),
             sized_window,
+            language: WhisperLanguage::english(),
         }
+    }
+
+    /// Listens for `language` instead of English. A language other than
+    /// English needs a multilingual model (`ggml-base.bin`, not
+    /// `ggml-base.en.bin`); the first recording fails clearly otherwise.
+    pub fn with_language(mut self, language: WhisperLanguage) -> Self {
+        self.language = language;
+        self
     }
 
     fn context(
@@ -207,7 +280,7 @@ impl WhisperTranscriber {
                 );
             }
             return Err(TranscriptionError::Failed(format!(
-                "Whisper model file is missing: {}; set INDEPENDENCE_WHISPER_MODEL to a local ggml base.en model",
+                "Whisper model file is missing: {}; set INDEPENDENCE_WHISPER_MODEL to a local ggml Whisper model",
                 self.model_path.display()
             )));
         }
@@ -242,6 +315,21 @@ impl WhisperTranscriber {
                 stage.finish("cancelled", telemetry::Fields::new());
             }
             return Err(TranscriptionError::Cancelled);
+        }
+
+        if !self.language.is_english() && !context.is_multilingual() {
+            // whisper.cpp would silently fall back to English here.
+            if let Some(stage) = loading.take() {
+                stage.finish(
+                    "failed",
+                    telemetry::fields([("failure_class", serde_json::json!("english_only_model"))]),
+                );
+            }
+            return Err(TranscriptionError::Failed(format!(
+                "Whisper model {} is English-only and cannot listen for `{}`; use a multilingual model such as ggml-base.bin",
+                self.model_path.display(),
+                self.language.code()
+            )));
         }
 
         let context = Arc::new(context);
@@ -301,7 +389,10 @@ impl Transcriber for WhisperTranscriber {
                 ))
             })?;
             let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            parameters.set_language(Some("en"));
+            // "auto" asks whisper.cpp to detect the language of this
+            // recording. (`set_detect_language(true)` is different: it
+            // detects the language and then returns without transcribing.)
+            parameters.set_language(Some(self.language.code()));
             parameters.set_translate(false);
             parameters.set_no_context(true);
             parameters.set_no_timestamps(true);
@@ -374,6 +465,34 @@ mod tests {
         Transcriber, TranscriptionError, TranscriptionKind, WhisperTranscriber, audio_ctx_for,
         cancellation_callback_data, transcription_cancelled_callback, without_non_speech_markers,
     };
+
+    #[test]
+    fn whisper_languages_are_checked_against_whisper_cpp() {
+        use super::WhisperLanguage;
+        assert_eq!(WhisperLanguage::parse("es").unwrap().code(), "es");
+        assert_eq!(WhisperLanguage::parse(" ES ").unwrap().code(), "es");
+        assert_eq!(WhisperLanguage::parse("spanish").unwrap().code(), "es");
+        assert_eq!(WhisperLanguage::parse("auto").unwrap().code(), "auto");
+        assert!(WhisperLanguage::default().is_english());
+        for invalid in ["", "xx", "klingon", "e\0s", "es-MX"] {
+            assert!(WhisperLanguage::parse(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn english_only_models_are_recognized_by_name() {
+        use super::is_english_only_model_name;
+        use std::path::Path;
+        assert!(is_english_only_model_name(Path::new(
+            "local-data/whisper/ggml-base.en.bin"
+        )));
+        assert!(!is_english_only_model_name(Path::new(
+            "local-data/whisper/ggml-base.bin"
+        )));
+        assert!(!is_english_only_model_name(Path::new(
+            "local-data/whisper/ggml-large-v3-turbo.bin"
+        )));
+    }
 
     #[test]
     fn whisper_non_speech_markers_are_not_words() {
@@ -493,6 +612,30 @@ mod tests {
                 completed_without_native_failure,
                 "native Whisper call {attempt} failed unexpectedly: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the locally downloaded Whisper base.en model"]
+    fn english_only_model_refuses_another_language_instead_of_guessing() {
+        let transcriber =
+            WhisperTranscriber::new(PathBuf::from("local-data/whisper/ggml-base.en.bin"))
+                .with_language(super::WhisperLanguage::parse("es").unwrap());
+        assert!(
+            transcriber.model_is_available(),
+            "download the local Whisper model before running this test"
+        );
+        let result = transcriber.transcribe(
+            CapturedAudio::new(vec![0.0; 16_000]),
+            Arc::new(AtomicBool::new(false)),
+            TranscriptionKind::Final,
+            None,
+        );
+        match result {
+            Err(TranscriptionError::Failed(message)) => {
+                assert!(message.contains("English-only"), "{message}");
+            }
+            other => panic!("expected an English-only model failure, got {other:?}"),
         }
     }
 }

@@ -31,6 +31,14 @@ discarded when the process ends.
 
 ## Teach Sam About the Latest Milestone
 
+Since Milestone 8 (not a milestone of its own): the Piper voice, the Whisper
+model, and the language Whisper listens for can be chosen at launch
+(`--tts-model`, `--whisper-model`, `--whisper-language`, or matching
+environment variables), which is enough to practise Spanish offline. A
+non-English language with an English-only Whisper model stops the launch
+instead of mishearing. On the Pi, `scripts/run-raspberry-pi-hailo.sh --check`
+checks the whole setup at once. See [voice and language](docs/voice-and-language.md).
+
 Milestone 8 attacks latency on the Hailo Pi. The model was already running at
 Hailo's advertised ~4.9 tokens/s; the wait came from what we asked of it. Voice
 answers now stream: each sentence is printed and spoken as soon as the model
@@ -110,5 +118,6 @@ inference service as in-memory bytes.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security and privacy threat model](docs/security/THREAT_MODEL.md)
 - [Learning guide](LEARNING.md)
+- [Voice and language (Spanish setup)](docs/voice-and-language.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Development and milestone rules](AGENTS.md)

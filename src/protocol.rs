@@ -243,6 +243,8 @@ pub enum DictationOutput {
     Transcript(String),
     /// A press was too short to contain a question; ask for a longer hold.
     TooShort,
+    /// Recognition finished but heard no words (silence or noise only).
+    NoSpeech,
     Diagnostic(String),
 }
 

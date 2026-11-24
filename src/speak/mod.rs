@@ -248,6 +248,9 @@ pub fn emit_raw(output: Output) {
 /// The fixed lifecycle message for a press too short to hold a question.
 pub const TOO_SHORT_VOICE_LOG: &str = "recording too short — hold enter while you speak";
 
+/// The fixed lifecycle message when recognition heard no words.
+pub const NO_SPEECH_VOICE_LOG: &str = "no speech heard — nothing was sent";
+
 /// User-facing lifecycle text for button-controlled voice mode. The text is
 /// never copied into diagnostic output.
 pub fn voice_log(message: &str) {
@@ -322,6 +325,7 @@ pub fn emit_dictation(output: DictationOutput) {
         DictationOutput::Transcribing => "transcribing",
         DictationOutput::Transcript(_) => "transcript",
         DictationOutput::TooShort => "too_short",
+        DictationOutput::NoSpeech => "no_speech",
         DictationOutput::Diagnostic(_) => "notice",
     };
     interface::emit_dictation(output);

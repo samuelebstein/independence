@@ -890,9 +890,19 @@ went into *what* we asked it to do:
   the bridge saves that context with `save_context()` and restores it per
   question with `load_context()`), and a photo is sent only with the turn
   that took it.
-- **Whisper's 30-second window.** whisper.cpp encodes 30 s of audio even for
-  a 3-second question. `audio_ctx_for` sizes the window to the clip plus about
-  2.6 s, with a 5-second floor.
+- **Whisper's 30-second window (tried, then turned off).** whisper.cpp
+  encodes 30 s of audio even for a 3-second question. `audio_ctx_for` sizes
+  the window to the clip, but on the Pi that made Whisper repeat phrases
+  ("What is gravity? What is gravity?"): the model was trained on 30-second
+  windows. The full window is the default again; set
+  `INDEPENDENCE_WHISPER_SIZED_WINDOW=1` only to experiment. A measured
+  accuracy check caught this, which is why P5 required one.
+
+Two voice-only session rules changed too. Button mode cannot type `/reset`,
+so voice keeps the last six exchanges and forgets the oldest instead of
+refusing new questions. And Whisper writes markers such as `[BLANK_AUDIO]`
+when it hears no words; those are removed, and an empty result shows "No
+speech heard" instead of being sent to the model as a question.
 
 How the controller stays in charge with streaming: a streamed sentence is an
 `Event::TurnPartial { id, text }`. The controller authorizes it only while

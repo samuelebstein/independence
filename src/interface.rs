@@ -32,6 +32,9 @@ what is displayed here.
 /// button). This is guidance, not a failure.
 pub const TOO_SHORT_MESSAGE: &str = "Recording too short. Hold ENTER while you speak.";
 
+/// Shown when recognition heard no words (silence or background noise).
+pub const NO_SPEECH_MESSAGE: &str = "No speech heard. Hold ENTER, speak, then release.";
+
 static LAST_STATUS: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Runs `update` with the most recently displayed status line. Tests use a
@@ -240,6 +243,7 @@ pub fn emit_dictation(output: DictationOutput) {
         DictationOutput::Transcribing => status("Transcribing..."),
         DictationOutput::Transcript(text) => final_transcript(&text),
         DictationOutput::TooShort => notice(TOO_SHORT_MESSAGE),
+        DictationOutput::NoSpeech => notice(NO_SPEECH_MESSAGE),
         DictationOutput::Diagnostic(_) => operational_warning("dictation"),
     }
 }
@@ -317,6 +321,7 @@ pub fn voice_status(message: &str) {
         | "released before the microphone became available; no recording started" => {
             notice(TOO_SHORT_MESSAGE)
         }
+        crate::speak::NO_SPEECH_VOICE_LOG => notice(NO_SPEECH_MESSAGE),
         value if value.starts_with("audio-to-audio ready") => {
             status("Direct voice mode is ready. Hold ENTER to speak.")
         }

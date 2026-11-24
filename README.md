@@ -37,9 +37,11 @@ answers now stream: each sentence is printed and spoken as soon as the model
 finishes it, with the next sentence synthesized while the current one plays.
 Escape or a new question stops the Hailo immediately instead of letting it
 finish an abandoned answer. Voice asks for one to three short sentences, a
-photo is sent only with the question that took it, the system prompt is loaded
-into the bridge once at startup instead of every turn, and Whisper processes a
-window sized to your question instead of 30 seconds. The bridge log now shows
+photo is sent only with the question that took it, and the system prompt is
+loaded into the bridge once at startup instead of every turn. (A shorter
+Whisper window was tried and turned off: it made transcripts repeat.) Voice
+keeps the last six exchanges instead of needing `/reset`, and Whisper's
+"[BLANK_AUDIO]"-style markers are never sent as questions. The bridge log now shows
 prompt tokens, time to first token, output tokens, and tokens/s for every
 question. See [the milestone](docs/milestones/MILESTONE_8_PI_VOICE_LATENCY.md)
 and [the learning notes](LEARNING.md#latest-milestone-where-the-pi-voice-latency-went-milestone-8).

@@ -401,14 +401,30 @@ scripts/run-raspberry-pi-hailo.sh
 ```
 
 The script checks the model file, Hailo Apps, bridge Python, Piper and the
-voice, the Whisper model and language, the button device, the release binary,
-and the camera (`rpicam-still --list-cameras`). Every check runs, and each
+voice, the Whisper model and language, the microphone and speaker (against
+Independence's own device list), the button device, the release binary, and
+the camera (`rpicam-still --list-cameras`). Every check runs, and each
 problem is listed with the fix; a missing camera is fatal because this profile
 requires it. To check the whole setup without starting anything:
 
 ```bash
 scripts/run-raspberry-pi-hailo.sh --check
 ```
+
+`--check` groups the items by what they do (program; thinking on the Hailo;
+hearing; speaking; controls and camera; connection to the bridge). Each line
+is green (✓) or red (✗), says what the item is for, and shows what was
+found: paths with file sizes (a truncated download stands out), the
+microphone and speaker names from Independence's own device list, the
+keyboard's name for the button device, the language the voice pronounces,
+and the detected camera. Red items include the fix. Colour is used only in a
+terminal; `NO_COLOR=1` turns it off.
+
+For a pinyin voice (Mandarin `chaowen` or `xiao_ya`, whose `.onnx.json` says
+`"phoneme_type": "pinyin"`), two more checks appear under Speaking: that
+`g2pW/g2pw.onnx` is next to the voice (without it Piper would download g2pW
+the first time it speaks) and that the Pi's Piper is new enough to know
+pinyin voices. Other voices skip both.
 
 It refuses to start if something already listens on the bridge port (for
 example, a bridge left running in another terminal). It then starts the

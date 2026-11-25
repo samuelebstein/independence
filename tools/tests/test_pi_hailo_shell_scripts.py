@@ -203,7 +203,20 @@ HTTPServer(("127.0.0.1", int(os.environ["FAKE_BRIDGE_PORT"])), Health).serve_for
 
 FAKE_INDEPENDENCE = """\
 #!/usr/bin/env bash
-# Stands in for target/release/independence: records how it was launched.
+# Stands in for target/release/independence: lists fake audio devices (as the
+# real program does, with CRLF line ends), or records how it was launched.
+case "$1" in
+  --audio-input-devices)
+    printf 'Audio input devices:\\r\\n- USB PnP Audio Device (default)\\r\\n  ID: %s\\r\\n' \\
+      "${FAKE_LISTED_MICROPHONE:-${PI_AUDIO_INPUT:-alsa:plughw:CARD=Device,DEV=0}}"
+    exit 0
+    ;;
+  --audio-devices)
+    printf 'Audio output devices:\\r\\n- USB PnP Audio Device\\r\\n  ID: %s\\r\\n' \\
+      "${PI_AUDIO_OUTPUT:-alsa:plughw:CARD=Device,DEV=0}"
+    exit 0
+    ;;
+esac
 printf '%s\\n' "$@" > "$FAKE_RECORD_DIR/independence-args"
 printf '%s|%s|%s|%s\\n' "$INDEPENDENCE_PIPER_COMMAND" "$INDEPENDENCE_TTS_MODEL" \\
   "$INDEPENDENCE_TTS_CONFIG" "$INDEPENDENCE_LOG" > "$FAKE_RECORD_DIR/independence-env"
@@ -237,6 +250,9 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
             "event2",
         ):
             (self.root / name).touch()
+        (self.root / "es_MX-claude-high.onnx.json").write_text(
+            '{"language": {"code": "es_MX"}, "espeak": {"voice": "es"}}', encoding="utf-8"
+        )
         (self.root / "hailo-apps").mkdir()
         for name in ("python", "piper"):
             self._executable(self.root / name, "#!/usr/bin/env bash\nexit 0\n")
@@ -401,6 +417,88 @@ class RaspberryPiHailoRunScriptTests(unittest.TestCase):
         self.assertIn("Whisper: ggml-base.en.bin (language: en)", result.stdout)
         self.assertFalse((self.record / "bridge-args.json").exists())
         self.assertFalse((self.record / "independence-args").exists())
+
+    def test_check_explains_each_item_and_what_it_found(self) -> None:
+        result = self._run(
+            "--check",
+            INDEPENDENCE_TTS_MODEL=str(self.root / "es_MX-claude-high.onnx"),
+            INDEPENDENCE_TTS_CONFIG="<unset>",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout
+        for section in ("Program", "Thinking", "Hearing", "Speaking", "Controls and camera"):
+            self.assertIn(section, output)
+        self.assertIn("✓ Microphone", output)
+        self.assertIn("alsa:plughw:CARD=Device,DEV=0 (USB PnP Audio Device)", output)
+        self.assertIn("Records your voice while ENTER is held.", output)
+        self.assertIn("0 : imx708_wide", output, "the detected camera is shown")
+        self.assertIn("pronounces text as es_MX", output)
+        self.assertNotIn("\x1b[", output, "no colour codes when not a terminal")
+
+    def test_check_colours_results_when_forced(self) -> None:
+        result = self._run("--check", FORCE_COLOR="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("\x1b[32m✓\x1b[0m Microphone", result.stdout)
+
+    def test_check_flags_a_microphone_independence_cannot_see(self) -> None:
+        result = self._run("--check", FAKE_LISTED_MICROPHONE="alsa:something-else")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("✗ Microphone", result.stdout)
+        self.assertIn("--audio-input-devices", result.stdout)
+        self.assertFalse((self.record / "independence-args").exists())
+
+    def _pinyin_voice(self, with_g2pw: bool) -> Path:
+        voice = self.root / "zh_CN-chaowen-medium"
+        voice.mkdir()
+        (voice / "zh_CN-chaowen-medium.onnx").touch()
+        (voice / "zh_CN-chaowen-medium.onnx.json").write_text(
+            '{"language": {"code": "zh_CN"}, "phoneme_type": "pinyin"}', encoding="utf-8"
+        )
+        if with_g2pw:
+            (voice / "g2pW").mkdir()
+            (voice / "g2pW" / "g2pw.onnx").touch()
+        return voice / "zh_CN-chaowen-medium.onnx"
+
+    def test_check_ignores_g2pw_for_espeak_voices(self) -> None:
+        result = self._run("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("g2pW", result.stdout)
+
+    def test_pinyin_voice_without_g2pw_fails_before_the_bridge(self) -> None:
+        model = self._pinyin_voice(with_g2pw=False)
+        result = self._run("--check", INDEPENDENCE_TTS_MODEL=str(model), INDEPENDENCE_TTS_CONFIG="<unset>")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("✗ Pinyin model (g2pW)", result.stdout)
+        self.assertIn(f"{model.parent / 'g2pW' / 'g2pw.onnx'} (missing)", result.stdout)
+        self.assertIn("Download g2pw.tar.gz into", result.stdout)
+
+        started = self._run(INDEPENDENCE_TTS_MODEL=str(model), INDEPENDENCE_TTS_CONFIG="<unset>")
+        self.assertEqual(started.returncode, 2)
+        self.assertFalse((self.record / "bridge-args.json").exists())
+        self.assertFalse((self.record / "independence-args").exists())
+
+    def test_pinyin_voice_with_g2pw_and_a_new_enough_piper_passes(self) -> None:
+        model = self._pinyin_voice(with_g2pw=True)
+        result = self._run("--check", INDEPENDENCE_TTS_MODEL=str(model), INDEPENDENCE_TTS_CONFIG="<unset>")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("✓ Pinyin model (g2pW)", result.stdout)
+        self.assertIn("✓ Piper pinyin support", result.stdout)
+
+    def test_pinyin_voice_with_an_old_piper_explains_the_upgrade(self) -> None:
+        model = self._pinyin_voice(with_g2pw=True)
+        old_piper = self.root / "old-piper-venv" / "bin"
+        old_piper.mkdir(parents=True)
+        self._executable(old_piper / "piper", "#!/usr/bin/env bash\nexit 0\n")
+        self._executable(old_piper / "python", "#!/usr/bin/env bash\nexit 1\n")
+        result = self._run(
+            "--check",
+            INDEPENDENCE_TTS_MODEL=str(model),
+            INDEPENDENCE_TTS_CONFIG="<unset>",
+            INDEPENDENCE_PIPER_COMMAND=str(old_piper / "piper"),
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("✗ Piper pinyin support", result.stdout)
+        self.assertIn("pip install --upgrade piper-tts", result.stdout)
 
     def test_check_lists_every_problem_at_once(self) -> None:
         self._camera(present=False)
